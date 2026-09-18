@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "motion/react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -27,6 +28,13 @@ import {
   Square,
   Copy,
   Mic,
+  MoreHorizontal,
+  Pin,
+  Pencil,
+  Trash2,
+  FolderCog,
+  CopyPlus,
+  ChevronLast,
 } from "lucide-react";
 
 /* ---------- Shared class fragments (single source of truth) ---------- */
@@ -55,30 +63,128 @@ const SSELECT =
 /** Text input in settings */
 const SINPUT =
   "h-8 w-[180px] rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 text-[12px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
+/** Tiny icon button revealed on row hover (⋮, +, pin).
+ *  Hover paints a solid grey pill instead of a faint translucent wash. */
+const ROW_ICON =
+  "flex h-6 w-6 shrink-0 items-center justify-center rounded text-[var(--text-muted)] transition-colors hover:bg-[var(--row-solid-hover)] hover:text-[var(--text-main)]";
 
-/* ---------- Scroll indicator hook ----------
-   Adds `.scrolling` to the scrolled element while the user is actively
-   scrolling, so the thumb only appears then (plus on hover). */
+/* ---------- Custom overlay scrollbar ----------
+   WebView2 draws its own "fluent" scrollbar (arrows, grows while scrolling,
+   jumps width). We hide it with .no-native-scrollbar and render our own
+   overlay thumb: constant 6px, no arrows, never shifts layout. */
 
-function useScrollIndicator<T extends HTMLElement>(extraRef?: React.RefObject<T>) {
-  const localRef = useRef<T>(null);
-  const ref = (extraRef ?? localRef) as React.RefObject<T>;
+type ThumbState = { top: number; height: number; visible: boolean };
+
+function useOverlayThumb(elRef: React.RefObject<HTMLElement | null>) {
+  const [thumb, setThumb] = useState<ThumbState>({ top: 0, height: 0, visible: false });
+
   useEffect(() => {
-    const el = ref.current;
+    const el = elRef.current;
     if (!el) return;
+
     let timer: number | undefined;
-    const onScroll = () => {
-      el.classList.add("scrolling");
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => el.classList.remove("scrolling"), 900);
+    let hovering = false;
+
+    const update = (active = false) => {
+      const { scrollHeight, clientHeight, scrollTop } = el;
+      const ratio = clientHeight / Math.max(scrollHeight, 1);
+      const needBar = scrollHeight > clientHeight + 1;
+      const height = Math.max(ratio * clientHeight, 28);
+      const maxTop = clientHeight - height;
+      const top = ratio >= 1 ? 0 : (scrollTop / (scrollHeight - clientHeight)) * maxTop;
+      setThumb({ top, height, visible: needBar && (active || hovering) });
     };
+
+    const onScroll = () => {
+      update(true);
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => update(hovering), 800);
+    };
+    const onEnter = () => {
+      hovering = true;
+      update(false);
+    };
+    const onLeave = () => {
+      hovering = false;
+      update(false);
+    };
+    const onResize = () => update(false);
+
     el.addEventListener("scroll", onScroll, { passive: true });
+    el.addEventListener("mouseenter", onEnter);
+    el.addEventListener("mouseleave", onLeave);
+    const ro = new ResizeObserver(onResize);
+    ro.observe(el);
+
+    update(false);
     return () => {
       el.removeEventListener("scroll", onScroll);
+      el.removeEventListener("mouseenter", onEnter);
+      el.removeEventListener("mouseleave", onLeave);
+      ro.disconnect();
       window.clearTimeout(timer);
     };
-  }, [ref]);
-  return ref;
+  }, [elRef]);
+
+  return thumb;
+}
+
+/** The thumb hugs the right edge of its scroll container — no padding gap. */
+function Thumb({ thumb }: { thumb: ThumbState }) {
+  return (
+    <div className="pointer-events-none absolute right-0 top-0 h-full w-2">
+      <div
+        className={`scroll-thumb ${thumb.visible ? "" : "opacity-0"}`}
+        style={{ top: `${thumb.top}px`, height: `${thumb.height}px` }}
+      />
+    </div>
+  );
+}
+
+/** Scroll container with the custom overlay bar (fills its parent box). */
+function ScrollArea({
+  children,
+  className = "",
+  innerClassName = "",
+  scrollRef,
+}: {
+  children: React.ReactNode;
+  className?: string;
+  innerClassName?: string;
+  scrollRef?: React.RefObject<HTMLDivElement>;
+}) {
+  const localRef = useRef<HTMLDivElement>(null);
+  const ref = scrollRef ?? localRef;
+  const thumb = useOverlayThumb(ref);
+
+  return (
+    <div className={`relative flex min-h-0 flex-col ${className}`}>
+      <div ref={ref} className={`no-native-scrollbar min-h-0 flex-1 overflow-y-auto ${innerClassName}`}>
+        {children}
+      </div>
+      <Thumb thumb={thumb} />
+    </div>
+  );
+}
+
+/** Scroll wrapper whose height is driven by its content classes (max-h-*, etc.). */
+function ScrollBox({
+  children,
+  className = "",
+}: {
+  children: React.ReactNode;
+  className?: string;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const thumb = useOverlayThumb(ref);
+  return (
+    <div className="relative">
+      <div ref={ref} className={`no-native-scrollbar overflow-y-auto ${className}`}>
+        {children}
+      </div>
+      <Thumb thumb={thumb} />
+    </div>
+  );
 }
 
 /* ---------- Types ---------- */
@@ -112,14 +218,22 @@ export interface Conversation {
   id: string;
   title: string;
   age: string;
+  pinned?: boolean;
 }
 
 export interface Project {
   name: string;
+  path: string;
   conversations: Conversation[];
 }
 
 export type ViewKind = "chat" | "new" | "history" | "tasks";
+
+/** Pseudo-project holding chats that belong to no folder. */
+const NO_PROJECT = "No project";
+
+/** How many conversations a project shows before "See all (N)". */
+const CONV_LIMIT = 6;
 
 /* ---------- Data ---------- */
 
@@ -158,24 +272,66 @@ const GATEWAYS: Gateway[] = [
   },
 ];
 
+const R = "C:\\Users\\nezuss\\Documents\\GitHub\\";
+
+/** Loose chats (no folder). Kept as a real entry so every row action just works. */
+const NO_PROJECT_ENTRY: Project = {
+  name: NO_PROJECT,
+  path: "",
+  conversations: [
+    { id: "loose-scratch", title: "Scratch notes", age: "3h" },
+    { id: "loose-quick", title: "Quick question about regex", age: "9h" },
+    { id: "loose-draft", title: "Draft commit message", age: "2d" },
+  ],
+};
+
 const INITIAL_PROJECTS: Project[] = [
   {
     name: "Singularity",
+    path: R + "Singularity",
     conversations: [
-      { id: "fix-terminal-tests", title: "Fix flaky terminal tests", age: "1d" },
+      { id: "fix-terminal-tests", title: "Fix flaky terminal tests", age: "1d", pinned: true },
       { id: "model-router-fallback", title: "Add Model Router fallback", age: "2d" },
+      { id: "git-sync", title: "Branchless git sync redesign", age: "3d" },
+      { id: "sidebar-v2", title: "Sidebar v2 layout pass", age: "4d" },
+      { id: "theme-tokens", title: "Theme tokens refactor", age: "6d" },
+      { id: "cmd-palette", title: "Command palette wiring", age: "8d" },
+      { id: "voice-input", title: "Voice input prototype", age: "11d" },
+      { id: "tool-diff", title: "Tool diff review panel", age: "15d" },
     ],
   },
-  { name: "accounting", conversations: [{ id: "acc-invoices", title: "Invoice parser refactor", age: "7d" }] },
-  { name: "Auth", conversations: [{ id: "auth-jwt", title: "JWT refresh flow", age: "12d" }] },
-  { name: "CourcesPlatform", conversations: [] },
-  { name: "DataVisualizationMatplotlib", conversations: [] },
-  { name: "Education-Website", conversations: [{ id: "edu-landing", title: "Landing page rewrite", age: "5d" }] },
-  { name: "Frontend_Booking", conversations: [] },
-  { name: "hosty", conversations: [] },
-  { name: "landing", conversations: [] },
-  { name: "TermosClient", conversations: [] },
-  { name: "TSKS_1gg7sgds", conversations: [] },
+  {
+    name: "accounting",
+    path: R + "accounting",
+    conversations: [{ id: "acc-invoices", title: "Invoice parser refactor", age: "7d" }],
+  },
+  {
+    name: "Auth",
+    path: R + "Auth",
+    conversations: [
+      { id: "auth-jwt", title: "JWT refresh flow", age: "12d" },
+      { id: "auth-oauth", title: "OAuth device flow", age: "14d" },
+      { id: "auth-sessions", title: "Session storage hardening", age: "18d" },
+      { id: "auth-mfa", title: "MFA enrollment", age: "21d" },
+      { id: "auth-keys", title: "Key rotation job", age: "25d" },
+      { id: "auth-audit", title: "Audit log table", age: "28d" },
+      { id: "auth-lockout", title: "Lockout policy", age: "31d" },
+      { id: "auth-passkeys", title: "Passkeys spike", age: "34d" },
+    ],
+  },
+  { name: "CourcesPlatform", path: R + "CourcesPlatform", conversations: [] },
+  { name: "DataVisualizationMatplotlib", path: R + "DataVisualizationMatplotlib", conversations: [] },
+  {
+    name: "Education-Website",
+    path: R + "Education-Website",
+    conversations: [{ id: "edu-landing", title: "Landing page rewrite", age: "5d" }],
+  },
+  { name: "Frontend_Booking", path: R + "Frontend_Booking", conversations: [] },
+  { name: "hosty", path: R + "hosty", conversations: [] },
+  { name: "landing", path: R + "landing", conversations: [] },
+  { name: "TermosClient", path: R + "TermosClient", conversations: [] },
+  { name: "TSKS_1gg7sgds", path: R + "TSKS_1gg7sgds", conversations: [] },
+  NO_PROJECT_ENTRY,
 ];
 
 const INITIAL_SCHEDULED = ["Nightly /review @main", "Weekly /test all"];
@@ -327,6 +483,112 @@ function TitleBar() {
   );
 }
 
+/* ---------- Tiny dropdown used by row actions ---------- */
+
+function RowMenu({
+  open,
+  anchor,
+  items,
+  onClose,
+}: {
+  open: boolean;
+  /** The element the menu should be anchored to (its trigger button). */
+  anchor: React.RefObject<HTMLElement | null>;
+  items: Array<{ icon: React.ReactNode; label: string; onClick: () => void; danger?: boolean }>;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ top: 0, left: 0, flipped: false });
+  // Keep callbacks/refs out of the effect deps so positioning never loops.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const itemCount = items.length;
+
+  /**
+   * Positioned with `position: fixed` against the trigger's viewport rect and
+   * re-measured on scroll/resize — so it is never clipped by the sidebar's
+   * overflow and never drifts out of view when the list is scrolled.
+   */
+  useEffect(() => {
+    if (!open) return;
+
+    const place = () => {
+      const el = anchor.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const menuH = ref.current?.offsetHeight ?? itemCount * 32 + 12;
+      const menuW = ref.current?.offsetWidth ?? 200;
+      const gap = 6;
+      const below = r.bottom + gap;
+      const fitBelow = below + menuH <= window.innerHeight - 8;
+      const top = fitBelow ? below : Math.max(8, r.top - gap - menuH);
+      const left = Math.min(Math.max(8, r.right - menuW), window.innerWidth - menuW - 8);
+      setPos((p) =>
+        p.top === top && p.left === left && p.flipped === !fitBelow
+          ? p // bail out: identical position must not trigger a re-render
+          : { top, left, flipped: !fitBelow }
+      );
+    };
+
+    place();
+    const raf = requestAnimationFrame(place); // second pass with real size
+
+    const onDocDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (ref.current?.contains(t) || anchor.current?.contains(t)) return;
+      onCloseRef.current();
+    };
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onCloseRef.current();
+
+    document.addEventListener("mousedown", onDocDown);
+    document.addEventListener("keydown", onKey);
+    // capture:true also catches scrolling inside nested scroll containers
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+    return () => {
+      cancelAnimationFrame(raf);
+      document.removeEventListener("mousedown", onDocDown);
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("scroll", place, true);
+      window.removeEventListener("resize", place);
+    };
+  }, [open, anchor, itemCount]);
+
+  return createPortal(
+    <AnimatePresence>
+      {open && (
+        <motion.div
+          ref={ref}
+          style={{ position: "fixed", top: pos.top, left: pos.left }}
+          className="z-[600] flex min-w-[200px] flex-col gap-0.5 rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] p-1 shadow-[var(--shadow-popup)]"
+          initial={{ opacity: 0, y: pos.flipped ? 4 : -4, scale: 0.97 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: pos.flipped ? 4 : -4, scale: 0.97 }}
+          transition={{ duration: 0.12, ease: "easeOut" }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {items.map((it) => (
+            <button
+              key={it.label}
+              className={`flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-[13px] transition-colors hover:bg-[var(--hover-bg)] ${
+                it.danger ? "text-[var(--diff-del)]" : "text-[var(--text-main)]"
+              }`}
+              onClick={() => {
+                it.onClick();
+                onClose();
+              }}
+            >
+              {it.icon}
+              {it.label}
+            </button>
+          ))}
+        </motion.div>
+      )}
+    </AnimatePresence>,
+    document.body
+  );
+}
+
 /* ---------- Sidebar ---------- */
 
 function Sidebar({
@@ -337,9 +599,14 @@ function Sidebar({
   view,
   onSelectConversation,
   onNewConversation,
+  onNewConversationInProject,
   onShowView,
   onOpenSettings,
+  onOpenProjectSettings,
   onNewProject,
+  onRenameConversation,
+  onDeleteConversation,
+  onTogglePin,
 }: {
   width: number;
   startResize: (e: React.MouseEvent) => void;
@@ -348,16 +615,204 @@ function Sidebar({
   view: ViewKind;
   onSelectConversation: (projectId: string, convId: string) => void;
   onNewConversation: () => void;
+  onNewConversationInProject: (project: string) => void;
   onShowView: (v: "history" | "tasks") => void;
   onOpenSettings: () => void;
+  onOpenProjectSettings: (project: string) => void;
   onNewProject: () => void;
+  onRenameConversation: (project: string, convId: string, title: string) => void;
+  onDeleteConversation: (project: string, convId: string) => void;
+  onTogglePin: (project: string, convId: string) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({ Singularity: true });
   const [sortAZ, setSortAZ] = useState(true);
-  const listRef = useScrollIndicator<HTMLDivElement>();
+  const [projectsOpen, setProjectsOpen] = useState(true);
+  const [convsOpen, setConvsOpen] = useState(true);
+  /** Expanded past the 6-chat limit; reset whenever the project is collapsed. */
+  const [showAll, setShowAll] = useState<Record<string, boolean>>({});
+  const [hoveredProject, setHoveredProject] = useState<string | null>(null);
+  const [hoveredConv, setHoveredConv] = useState<string | null>(null);
+  const [projectMenu, setProjectMenu] = useState<string | null>(null);
+  const [convMenu, setConvMenu] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  /** Trigger element of whichever row menu is open (anchors the portal). */
+  const menuAnchorRef = useRef<HTMLElement | null>(null);
+  const menuAnchor = menuAnchorRef as React.RefObject<HTMLElement | null>;
 
-  const toggle = (name: string) => setExpanded((e) => ({ ...e, [name]: !e[name] }));
-  const sorted = sortAZ ? [...projects].sort((a, b) => a.name.localeCompare(b.name)) : projects;
+  const toggle = (name: string) => {
+    setExpanded((e) => {
+      const next = !e[name];
+      // Collapsing resets "See all", so the next open shows 6 again.
+      if (!next) setShowAll((s) => ({ ...s, [name]: false }));
+      return { ...e, [name]: next };
+    });
+  };
+
+  const copy = (text: string) => {
+    navigator.clipboard?.writeText(text).catch(() => {});
+  };
+
+  const foldered = projects.filter((p) => p.name !== NO_PROJECT);
+  const sorted = sortAZ
+    ? [...foldered].sort((a, b) => a.name.localeCompare(b.name))
+    : foldered;
+  /** Loose chats (no folder) — rendered flat, in place of a project row. */
+  const looseConvs = projects.find((p) => p.name === NO_PROJECT)?.conversations ?? [];
+  const looseOrdered = [
+    ...looseConvs.filter((c) => c.pinned),
+    ...looseConvs.filter((c) => !c.pinned),
+  ];
+  const looseShowAll = !!showAll[NO_PROJECT];
+  const looseVisible = looseShowAll ? looseOrdered : looseOrdered.slice(0, CONV_LIMIT);
+  const looseHidden = looseOrdered.length - looseVisible.length;
+
+  /**
+   * One conversation row. `topLevel` rows are the content of the Conversations
+   * section, so they keep the section's own indentation instead of nesting.
+   */
+  const renderConversation = (
+    projectName: string,
+    c: Conversation,
+    topLevel: boolean
+  ) => {
+    const active = activeConversation === c.id && view === "chat";
+    const convActive = hoveredConv === c.id || convMenu === c.id;
+    const isRenaming = renaming === c.id;
+    return (
+      <div
+        key={`${projectName}:${c.id}`}
+        className="relative shrink-0"
+        onMouseEnter={() => setHoveredConv(c.id)}
+        onMouseLeave={() => setHoveredConv(null)}
+      >
+        {isRenaming ? (
+          <input
+            autoFocus
+            className={`${SINPUT} h-8 w-full text-[13px]`}
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.target.value)}
+            onBlur={() => {
+              const t = renameValue.trim();
+              if (t) onRenameConversation(projectName, c.id, t);
+              setRenaming(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") e.currentTarget.blur();
+              if (e.key === "Escape") setRenaming(null);
+            }}
+          />
+        ) : (
+          <button
+            className={`${ROW} w-full ${
+              topLevel ? "" : "pl-6"
+            } ${
+              active
+                ? ROW_ACTIVE
+                : convActive
+                  ? "bg-[var(--row-solid-hover)] text-[var(--text-main)]"
+                  : ROW_HOVER
+            }`}
+            onClick={() => onSelectConversation(projectName, c.id)}
+          >
+            {/* No icon — plain text, same as nested conversation rows */}
+            {c.pinned && (
+              <Pin
+                size={11}
+                strokeWidth={1.8}
+                fill="currentColor"
+                className="shrink-0 text-[var(--text-muted)]"
+              />
+            )}
+            <span className="truncate">{c.title}</span>
+            <span className="ml-auto shrink-0 font-mono text-[11px] text-[var(--text-dim)]">
+              {c.age}
+            </span>
+          </button>
+        )}
+
+        {!isRenaming && (
+          <div
+            className={`absolute right-0.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5 bg-gradient-to-l from-[var(--row-solid-gradient)] via-[var(--row-solid-gradient)] to-transparent pl-4 transition-opacity duration-100 ${
+              convActive ? "opacity-100" : "pointer-events-none opacity-0"
+            }`}
+          >
+            <button
+              className={ROW_ICON}
+              title={c.pinned ? "Unpin chat" : "Pin chat"}
+              onClick={(e) => {
+                e.stopPropagation();
+                onTogglePin(projectName, c.id);
+              }}
+            >
+              <Pin size={14} strokeWidth={1.5} fill={c.pinned ? "currentColor" : "none"} />
+            </button>
+            <button
+              className={ROW_ICON}
+              title="Chat actions"
+              onClick={(e) => {
+                e.stopPropagation();
+                menuAnchorRef.current = e.currentTarget;
+                setConvMenu(convMenu === c.id ? null : c.id);
+              }}
+            >
+              <MoreHorizontal size={14} strokeWidth={1.5} />
+            </button>
+          </div>
+        )}
+
+        <RowMenu
+          open={convMenu === c.id}
+          anchor={menuAnchor}
+          onClose={() => setConvMenu(null)}
+          items={[
+            {
+              icon: <Pencil size={14} strokeWidth={1.5} />,
+              label: "Rename chat",
+              onClick: () => {
+                setRenaming(c.id);
+                setRenameValue(c.title);
+              },
+            },
+            {
+              icon: <Trash2 size={14} strokeWidth={1.5} />,
+              label: "Delete chat",
+              danger: true,
+              onClick: () => onDeleteConversation(projectName, c.id),
+            },
+          ]}
+        />
+      </div>
+    );
+  };
+
+  const seeAllButton = (key: string, hidden: number) =>
+    hidden > 0 ? (
+      <button
+        key={`see-all-${key}`}
+        className={`flex h-7 items-center gap-1.5 rounded-md pr-2 text-[12px] text-[var(--accent)] transition-colors hover:bg-[var(--hover-bg)] ${
+          key === NO_PROJECT ? "pl-2" : "pl-6"
+        }`}
+        onClick={() => setShowAll((s) => ({ ...s, [key]: true }))}
+      >
+        <ChevronLast size={13} strokeWidth={1.8} />
+        See all ({hidden})
+      </button>
+    ) : null;
+
+  const showLessButton = (key: string, total: number) =>
+    showAll[key] && total > CONV_LIMIT ? (
+      <button
+        key={`show-less-${key}`}
+        className={`flex h-7 items-center gap-1.5 rounded-md pr-2 text-[12px] text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)] ${
+          key === NO_PROJECT ? "pl-2" : "pl-6"
+        }`}
+        onClick={() => setShowAll((s) => ({ ...s, [key]: false }))}
+      >
+        <ChevronLast size={13} strokeWidth={1.8} className="-rotate-90" />
+        Show less
+      </button>
+    ) : null;
 
   return (
     <aside
@@ -367,7 +822,7 @@ function Sidebar({
       {/* Header block (fixed — scrollbar never overlaps it) */}
       <div className="px-2.5 pt-3">
         <button
-          className="mb-2 flex h-9 w-full items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] px-3 text-left text-[13px] font-medium text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+          className="mb-2 flex h-8 w-full items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] px-3 text-left text-[13px] font-medium text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
           onClick={onNewConversation}
         >
           <Plus size={14} strokeWidth={1.5} className="shrink-0" />
@@ -392,81 +847,217 @@ function Sidebar({
         </nav>
       </div>
 
-      {/* Projects header */}
-      <div className="mb-1 mt-6 flex h-6 shrink-0 items-center px-[18px]">
-        <span className="text-[12px] font-medium text-[var(--text-dim)]">Projects</span>
-        <span className="ml-auto flex items-center gap-2">
-          <button
-            className={`flex items-center justify-center rounded p-0.5 opacity-60 transition-all hover:opacity-100 ${
-              sortAZ ? "text-[var(--accent)]" : "text-[var(--text-muted)]"
-            }`}
-            onClick={() => setSortAZ(!sortAZ)}
-            title="Sort A–Z / by date"
-          >
-            <ListFilter size={14} strokeWidth={1.5} />
-          </button>
-          <button
-            className="flex items-center justify-center rounded p-0.5 text-[var(--text-muted)] opacity-60 transition-all hover:opacity-100"
-            onClick={onNewProject}
-            title="New project"
-          >
-            <FolderPlus size={14} strokeWidth={1.5} />
-          </button>
-        </span>
-      </div>
-
-      {/* Tree — the scrollbar sits flush against the sidebar edge,
-          so the horizontal padding lives on this scrolling element. */}
-      <div
-        className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto overflow-x-hidden px-2.5"
-        ref={listRef}
-      >
-        {sorted.map((p) => {
-          const isOpen = !!expanded[p.name];
-          return (
-            <div key={p.name}>
-              <button className={`${ROW} w-full ${ROW_TEXT}`} onClick={() => toggle(p.name)}>
-                {isOpen ? (
-                  <FolderOpen size={15} strokeWidth={1.5} className="shrink-0" />
-                ) : (
-                  <Folder size={15} strokeWidth={1.5} className="shrink-0" />
-                )}
-                <span className="truncate">{p.name}</span>
+      {/* Sidebar tree — Projects and Conversations share one scroll region */}
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <ScrollArea
+          className="min-h-0 flex-1"
+          innerClassName="flex flex-col gap-0.5 px-2.5 [&>*]:shrink-0"
+        >
+          {/* Projects header — click the label to collapse the whole section */}
+          <div className="mb-1 mt-3 flex h-6 shrink-0 items-center pl-1 pr-0.5">
+            <button
+              className="flex h-6 items-center gap-1 rounded text-[12px] font-medium text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
+              onClick={() => setProjectsOpen(!projectsOpen)}
+              title={projectsOpen ? "Collapse projects" : "Expand projects"}
+            >
+              <motion.span
+                animate={{ rotate: projectsOpen ? 90 : 0 }}
+                transition={{ duration: 0.15 }}
+                className="flex items-center"
+              >
+                <ChevronRight size={12} strokeWidth={2} />
+              </motion.span>
+              Projects
+            </button>
+            <span className="ml-auto flex items-center gap-2">
+              <button
+                className={`flex items-center justify-center rounded p-0.5 opacity-60 transition-all hover:opacity-100 ${
+                  sortAZ ? "text-[var(--accent)]" : "text-[var(--text-muted)]"
+                }`}
+                onClick={() => setSortAZ(!sortAZ)}
+                title="Sort A–Z / by date"
+              >
+                <ListFilter size={14} strokeWidth={1.5} />
               </button>
+              <button
+                className="flex items-center justify-center rounded p-0.5 text-[var(--text-muted)] opacity-60 transition-all hover:opacity-100"
+                onClick={onNewProject}
+                title="New project"
+              >
+                <FolderPlus size={14} strokeWidth={1.5} />
+              </button>
+            </span>
+          </div>
 
-              <AnimatePresence initial={false}>
-                {isOpen && p.conversations.length > 0 && (
-                  <motion.div
-                    className="flex flex-col gap-0.5 overflow-hidden"
-                    initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: "auto", opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    transition={{ duration: 0.18, ease: "easeOut" }}
+          <AnimatePresence initial={false}>
+            {projectsOpen && (
+              <motion.div
+                className="flex shrink-0 flex-col gap-0.5 overflow-hidden"
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: "auto", opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: 0.18, ease: "easeOut" }}
+              >
+                {sorted.map((p) => {
+                const isOpen = !!expanded[p.name];
+                // Pinned chats float to the top of their project.
+                const ordered = [
+                  ...p.conversations.filter((c) => c.pinned),
+                  ...p.conversations.filter((c) => !c.pinned),
+                ];
+                const isShowAll = !!showAll[p.name];
+                const visible = isShowAll ? ordered : ordered.slice(0, CONV_LIMIT);
+                const hidden = ordered.length - visible.length;
+                const projectActive = hoveredProject === p.name || projectMenu === p.name;
+
+                return (
+                  <div
+                    key={p.name}
+                    className="shrink-0"
+                    onMouseEnter={() => setHoveredProject(p.name)}
+                    onMouseLeave={() => setHoveredProject(null)}
                   >
-                    {p.conversations.map((c) => (
+                    {/* Level 1 — project row; actions float above the text */}
+                    <div className="group relative">
                       <button
-                        key={c.id}
-                        className={`${ROW} pl-6 ${
-                          activeConversation === c.id && view === "chat" ? ROW_ACTIVE : ROW_HOVER
-                        }`}
-                        onClick={() => onSelectConversation(p.name, c.id)}
+                        className={`${ROW} w-full ${ROW_TEXT}`}
+                        onClick={() => toggle(p.name)}
                       >
-                        <span className="truncate">{c.title}</span>
-                        <span className="ml-auto shrink-0 font-mono text-[11px] text-[var(--text-dim)]">
-                          {c.age}
-                        </span>
+                        {isOpen ? (
+                          <FolderOpen size={15} strokeWidth={1.5} className="shrink-0" />
+                        ) : (
+                          <Folder size={15} strokeWidth={1.5} className="shrink-0" />
+                        )}
+                        <span className="truncate">{p.name}</span>
                       </button>
-                    ))}
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
-          );
-        })}
+
+                      <div
+                        className={`absolute right-0.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5 rounded-md transition-opacity duration-100 ${
+                          projectActive ? "opacity-100" : "pointer-events-none opacity-0"
+                        }`}
+                      >
+                        <button
+                          className={`${ROW_ICON} bg-[var(--row-solid)]`}
+                          title="New chat in this project"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onNewConversationInProject(p.name);
+                          }}
+                        >
+                          <Plus size={14} strokeWidth={1.5} />
+                        </button>
+                        <button
+                          className={`${ROW_ICON} bg-[var(--row-solid)]`}
+                          title="Project actions"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            menuAnchorRef.current = e.currentTarget;
+                            setProjectMenu(projectMenu === p.name ? null : p.name);
+                          }}
+                        >
+                          <MoreHorizontal size={14} strokeWidth={1.5} />
+                        </button>
+                      </div>
+
+                      <RowMenu
+                        open={projectMenu === p.name}
+                        anchor={menuAnchor}
+                        onClose={() => setProjectMenu(null)}
+                        items={[
+                          {
+                            icon: <FolderCog size={14} strokeWidth={1.5} />,
+                            label: "Project settings",
+                            onClick: () => onOpenProjectSettings(p.name),
+                          },
+                          {
+                            icon: <Copy size={14} strokeWidth={1.5} />,
+                            label: "Copy name",
+                            onClick: () => copy(p.name),
+                          },
+                          {
+                            icon: <CopyPlus size={14} strokeWidth={1.5} />,
+                            label: "Copy directory",
+                            onClick: () => copy(p.path),
+                          },
+                        ]}
+                      />
+                    </div>
+
+                    {/* Level 2 — conversations */}
+                    <AnimatePresence initial={false}>
+                      {isOpen && ordered.length > 0 && (
+                        <motion.div
+                          className="flex flex-col gap-0.5 overflow-hidden"
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: "auto", opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          transition={{ duration: 0.18, ease: "easeOut" }}
+                        >
+                          {visible.map((c) => renderConversation(p.name, c, false))}
+                          {seeAllButton(p.name, hidden)}
+                          {showLessButton(p.name, ordered.length)}
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+                );
+              })}
+
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Conversations header — loose chats, mirroring the Projects section */}
+          <div className="mb-1 mt-3 flex h-6 shrink-0 items-center pl-1 pr-0.5">
+            <button
+              className="flex h-6 items-center gap-1 rounded text-[12px] font-medium text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
+              onClick={() => setConvsOpen(!convsOpen)}
+              title={convsOpen ? "Collapse conversations" : "Expand conversations"}
+            >
+              <motion.span
+                animate={{ rotate: convsOpen ? 90 : 0 }}
+                transition={{ duration: 0.15 }}
+                className="flex items-center"
+              >
+                <ChevronRight size={12} strokeWidth={2} />
+              </motion.span>
+              Conversations
+            </button>
+            <span className="ml-auto flex items-center gap-2">
+              <button
+                className="flex items-center justify-center rounded p-0.5 text-[var(--text-muted)] opacity-60 transition-all hover:opacity-100"
+                onClick={() => onNewConversationInProject(NO_PROJECT)}
+                title="New chat without a project"
+              >
+                <Plus size={14} strokeWidth={1.5} />
+              </button>
+            </span>
+          </div>
+
+          <AnimatePresence initial={false}>
+            {convsOpen && (
+              <motion.div
+                className="flex shrink-0 flex-col gap-0.5 overflow-hidden"
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: "auto", opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: 0.18, ease: "easeOut" }}
+              >
+                {/* Loose chats — plain text rows, each still pinnable and editable */}
+                {looseVisible.map((c) => renderConversation(NO_PROJECT, c, true))}
+                {seeAllButton(NO_PROJECT, looseHidden)}
+                {showLessButton(NO_PROJECT, looseOrdered.length)}
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Bottom breathing room inside the scroll region */}
+          <div className="h-2 shrink-0" />
+        </ScrollArea>
       </div>
 
-      {/* Footer: Settings (fixed) */}
-      <div className="px-2.5 pb-3 pt-1">
+      {/* Footer: Settings — always pinned to the very bottom of the sidebar */}
+      <div className="mt-auto shrink-0 px-2.5 pb-3 pt-1">
         <button className={`${ROW} w-full ${ROW_HOVER}`} onClick={onOpenSettings}>
           <Settings size={16} strokeWidth={1.5} className="shrink-0" />
           <span>Settings</span>
@@ -477,8 +1068,6 @@ function Sidebar({
     </aside>
   );
 }
-
-/* ---------- Badge ---------- */
 
 function Badge({ kind, children }: { kind: "add" | "del" | "run"; children: React.ReactNode }) {
   return (
@@ -805,38 +1394,148 @@ function ProjectPicker({
         className="flex h-8 items-center gap-1.5 px-1 text-[13px] font-medium text-[var(--text-main)] transition-colors hover:text-[var(--accent)]"
         onClick={() => setOpen(!open)}
       >
-        <Folder size={15} strokeWidth={1.5} className="text-[var(--text-muted)]" />
+        {project === NO_PROJECT ? (
+          <MessageSquare size={15} strokeWidth={1.8} className="text-[var(--text-muted)]" />
+        ) : (
+          <Folder size={16} strokeWidth={2} />
+        )}
         {project}
         <ChevronDown size={12} className="text-[var(--text-dim)]" />
       </button>
       <AnimatePresence>
         {open && (
           <motion.div
-            className="absolute left-1/2 top-[calc(100%+8px)] z-[200] flex max-h-[260px] min-w-[240px] -translate-x-1/2 flex-col gap-0.5 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--bg-surface)] p-2 shadow-[var(--shadow-popup)]"
+            className="absolute left-1/2 top-[calc(100%+8px)] z-[200] min-w-[240px] -translate-x-1/2 rounded-xl border border-[var(--border)] bg-[var(--bg-surface)] p-2 shadow-[var(--shadow-popup)]"
             initial={{ opacity: 0, y: -8, scale: 0.96 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -8, scale: 0.96 }}
             transition={{ duration: 0.15, ease: "easeOut" }}
           >
-            {projects.map((p) => (
+            <ScrollBox className="flex max-h-[260px] flex-col gap-0.5">
+              {/* No project — chat that lives outside any folder */}
               <button
-                key={p.name}
-                className={`${MENU_ITEM} ${p.name === project ? "bg-[var(--hover-bg)]" : ""} py-2`}
+                className={`${MENU_ITEM} ${project === NO_PROJECT ? "bg-[var(--hover-bg)]" : ""} py-2`}
                 onClick={() => {
-                  onSelect(p.name);
+                  onSelect(NO_PROJECT);
                   setOpen(false);
                 }}
               >
-                <Folder size={14} />
-                <span className="truncate">{p.name}</span>
-                {p.name === project && <Check size={12} className="ml-auto text-[var(--text-dim)]" />}
+                <MessageSquare size={14} />
+                <span className="truncate">{NO_PROJECT}</span>
+                {project === NO_PROJECT && (
+                  <Check size={12} className="ml-auto text-[var(--text-dim)]" />
+                )}
               </button>
-            ))}
+              <div className="my-1 h-px bg-[var(--border-soft)]" />
+              {projects
+                .filter((p) => p.name !== NO_PROJECT)
+                .map((p) => (
+                  <button
+                    key={p.name}
+                    className={`${MENU_ITEM} ${p.name === project ? "bg-[var(--hover-bg)]" : ""} py-2`}
+                    onClick={() => {
+                      onSelect(p.name);
+                      setOpen(false);
+                    }}
+                  >
+                    <Folder size={14} />
+                    <span className="truncate">{p.name}</span>
+                    {p.name === project && (
+                      <Check size={12} className="ml-auto text-[var(--text-dim)]" />
+                    )}
+                  </button>
+                ))}
+            </ScrollBox>
           </motion.div>
         )}
       </AnimatePresence>
     </div>
   );
+}
+
+/* ---------- Speech-to-text (Web Speech API, provided by WebView2/Edge) ---------- */
+
+type SpeechRec = {
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((e: any) => void) | null;
+  onerror: ((e: any) => void) | null;
+  onend: (() => void) | null;
+};
+
+function getSpeechRecognition(): (new () => SpeechRec) | null {
+  const w = window as any;
+  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
+}
+
+/**
+ * Microphone → text. Streams recognized speech into the caller via onText
+ * (interim results are shown live, final results are appended).
+ */
+function useSpeechToText(
+  lang: string,
+  onText: (chunk: string, isFinal: boolean) => void
+) {
+  const [listening, setListening] = useState(false);
+  const [supported] = useState(() => getSpeechRecognition() !== null);
+  const recRef = useRef<SpeechRec | null>(null);
+  const finalRef = useRef("");
+  const cbRef = useRef(onText);
+  cbRef.current = onText;
+
+  const stop = () => {
+    try {
+      recRef.current?.stop();
+    } catch {
+      /* already stopped */
+    }
+    setListening(false);
+  };
+
+  const start = () => {
+    const Ctor = getSpeechRecognition();
+    if (!Ctor) return;
+    try {
+      const rec = new Ctor();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.lang = lang;
+      finalRef.current = "";
+
+      rec.onresult = (e: any) => {
+        let interim = "";
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const res = e.results[i];
+          const txt = res[0]?.transcript ?? "";
+          if (res.isFinal) {
+            finalRef.current += txt;
+            cbRef.current(txt.trim() ? txt : "", true);
+          } else {
+            interim += txt;
+          }
+        }
+        if (interim) cbRef.current(interim, false);
+      };
+      rec.onerror = () => {
+        setListening(false);
+      };
+      rec.onend = () => setListening(false);
+
+      rec.start();
+      recRef.current = rec;
+      setListening(true);
+    } catch {
+      setListening(false);
+    }
+  };
+
+  useEffect(() => () => recRef.current?.abort?.(), []);
+
+  return { listening, supported, start, stop, toggle: () => (listening ? stop() : start()) };
 }
 
 /* ---------- Prompt box ---------- */
@@ -859,6 +1558,7 @@ function PromptBox({
   const [modelId, setModelId] = useState("deepseek-v4");
   const [turbo, setTurbo] = useState(true);
   const ref = useRef<HTMLTextAreaElement>(null);
+  const promptThumb = useOverlayThumb(ref);
 
   const autoGrow = () => {
     const el = ref.current;
@@ -867,8 +1567,20 @@ function PromptBox({
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   };
 
+  const speech = useSpeechToText("ru-RU", (chunk, isFinal) => {
+    if (!isFinal) return; // interim text is handled below via preview
+    setText((prev) => `${prev}${prev && !prev.endsWith(" ") ? " " : ""}${chunk.trim()}`);
+    requestAnimationFrame(autoGrow);
+  });
+
+  const toggleMic = () => {
+    if (speech.listening) speech.stop();
+    else speech.start();
+  };
+
   const send = () => {
     if (!text.trim()) return;
+    speech.stop();
     onSend(text.trim());
     setText("");
     requestAnimationFrame(autoGrow);
@@ -884,23 +1596,27 @@ function PromptBox({
         )}
         {/* min-h 108px, radius 16, theme surface + border */}
         <div className="flex min-h-[108px] w-full flex-col justify-between rounded-2xl border border-[var(--border)] bg-[var(--bg-surface)] transition-colors focus-within:border-[var(--accent)]">
-          <textarea
-            ref={ref}
-            rows={1}
-            className="max-h-[200px] min-h-[44px] w-full resize-none border-none bg-transparent px-4 pb-2 pt-3.5 text-[14px] leading-normal text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
-            placeholder="Ask anything…  /commands   @files @folders @terminal @git"
-            value={text}
-            onChange={(e) => {
-              setText(e.target.value);
-              autoGrow();
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                send();
-              }
-            }}
-          />
+          {/* Textarea keeps the custom overlay bar too (native bar is hidden) */}
+          <div className="relative">
+            <textarea
+              ref={ref}
+              rows={1}
+              className="no-native-scrollbar max-h-[200px] min-h-[44px] w-full resize-none border-none bg-transparent px-4 pb-2 pt-3.5 text-[14px] leading-normal text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
+              placeholder="Ask anything…  /commands   @files @folders @terminal @git"
+              value={text}
+              onChange={(e) => {
+                setText(e.target.value);
+                autoGrow();
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  send();
+                }
+              }}
+            />
+            <Thumb thumb={promptThumb} />
+          </div>
           {/* Toolbar: 6px 12px 10px, space-between */}
           <div className="flex items-center justify-between gap-1.5 px-3 pb-2.5 pt-1.5">
             <div className="flex min-w-0 items-center gap-1.5">
@@ -928,11 +1644,31 @@ function PromptBox({
             </div>
 
             <div className="flex shrink-0 items-center gap-1">
+              {/* Mic: 28×28, icon 15 — live speech-to-text while active */}
               <button
-                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-                title="Voice input"
+                className={`relative flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+                  speech.listening
+                    ? "bg-[var(--diff-del)]/15 text-[var(--diff-del)]"
+                    : "text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                } ${speech.supported ? "" : "cursor-not-allowed opacity-40"}`}
+                onClick={toggleMic}
+                disabled={!speech.supported}
+                title={
+                  speech.supported
+                    ? speech.listening
+                      ? "Stop dictation"
+                      : "Dictate with microphone"
+                    : "Speech recognition is unavailable"
+                }
               >
                 <Mic size={15} strokeWidth={1.5} />
+                {speech.listening && (
+                  <motion.span
+                    className="absolute inset-0 rounded-md border border-[var(--diff-del)]"
+                    animate={{ opacity: [0.9, 0.25, 0.9] }}
+                    transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
+                  />
+                )}
               </button>
               <button
                 className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--accent)] text-white transition-colors hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--bg-elevated)] disabled:text-[var(--text-dim)]"
@@ -1222,7 +1958,7 @@ function SettingsModal({
 
   return (
     <motion.div
-      className="fixed inset-0 z-[400] flex items-center justify-center bg-black/65 backdrop-blur-md"
+      className="fixed inset-0 z-[400] flex items-center justify-center bg-black/5 backdrop-blur-sm"
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
@@ -1231,13 +1967,16 @@ function SettingsModal({
     >
       <motion.div
         className="flex h-[min(580px,calc(100vh-48px))] w-[min(820px,calc(100vw-48px))] overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-app)] shadow-[0_25px_50px_-12px_rgba(0,0,0,0.7)]"
-        initial={{ opacity: 0, y: 16, scale: 0.97 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
+        initial={{ opacity: 0, scale: 0.97 }}
+        animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.2, ease: "easeOut" }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Left column — categories */}
-        <div className="flex w-[210px] shrink-0 flex-col overflow-y-auto border-r border-[var(--border)] px-3 py-4">
+        <ScrollArea
+          className="w-[210px] shrink-0 border-r border-[var(--border)]"
+          innerClassName="flex flex-col gap-3 px-3 py-4"
+        >
           {navItems.map((grp) => (
             <div key={grp.group}>
               <div className="mb-1.5 mt-3 px-2.5 text-[11px] font-medium uppercase tracking-wide text-[var(--text-dim)] first:mt-0">
@@ -1258,19 +1997,10 @@ function SettingsModal({
               ))}
             </div>
           ))}
-          <div className="mt-auto flex items-center gap-2.5 border-t border-[var(--border)] pt-3">
-            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[12px] font-semibold text-white">
-              N
-            </div>
-            <div className="min-w-0">
-              <div className="truncate text-[12px] font-bold text-[var(--text-main)]">nezuss</div>
-              <div className="truncate text-[11px] text-[var(--text-dim)]">nezuss@local</div>
-            </div>
-          </div>
-        </div>
+        </ScrollArea>
 
         {/* Right column — content */}
-        <div className="flex-1 overflow-y-auto px-7 py-6">
+        <ScrollArea className="flex-1" innerClassName="px-7 py-6">
           <div className="mb-6 flex items-start">
             <div>
               <div className="text-[21px] font-semibold text-[var(--text-main)]">
@@ -1382,7 +2112,7 @@ function SettingsModal({
           {section === "projects" && (
             <div className="flex flex-col gap-3">
               <SettingsCard>
-                <div className="flex max-h-[300px] flex-col gap-1 overflow-y-auto">
+                <ScrollBox className="flex max-h-[300px] flex-col gap-1 pr-2">
                   {projects.map((p) => (
                     <span
                       key={p.name}
@@ -1394,7 +2124,7 @@ function SettingsModal({
                       </span>
                     </span>
                   ))}
-                </div>
+                </ScrollBox>
               </SettingsCard>
               <SettingsCard>
                 <SettingRow title="New project" hint="Adds a folder to the sidebar tree">
@@ -1412,7 +2142,7 @@ function SettingsModal({
               </SettingsCard>
             </div>
           )}
-        </div>
+        </ScrollArea>
       </motion.div>
     </motion.div>
   );
@@ -1490,10 +2220,6 @@ export default function App() {
   });
   const [newChatProject, setNewChatProject] = useState("Singularity");
   const chatRef = useRef<HTMLDivElement>(null);
-  // Hooks must run unconditionally, so all scroll areas get their indicator here.
-  const historyRef = useScrollIndicator<HTMLDivElement>();
-  const tasksRef = useScrollIndicator<HTMLDivElement>();
-  const chatScrollRef = useScrollIndicator<HTMLDivElement>(chatRef);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -1548,13 +2274,59 @@ export default function App() {
           view={view}
           onSelectConversation={openConversation}
           onNewConversation={() => {
+            // Plain "New Conversation" starts a chat with no project folder.
+            setNewChatProject(NO_PROJECT);
+            setActiveConv(null);
+            setDraftMsgs([]);
+            setView("new");
+          }}
+          onNewConversationInProject={(project) => {
+            setNewChatProject(project);
             setActiveConv(null);
             setDraftMsgs([]);
             setView("new");
           }}
           onShowView={(v) => setView(v)}
           onOpenSettings={() => setModal("settings")}
+          onOpenProjectSettings={() => setModal("settings")}
           onNewProject={() => setModal("settings")}
+          onRenameConversation={(project, convId, title) =>
+            setProjects((prev) =>
+              prev.map((p) =>
+                p.name !== project
+                  ? p
+                  : {
+                      ...p,
+                      conversations: p.conversations.map((c) =>
+                        c.id === convId ? { ...c, title } : c
+                      ),
+                    }
+              )
+            )
+          }
+          onDeleteConversation={(project, convId) =>
+            setProjects((prev) =>
+              prev.map((p) =>
+                p.name !== project
+                  ? p
+                  : { ...p, conversations: p.conversations.filter((c) => c.id !== convId) }
+              )
+            )
+          }
+          onTogglePin={(project, convId) =>
+            setProjects((prev) =>
+              prev.map((p) =>
+                p.name !== project
+                  ? p
+                  : {
+                      ...p,
+                      conversations: p.conversations.map((c) =>
+                        c.id === convId ? { ...c, pinned: !c.pinned } : c
+                      ),
+                    }
+              )
+            )
+          }
         />
 
         <div className="flex min-w-0 flex-1 flex-col bg-[var(--bg-app)]">
@@ -1566,19 +2338,19 @@ export default function App() {
           )}
 
           {view === "history" && (
-            <div className="flex-1 overflow-y-auto py-4" ref={historyRef}>
+            <ScrollArea className="flex-1" innerClassName="py-4">
               <div className="px-6">
                 <HistoryView projects={projects} onOpen={openConversation} />
               </div>
-            </div>
+            </ScrollArea>
           )}
 
           {view === "tasks" && (
-            <div className="flex-1 overflow-y-auto py-4" ref={tasksRef}>
+            <ScrollArea className="flex-1" innerClassName="py-4">
               <div className="px-6">
                 <TasksView scheduled={scheduled} onScheduleTask={() => setModal("schedule")} />
               </div>
-            </div>
+            </ScrollArea>
           )}
 
           {view === "new" && (
@@ -1595,7 +2367,23 @@ export default function App() {
                   project={newChatProject}
                   onSelectProject={setNewChatProject}
                   onSend={(text) => {
-                    setActiveConv({ project: newChatProject, id: `new-${Date.now()}` });
+                    const id = `new-${Date.now()}`;
+                    const title = text.length > 42 ? `${text.slice(0, 42)}…` : text;
+                    // Persist the chat into its project (or the loose-chat section).
+                    setProjects((prev) =>
+                      prev.map((p) =>
+                        p.name !== newChatProject
+                          ? p
+                          : {
+                              ...p,
+                              conversations: [
+                                { id, title, age: "now" },
+                                ...p.conversations,
+                              ],
+                            }
+                      )
+                    );
+                    setActiveConv({ project: newChatProject, id });
                     setDraftMsgs([{ role: "user", text }]);
                     setView("chat");
                   }}
@@ -1606,13 +2394,13 @@ export default function App() {
 
           {view === "chat" && (
             <>
-              <div className="flex-1 overflow-y-auto py-4" ref={chatScrollRef}>
-                <div className="px-6 pr-2">
+              <ScrollArea className="flex-1" innerClassName="py-4" scrollRef={chatRef}>
+                <div className="px-6">
                   <div
                     className="mx-auto flex w-full max-w-[760px] flex-col gap-4"
                     key={activeConv?.id ?? "new"}
                   >
-                  {activeConv?.id === "fix-terminal-tests" && <ChatBody />}
+                    {activeConv?.id === "fix-terminal-tests" && <ChatBody />}
                     <AnimatePresence initial={false}>
                       {draftMsgs.map((m, i) => (
                         <motion.div
@@ -1627,7 +2415,7 @@ export default function App() {
                     </AnimatePresence>
                   </div>
                 </div>
-              </div>
+              </ScrollArea>
               <PromptBox
                 onSend={(text) => setDraftMsgs((prev) => [...prev, { role: "user", text }])}
                 projects={projects}
@@ -1644,7 +2432,9 @@ export default function App() {
               theme={theme}
               onTheme={setTheme}
               projects={projects}
-              onAddProject={(n) => setProjects((p) => [...p, { name: n, conversations: [] }])}
+              onAddProject={(n) =>
+                setProjects((p) => [...p, { name: n, path: R + n, conversations: [] }])
+              }
               onClose={() => setModal("none")}
             />
           )}

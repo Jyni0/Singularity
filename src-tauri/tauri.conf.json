@@ -14,7 +14,7 @@
       {
         "title": "Singularity",
         "width": 1440,
-        "height": 900,
+        "height": 700,
         "minWidth": 1024,
         "minHeight": 700,
         "resizable": true,

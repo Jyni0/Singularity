@@ -20,7 +20,7 @@
   --border: rgba(255, 255, 255, 0.08);
   --border-soft: rgba(255, 255, 255, 0.06);
   --text-main: #E4E4E7;
-  --text-muted: #9CA3AF;
+  --text-muted: #6e6e6e;
   --text-dim: #71717A;
   --accent: #388BFD;
   --accent-hover: #007ACC;
@@ -107,29 +107,58 @@
 
   button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
   input, textarea, select { font: inherit; }
-
-  /* Scrollbars: invisible until you actually scroll or hover the area */
-  ::-webkit-scrollbar { width: 8px; height: 8px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb {
-    background: transparent;
-    border-radius: 8px;
-    transition: background 0.25s ease;
-  }
-  *:hover::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, 0.3); }
-  ::-webkit-scrollbar-thumb:hover { background: rgba(128, 128, 128, 0.55); }
-  ::-webkit-scrollbar-corner { background: transparent; }
 }
 
-/* Thumb appears while the area is actively being scrolled (see useScrollIndicator) */
-.scrolling::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, 0.38); }
-.scrolling { scrollbar-color: rgba(128, 128, 128, 0.38) transparent; }
+/* Native scrollbars are fully disabled — the app draws its own overlay bar.
+   This kills WebView2/Edge "fluent" bars: no arrows, no width jump, no layout shift. */
+.no-native-scrollbar {
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* legacy Edge */
+}
+.no-native-scrollbar::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+/* Custom overlay scrollbar thumb — hugs the very right edge (1px inset) */
+.scroll-thumb {
+  position: absolute;
+  right: 1px;
+  width: 6px;
+  border-radius: 9999px;
+  background: rgba(128, 128, 128, 0.3);
+  transition: background 0.15s ease, opacity 0.2s ease;
+  z-index: 30;
+}
+.scroll-thumb:hover,
+.scroll-thumb--active { background: rgba(128, 128, 128, 0.55); }
 
 /* Neutral hover surface (theme-aware) */
-[data-theme="dark"] { --hover-bg: rgba(255, 255, 255, 0.06); }
-[data-theme="light"] { --hover-bg: rgba(0, 0, 0, 0.05); }
-[data-theme="slate"] { --hover-bg: rgba(255, 255, 255, 0.06); }
-[data-theme="amoled"] { --hover-bg: rgba(255, 255, 255, 0.07); }
+[data-theme="dark"] {
+  --hover-bg: rgba(255, 255, 255, 0.06);
+  --row-solid: #181818;
+  --row-solid-hover: #242424;
+  --row-solid-gradient: #242424;
+}
+[data-theme="light"] {
+  --hover-bg: rgba(0, 0, 0, 0.05);
+  --row-solid: #F1F3F5;
+  --row-solid-hover: #E5E7E9;
+  --row-solid-gradient: #E5E7E9;
+}
+[data-theme="slate"] {
+  --hover-bg: rgba(255, 255, 255, 0.06);
+  --row-solid: #0B1120;
+  --row-solid-hover: #1A2131;
+  --row-solid-gradient: #1A2131;
+}
+[data-theme="amoled"] {
+  --hover-bg: rgba(255, 255, 255, 0.07);
+  --row-solid: #050505;
+  --row-solid-hover: #171717;
+  --row-solid-gradient: #171717;
+}
 
 /* Sidebar drag-resizer (kept as plain CSS, it's a behavior strip) */
 .sidebar-resizer {
@@ -166,4 +195,3 @@
 
 /* Window close button hover (native-like) */
 .win-close:hover { background: #E81123; color: #fff; }
-

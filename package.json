@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "icons": "tauri icon app-icon.png && python scripts/generate_icons.py"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

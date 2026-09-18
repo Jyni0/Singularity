@@ -5,6 +5,7 @@ import {
   Plus,
   MessageSquare,
   Folder,
+  FolderOpen,
   History,
   Timer,
   ListFilter,
@@ -25,9 +26,60 @@ import {
   Minus,
   Square,
   Copy,
-  FolderOpen,
   Mic,
 } from "lucide-react";
+
+/* ---------- Shared class fragments (single source of truth) ---------- */
+
+/** Sidebar / titlebar row: h 32px, padding 0 8px, radius 6px, gap 10px */
+const ROW = "flex h-8 shrink-0 items-center gap-2.5 rounded-md px-2 text-left text-[13px]";
+/** Hover: text brightens only (no background) */
+const ROW_TEXT = "text-[var(--text-muted)] transition-colors hover:text-[var(--text-main)]";
+/** Hover + active: background highlight (used by nav / settings) */
+const ROW_HOVER =
+  "text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
+/** Active row: background highlight only (no other changes) */
+const ROW_ACTIVE = "bg-[var(--hover-bg)]";
+/** Chip in prompt box: h 28px, padding 0 10px, radius 6px, 12px */
+const CHIP =
+  "inline-flex h-7 shrink-0 cursor-pointer items-center gap-1.5 rounded-md px-2.5 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
+/** Context chip: h 24px, padding 0 8px, 11px */
+const CHIP_CTX =
+  "inline-flex h-6 shrink-0 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[11px] text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
+/** Small theme-aware button (settings / panels) */
+const SBUTTON =
+  "flex h-[30px] shrink-0 items-center justify-center rounded-md bg-[var(--bg-elevated)] px-3 text-[12px] text-[var(--text-main)] transition-colors hover:bg-[var(--bg-input)] disabled:cursor-not-allowed disabled:opacity-50";
+/** Select in settings */
+const SSELECT =
+  "h-8 min-w-[130px] cursor-pointer rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2 text-[12px] text-[var(--text-main)] outline-none";
+/** Text input in settings */
+const SINPUT =
+  "h-8 w-[180px] rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 text-[12px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
+
+/* ---------- Scroll indicator hook ----------
+   Adds `.scrolling` to the scrolled element while the user is actively
+   scrolling, so the thumb only appears then (plus on hover). */
+
+function useScrollIndicator<T extends HTMLElement>(extraRef?: React.RefObject<T>) {
+  const localRef = useRef<T>(null);
+  const ref = (extraRef ?? localRef) as React.RefObject<T>;
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    let timer: number | undefined;
+    const onScroll = () => {
+      el.classList.add("scrolling");
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => el.classList.remove("scrolling"), 900);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      window.clearTimeout(timer);
+    };
+  }, [ref]);
+  return ref;
+}
 
 /* ---------- Types ---------- */
 
@@ -59,7 +111,7 @@ interface Msg {
 export interface Conversation {
   id: string;
   title: string;
-  age: string; // e.g. "7d"
+  age: string;
 }
 
 export interface Project {
@@ -141,7 +193,7 @@ const DIFF: DiffLine[] = [
   { kind: "ctx", text: "  }", no: "18" },
 ];
 
-/* ---------- Custom title bar (window controls + app menu) ---------- */
+/* ---------- Custom title bar ---------- */
 
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -192,14 +244,24 @@ function TitleBar() {
   };
 
   return (
-    <div ref={barRef} className="titlebar" data-tauri-drag-region>
+    <div
+      ref={barRef}
+      data-tauri-drag-region
+      className="flex h-[34px] shrink-0 select-none items-center bg-[var(--bg-titlebar)]"
+    >
       {/* Left: app menu */}
-      <div className="titlebar__menu">
-        <span className="titlebar__logo">Singularity</span>
+      <div className="flex h-full items-center gap-1 pl-2">
+        <span className="mr-0.5 px-2 text-[13px] font-semibold tracking-wide bg-gradient-to-r from-[#348867] to-[#64d5a4] bg-clip-text text-transparent">
+          Singularity
+        </span>
         {Object.keys(MENUS).map((m) => (
-          <div key={m} className="titlebar__menu-item-wrap">
+          <div key={m} className="relative flex h-full items-center">
             <button
-              className={`titlebar__menu-item ${openMenu === m ? "titlebar__menu-item--open" : ""}`}
+              className={`mr-0.5 rounded px-2.5 py-1 text-[13px] transition-colors ${
+                openMenu === m
+                  ? "bg-[var(--hover-bg)] text-[var(--text-main)]"
+                  : "text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+              }`}
               onMouseDown={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -212,7 +274,7 @@ function TitleBar() {
             <AnimatePresence>
               {openMenu === m && (
                 <motion.div
-                  className="titlebar__dropdown"
+                  className="absolute left-0 top-[calc(100%+4px)] z-[300] flex min-w-[200px] flex-col gap-0.5 rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] p-1 shadow-[var(--shadow-popup)]"
                   initial={{ opacity: 0, y: -4 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -4 }}
@@ -221,7 +283,7 @@ function TitleBar() {
                   {MENUS[m].map((item) => (
                     <button
                       key={item}
-                      className="titlebar__dropdown-item"
+                      className="flex w-full items-center rounded-md px-2.5 py-1.5 text-left text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
                       onClick={() => runMenuAction(item)}
                     >
                       {item}
@@ -235,25 +297,37 @@ function TitleBar() {
       </div>
 
       {/* Center: drag region */}
-      <div className="titlebar__drag" data-tauri-drag-region />
+      <div className="h-full flex-1" data-tauri-drag-region />
 
-      {/* Right: window controls */}
-      <div className="titlebar__controls">
-        <button className="titlebar__ctrl" onClick={minimize} title="Minimize">
-          <Minus size={12} strokeWidth={1} />
+      {/* Right: window controls — 54px wide, full height */}
+      <div className="flex h-full items-stretch">
+        <button
+          className="flex w-[54px] items-center justify-center text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+          onClick={minimize}
+          title="Minimize"
+        >
+          <Minus size={15} strokeWidth={1} />
         </button>
-        <button className="titlebar__ctrl" onClick={toggleMax} title={maximized ? "Restore" : "Maximize"}>
-          {maximized ? <Copy size={11} strokeWidth={1} /> : <Square size={11} strokeWidth={1} />}
+        <button
+          className="flex w-[54px] items-center justify-center text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+          onClick={toggleMax}
+          title={maximized ? "Restore" : "Maximize"}
+        >
+          {maximized ? <Copy size={13} strokeWidth={1} /> : <Square size={13} strokeWidth={1} />}
         </button>
-        <button className="titlebar__ctrl titlebar__ctrl--close" onClick={close} title="Close">
-          <X size={12} strokeWidth={1} />
+        <button
+          className="flex w-[54px] items-center justify-center text-[var(--text-muted)] transition-colors hover:bg-[#E81123] hover:text-white"
+          onClick={close}
+          title="Close"
+        >
+          <X size={15} strokeWidth={1.2} />
         </button>
       </div>
     </div>
   );
 }
 
-/* ---------- Sidebar (tree view) ---------- */
+/* ---------- Sidebar ---------- */
 
 function Sidebar({
   width,
@@ -280,63 +354,59 @@ function Sidebar({
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({ Singularity: true });
   const [sortAZ, setSortAZ] = useState(true);
+  const listRef = useScrollIndicator<HTMLDivElement>();
 
   const toggle = (name: string) => setExpanded((e) => ({ ...e, [name]: !e[name] }));
   const sorted = sortAZ ? [...projects].sort((a, b) => a.name.localeCompare(b.name)) : projects;
 
   return (
     <aside
-      className="relative flex shrink-0 flex-col bg-[#181818] p-[12px_10px] text-[13px] leading-tight"
+      className="relative flex shrink-0 flex-col bg-[var(--bg-sidebar)] text-[13px] leading-tight"
       style={{ width: `${width}px` }}
     >
-      {/* Primary action */}
-      <button
-        className="mb-3 flex h-9 w-full items-center gap-2 rounded-lg border border-[#2e2e2e] bg-[#1f1f1f] px-3 text-left text-[13px] font-medium text-[#cccccc] transition-colors hover:bg-[#262626] hover:text-white"
-        onClick={onNewConversation}
-      >
-        <Plus size={14} strokeWidth={1.5} className="shrink-0" />
-        <span>New Conversation</span>
-      </button>
-
-      {/* System navigation — opens views in chat area */}
-      <nav className="flex flex-col gap-0.5">
+      {/* Header block (fixed — scrollbar never overlaps it) */}
+      <div className="px-2.5 pt-3">
         <button
-          className={`flex h-8 items-center gap-2.5 rounded-md px-2 text-left text-[13px] transition-colors ${
-            view === "history"
-              ? "font-medium text-white"
-              : "text-[#cccccc] hover:text-white"
-          }`}
-          onClick={() => onShowView("history")}
+          className="mb-2 flex h-9 w-full items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] px-3 text-left text-[13px] font-medium text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+          onClick={onNewConversation}
         >
-          <History size={16} strokeWidth={1.5} className="shrink-0" />
-          <span>Conversation History</span>
+          <Plus size={14} strokeWidth={1.5} className="shrink-0" />
+          <span>New Conversation</span>
         </button>
-        <button
-          className={`flex h-8 items-center gap-2.5 rounded-md px-2 text-left text-[13px] transition-colors ${
-            view === "tasks"
-              ? "font-medium text-white"
-              : "text-[#cccccc] hover:text-white"
-          }`}
-          onClick={() => onShowView("tasks")}
-        >
-          <Timer size={16} strokeWidth={1.5} className="shrink-0" />
-          <span>Scheduled Tasks</span>
-        </button>
-      </nav>
 
-      {/* Project tree header */}
-      <div className="mt-4 mb-1 flex h-6 items-center px-2">
-        <span className="text-[12px] font-medium text-[#707070]">Projects</span>
+        <nav className="flex flex-col gap-2">
+          <button
+            className={`${ROW} ${view === "history" ? ROW_ACTIVE : ROW_HOVER}`}
+            onClick={() => onShowView("history")}
+          >
+            <History size={16} strokeWidth={1.5} className="shrink-0" />
+            <span>Conversation History</span>
+          </button>
+          <button
+            className={`${ROW} ${view === "tasks" ? ROW_ACTIVE : ROW_HOVER}`}
+            onClick={() => onShowView("tasks")}
+          >
+            <Timer size={16} strokeWidth={1.5} className="shrink-0" />
+            <span>Scheduled Tasks</span>
+          </button>
+        </nav>
+      </div>
+
+      {/* Projects header */}
+      <div className="mb-1 mt-6 flex h-6 shrink-0 items-center px-[18px]">
+        <span className="text-[12px] font-medium text-[var(--text-dim)]">Projects</span>
         <span className="ml-auto flex items-center gap-2">
           <button
-            className={`flex items-center justify-center rounded p-0.5 opacity-60 transition-all hover:opacity-100 ${sortAZ ? "text-[#388BFD]" : "text-[#9CA3AF]"}`}
+            className={`flex items-center justify-center rounded p-0.5 opacity-60 transition-all hover:opacity-100 ${
+              sortAZ ? "text-[var(--accent)]" : "text-[var(--text-muted)]"
+            }`}
             onClick={() => setSortAZ(!sortAZ)}
             title="Sort A–Z / by date"
           >
             <ListFilter size={14} strokeWidth={1.5} />
           </button>
           <button
-            className="flex items-center justify-center rounded p-0.5 text-[#9CA3AF] opacity-60 transition-all hover:opacity-100"
+            className="flex items-center justify-center rounded p-0.5 text-[var(--text-muted)] opacity-60 transition-all hover:opacity-100"
             onClick={onNewProject}
             title="New project"
           >
@@ -345,17 +415,17 @@ function Sidebar({
         </span>
       </div>
 
-      {/* Tree view (scrollable) */}
-      <div className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto overflow-x-hidden [scrollbar-color:rgba(255,255,255,0.1)_transparent] [scrollbar-width:thin]">
+      {/* Tree — the scrollbar sits flush against the sidebar edge,
+          so the horizontal padding lives on this scrolling element. */}
+      <div
+        className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto overflow-x-hidden px-2.5"
+        ref={listRef}
+      >
         {sorted.map((p) => {
           const isOpen = !!expanded[p.name];
           return (
             <div key={p.name}>
-              {/* Level 1 — project */}
-              <button
-                className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[13px] text-[#cccccc] transition-colors hover:text-white"
-                onClick={() => toggle(p.name)}
-              >
+              <button className={`${ROW} w-full ${ROW_TEXT}`} onClick={() => toggle(p.name)}>
                 {isOpen ? (
                   <FolderOpen size={15} strokeWidth={1.5} className="shrink-0" />
                 ) : (
@@ -363,7 +433,7 @@ function Sidebar({
                 )}
                 <span className="truncate">{p.name}</span>
               </button>
-              {/* Level 2 — conversations */}
+
               <AnimatePresence initial={false}>
                 {isOpen && p.conversations.length > 0 && (
                   <motion.div
@@ -376,17 +446,13 @@ function Sidebar({
                     {p.conversations.map((c) => (
                       <button
                         key={c.id}
-                        className={`flex h-8 items-center gap-2 rounded-md py-0 pr-2 text-left text-[13px] transition-colors ${
-                          activeConversation === c.id && view === "chat"
-                            ? "font-medium text-white"
-                            : "text-[#cccccc] hover:text-white"
+                        className={`${ROW} pl-6 ${
+                          activeConversation === c.id && view === "chat" ? ROW_ACTIVE : ROW_HOVER
                         }`}
-                        style={{ paddingLeft: "24px" }}
                         onClick={() => onSelectConversation(p.name, c.id)}
                       >
-                        <MessageSquare size={15} strokeWidth={1.5} className="shrink-0" />
                         <span className="truncate">{c.title}</span>
-                        <span className="ml-auto w-5 shrink-0 text-right font-mono text-[11px] text-[#6e6e6e]">
+                        <span className="ml-auto shrink-0 font-mono text-[11px] text-[var(--text-dim)]">
                           {c.age}
                         </span>
                       </button>
@@ -399,17 +465,30 @@ function Sidebar({
         })}
       </div>
 
-      {/* Footer — Settings pinned to bottom */}
-      <button
-        className="mt-auto flex h-8 items-center gap-2.5 rounded-md px-2 text-left text-[13px] text-[#cccccc] transition-colors hover:text-white"
-        onClick={onOpenSettings}
-      >
-        <Settings size={16} strokeWidth={1.5} className="shrink-0" />
-        <span>Settings</span>
-      </button>
+      {/* Footer: Settings (fixed) */}
+      <div className="px-2.5 pb-3 pt-1">
+        <button className={`${ROW} w-full ${ROW_HOVER}`} onClick={onOpenSettings}>
+          <Settings size={16} strokeWidth={1.5} className="shrink-0" />
+          <span>Settings</span>
+        </button>
+      </div>
 
-      <div className="sidebar__resizer" onMouseDown={startResize} />
+      <div className="sidebar-resizer" onMouseDown={startResize} />
     </aside>
+  );
+}
+
+/* ---------- Badge ---------- */
+
+function Badge({ kind, children }: { kind: "add" | "del" | "run"; children: React.ReactNode }) {
+  return (
+    <span
+      className={`inline-flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono text-[11px] ${
+        kind === "add" ? "badge-add" : kind === "del" ? "badge-del" : "badge-run"
+      }`}
+    >
+      {children}
+    </span>
   );
 }
 
@@ -428,22 +507,25 @@ function TaskCard({
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <div className="card task-card">
-      <div className="task-card__head" onClick={() => setOpen(!open)}>
+    <div className="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-surface)]">
+      <div
+        className="flex cursor-pointer select-none items-center gap-2 border-b border-[var(--border)] px-3 py-2"
+        onClick={() => setOpen(!open)}
+      >
         {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        <span className="task-card__title">{title}</span>
+        <span className="flex-1 font-semibold">{title}</span>
         {badge}
       </div>
       <AnimatePresence initial={false}>
         {open && (
           <motion.div
-            className="task-card__anim"
+            className="overflow-hidden"
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: "auto", opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
             transition={{ duration: 0.2, ease: "easeOut" }}
           >
-            <div className="task-card__body">{children}</div>
+            <div className="flex flex-col gap-2 p-3">{children}</div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -456,32 +538,39 @@ function TaskCard({
 function DiffViewer({ file }: { file: string }) {
   const [decision, setDecision] = useState<"none" | "accepted" | "rejected">("none");
   return (
-    <div className="diff">
-      <div className="diff__header">
-        <span className="diff__file mono">{file}</span>
-        <span className="badge badge--add">+4</span>
-        <span className="badge badge--del">-2</span>
-        <div className="diff__actions">
+    <div className="max-w-full overflow-x-auto rounded-xl border border-[var(--border)] font-mono text-[13px] leading-normal">
+      <div className="flex items-center gap-2 border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 py-2">
+        <span className="flex-1 text-[12px]">{file}</span>
+        <Badge kind="add">+4</Badge>
+        <Badge kind="del">-2</Badge>
+        <div className="flex gap-2">
           {decision === "none" ? (
             <>
-              <button className="btn" onClick={() => setDecision("accepted")}>
-                <Check size={12} /> Accept
+              <button className={`${SBUTTON} h-6 px-2 text-[11px]`} onClick={() => setDecision("accepted")}>
+                <Check size={12} className="mr-1" /> Accept
               </button>
-              <button className="btn" onClick={() => setDecision("rejected")}>
-                <X size={12} /> Reject
+              <button className={`${SBUTTON} h-6 px-2 text-[11px]`} onClick={() => setDecision("rejected")}>
+                <X size={12} className="mr-1" /> Reject
               </button>
-              <button className="btn">
-                <Eye size={12} /> Review
+              <button className={`${SBUTTON} h-6 px-2 text-[11px]`}>
+                <Eye size={12} className="mr-1" /> Review
               </button>
             </>
           ) : (
-            <span className={`badge badge--${decision === "accepted" ? "add" : "del"}`}>{decision}</span>
+            <Badge kind={decision === "accepted" ? "add" : "del"}>{decision}</Badge>
           )}
         </div>
       </div>
       {DIFF.map((l, i) => (
-        <div key={i} className={`diff__line diff__line--${l.kind}`}>
-          {l.no !== undefined && <span className="diff__no">{l.no}</span>}
+        <div
+          key={i}
+          className={`flex whitespace-pre px-2 ${
+            l.kind === "add" ? "diff-line--add" : l.kind === "del" ? "diff-line--del" : ""
+          } ${l.kind === "hunk" ? "bg-[var(--bg-surface)] py-0.5 text-[var(--text-dim)]" : ""}`}
+        >
+          {l.no !== undefined && (
+            <span className="w-11 shrink-0 select-none text-[var(--text-dim)]">{l.no}</span>
+          )}
           <span>{l.text}</span>
         </div>
       ))}
@@ -495,10 +584,16 @@ function MessageBody({ text }: { text: string }) {
   const long = text.length > 280 || text.split("\n").length > 6;
   const [open, setOpen] = useState(!long);
   return (
-    <div className="msg__body-wrap" onClick={() => long && setOpen(!open)}>
-      <div className={`msg__body ${!open ? "msg__body--clamped" : ""}`}>{text}</div>
+    <div className="flex min-w-0 max-w-full flex-col gap-1" onClick={() => long && setOpen(!open)}>
+      <div
+        className={`min-w-0 max-w-full whitespace-pre-wrap break-words leading-relaxed text-[var(--text-main)] ${
+          open ? "" : "line-clamp-4"
+        }`}
+      >
+        {text}
+      </div>
       {long && (
-        <span className="msg__expand">
+        <span className="flex items-center gap-1 self-start text-[11px] text-[var(--accent)]">
           {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           {open ? "Collapse" : "Expand"}
         </span>
@@ -507,7 +602,27 @@ function MessageBody({ text }: { text: string }) {
   );
 }
 
-/* ---------- Chat body ---------- */
+/* ---------- Unified chat message row ---------- */
+
+function ChatMessage({ role, text }: { role: "user" | "agent"; text: string }) {
+  if (role === "user") {
+    return (
+      <div className="flex flex-col items-end">
+        <div className="max-w-[85%] rounded-xl border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2 text-left">
+          <MessageBody text={text} />
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">Agent</div>
+      <MessageBody text={text} />
+    </div>
+  );
+}
+
+/* ---------- Demo conversation ---------- */
 
 function ChatBody() {
   const steps: Array<[string, "done" | "run" | "todo"]> = [
@@ -518,14 +633,15 @@ function ChatBody() {
   ];
   return (
     <>
-      <div className="msg msg--user">
-        <MessageBody
-          text={"/fix Rate limits on the official gateway cause task failures — add a fallback strategy. @src"}
-        />
-      </div>
+      <ChatMessage
+        role="user"
+        text="/fix Rate limits on the official gateway cause task failures — add a fallback strategy. @src"
+      />
 
-      <div className="msg">
-        <div className="msg__role">Agent · DeepSeek V4</div>
+      <div className="flex flex-col gap-2">
+        <div className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
+          Agent · DeepSeek V4
+        </div>
         <MessageBody
           text={`Found the issue: ModelRouter only ever used the first provider and never retried on 429.
 
@@ -537,28 +653,28 @@ Root cause analysis:
 Plan: iterate over all gateways, retry on 429, fail fast on other errors.`}
         />
 
-        <TaskCard title="Walkthrough — Model Router fallback" badge={<span className="badge badge--run">running</span>}>
+        <TaskCard title="Walkthrough — Model Router fallback" badge={<Badge kind="run">running</Badge>}>
           {steps.map(([text, st]) => (
-            <div key={text} className="task-card__step">
+            <div key={text} className="flex items-center gap-2 rounded-lg px-2 py-1">
               {st === "done" ? (
                 <Check size={14} color="var(--diff-add)" />
               ) : st === "run" ? (
-                <CircleDot size={14} color="var(--accent-primary)" />
+                <CircleDot size={14} color="var(--accent)" />
               ) : (
-                <Circle size={14} color="var(--text-muted)" />
+                <Circle size={14} color="var(--text-dim)" />
               )}
-              <span style={{ color: st === "todo" ? "var(--text-muted)" : undefined }}>{text}</span>
-              {st === "run" && <span className="badge badge--run">step 3/4</span>}
+              <span className={st === "todo" ? "text-[var(--text-dim)]" : ""}>{text}</span>
+              {st === "run" && <Badge kind="run">step 3/4</Badge>}
             </div>
           ))}
         </TaskCard>
 
         <DiffViewer file="src/router/fallback.ts" />
 
-        <TaskCard title="Terminal — pnpm test" badge={<span className="badge badge--add">exit 0</span>} defaultOpen={false}>
-          <div className="term">
-            <div><span className="term__prompt">$ pnpm test</span></div>
-            <div>вњ“ router/fallback (12 tests) 843ms</div>
+        <TaskCard title="Terminal — pnpm test" badge={<Badge kind="add">exit 0</Badge>} defaultOpen={false}>
+          <div className="max-w-full overflow-x-auto rounded-xl border border-[var(--border)] bg-[var(--bg-sidebar)] p-3 font-mono text-[13px] leading-normal text-[var(--text-main)]">
+            <div className="text-[var(--text-dim)]">$ pnpm test</div>
+            <div>OK router/fallback (12 tests) 843ms</div>
             <div>Test Files 1 passed (1)</div>
           </div>
         </TaskCard>
@@ -567,7 +683,12 @@ Plan: iterate over all gateways, retry on 429, fail fast on other errors.`}
   );
 }
 
-/* ---------- Model selector (grouped by gateway, submenu flies right) ---------- */
+/* ---------- Shared menu bits ---------- */
+
+const MENU_ITEM =
+  "flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]";
+
+/* ---------- Model selector (gateways → submenu flies right) ---------- */
 
 function ModelSelector({
   gatewayId,
@@ -594,16 +715,17 @@ function ModelSelector({
   const model = gw.models.find((m) => m.id === modelId)!;
 
   return (
-    <div className="dropdown" ref={ref}>
-      <span className="prompt-chip" onClick={() => setOpen(!open)}>
-        <Zap size={12} strokeWidth={1.5} /> {model.name}
-        <span className="prompt-chip__meta">· {gw.name.split(" ·")[0]}</span>
+    <div className="relative" ref={ref}>
+      <span className={CHIP} onClick={() => setOpen(!open)}>
+        <Zap size={12} strokeWidth={1.5} />
+        {model.name}
+        <span className="text-[var(--text-dim)]">· {gw.name.split(" ·")[0]}</span>
         <ChevronDown size={12} />
       </span>
       <AnimatePresence>
         {open && (
           <motion.div
-            className="dropdown__menu"
+            className="absolute bottom-[calc(100%+8px)] left-0 z-[200] flex min-w-[240px] flex-col gap-0.5 rounded-xl border border-[var(--border)] bg-[var(--bg-surface)] p-2 shadow-[var(--shadow-popup)]"
             initial={{ opacity: 0, y: 8, scale: 0.96 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 8, scale: 0.96 }}
@@ -612,19 +734,19 @@ function ModelSelector({
             {GATEWAYS.map((g) => (
               <div
                 key={g.id}
-                className="dropdown__gw"
+                className="relative"
                 onMouseEnter={() => setHoveredGw(g.id)}
                 onClick={() => setHoveredGw(g.id)}
               >
-                <button className="dropdown__item">
+                <button className={MENU_ITEM}>
                   <span>{g.name.split(" ·")[0]}</span>
                   {g.id === gatewayId && <Check size={12} />}
-                  <ChevronRight size={12} className="dropdown__item-meta" />
+                  <ChevronRight size={12} className="ml-auto text-[var(--text-dim)]" />
                 </button>
                 <AnimatePresence>
                   {hoveredGw === g.id && (
                     <motion.div
-                      className="dropdown__submenu"
+                      className="absolute bottom-[-4px] left-[calc(100%+4px)] z-[210] flex min-w-[220px] flex-col gap-0.5 rounded-xl border border-[var(--border)] bg-[var(--bg-surface)] p-2 shadow-[var(--shadow-popup)]"
                       initial={{ opacity: 0, x: -6 }}
                       animate={{ opacity: 1, x: 0 }}
                       exit={{ opacity: 0, x: -6 }}
@@ -633,17 +755,15 @@ function ModelSelector({
                       {g.models.map((m) => (
                         <button
                           key={m.id}
-                          className={`dropdown__item ${
-                            g.id === gatewayId && m.id === modelId ? "dropdown__item--active" : ""
-                          }`}
+                          className={`${MENU_ITEM} ${g.id === gatewayId && m.id === modelId ? "bg-[var(--hover-bg)]" : ""}`}
                           onClick={() => {
                             onSelect(g.id, m.id);
                             setOpen(false);
                             setHoveredGw(null);
                           }}
                         >
-                          <span className="mono">{m.name}</span>
-                          <span className="dropdown__item-meta">{m.meta}</span>
+                          <span className="font-mono">{m.name}</span>
+                          <span className="ml-auto text-[11px] text-[var(--text-dim)]">{m.meta}</span>
                         </button>
                       ))}
                     </motion.div>
@@ -658,7 +778,7 @@ function ModelSelector({
   );
 }
 
-/* ---------- Project picker (for new chat) ---------- */
+/* ---------- Project breadcrumb picker (new chat) ---------- */
 
 function ProjectPicker({
   projects,
@@ -679,19 +799,20 @@ function ProjectPicker({
     return () => document.removeEventListener("mousedown", close);
   }, []);
   return (
-    <div className="dropdown" ref={ref}>
+    <div className="relative" ref={ref}>
+      {/* Breadcrumb: h 32px, folder 15, name 13 medium, chevron 12 */}
       <button
-        className="flex h-8 items-center gap-1.5 bg-transparent px-1 text-[13px] font-medium text-[#D4D4D8] transition-colors hover:text-white"
+        className="flex h-8 items-center gap-1.5 px-1 text-[13px] font-medium text-[var(--text-main)] transition-colors hover:text-[var(--accent)]"
         onClick={() => setOpen(!open)}
       >
-        <Folder size={15} strokeWidth={1.5} className="text-[#9CA3AF]" />
+        <Folder size={15} strokeWidth={1.5} className="text-[var(--text-muted)]" />
         {project}
-        <ChevronDown size={12} className="text-[#71717A]" />
+        <ChevronDown size={12} className="text-[var(--text-dim)]" />
       </button>
       <AnimatePresence>
         {open && (
           <motion.div
-            className="dropdown__menu dropdown__menu--down"
+            className="absolute left-1/2 top-[calc(100%+8px)] z-[200] flex max-h-[260px] min-w-[240px] -translate-x-1/2 flex-col gap-0.5 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--bg-surface)] p-2 shadow-[var(--shadow-popup)]"
             initial={{ opacity: 0, y: -8, scale: 0.96 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -8, scale: 0.96 }}
@@ -700,7 +821,7 @@ function ProjectPicker({
             {projects.map((p) => (
               <button
                 key={p.name}
-                className={`dropdown__item ${p.name === project ? "dropdown__item--active" : ""}`}
+                className={`${MENU_ITEM} ${p.name === project ? "bg-[var(--hover-bg)]" : ""} py-2`}
                 onClick={() => {
                   onSelect(p.name);
                   setOpen(false);
@@ -708,7 +829,7 @@ function ProjectPicker({
               >
                 <Folder size={14} />
                 <span className="truncate">{p.name}</span>
-                {p.name === project && <Check size={12} className="dropdown__item-meta" />}
+                {p.name === project && <Check size={12} className="ml-auto text-[var(--text-dim)]" />}
               </button>
             ))}
           </motion.div>
@@ -754,18 +875,19 @@ function PromptBox({
   };
 
   return (
-    <div className={`inputbox-wrap ${centered ? "inputbox-wrap--centered" : ""}`}>
-      <div className="inputbox-col">
+    <div className={`flex w-full justify-center ${centered ? "" : "px-6 pb-4"}`}>
+      <div className="flex w-full max-w-[760px] flex-col">
         {centered && (
-          <div className="inputbox-project">
+          <div className="mb-4 flex justify-center">
             <ProjectPicker projects={projects} project={project} onSelect={onSelectProject} />
           </div>
         )}
-        <div className="inputbox">
+        {/* min-h 108px, radius 16, theme surface + border */}
+        <div className="flex min-h-[108px] w-full flex-col justify-between rounded-2xl border border-[var(--border)] bg-[var(--bg-surface)] transition-colors focus-within:border-[var(--accent)]">
           <textarea
             ref={ref}
-            className="inputbox__textarea"
             rows={1}
+            className="max-h-[200px] min-h-[44px] w-full resize-none border-none bg-transparent px-4 pb-2 pt-3.5 text-[14px] leading-normal text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
             placeholder="Ask anything…  /commands   @files @folders @terminal @git"
             value={text}
             onChange={(e) => {
@@ -779,35 +901,48 @@ function PromptBox({
               }
             }}
           />
-          <div className="inputbox__bottom">
-            <ModelSelector
-              gatewayId={gatewayId}
-              modelId={modelId}
-              onSelect={(g, m) => {
-                setGatewayId(g);
-                setModelId(m);
-              }}
-            />
-            <span
-              className="prompt-chip prompt-chip--context"
-              onClick={() => setTurbo(!turbo)}
-              title="Turbo / Auto-Pilot vs Safe / Supervised"
-            >
-              {turbo ? <Zap size={12} /> : <Shield size={12} />}
-              {turbo ? "Turbo" : "Safe"}
-            </span>
-            <span className="prompt-chip prompt-chip--context" title="Context: local workspace">
-              <Folder size={12} strokeWidth={1.5} />
-              Local
-              <ChevronDown size={12} />
-            </span>
-            <span className="inputbox__spacer" />
-            <button className="prompt-mic" title="Voice input">
-              <Mic size={15} strokeWidth={1.5} />
-            </button>
-            <button className="prompt-send" onClick={send} disabled={!text.trim()} title="Send">
-              <Send size={14} />
-            </button>
+          {/* Toolbar: 6px 12px 10px, space-between */}
+          <div className="flex items-center justify-between gap-1.5 px-3 pb-2.5 pt-1.5">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <ModelSelector
+                gatewayId={gatewayId}
+                modelId={modelId}
+                onSelect={(g, m) => {
+                  setGatewayId(g);
+                  setModelId(m);
+                }}
+              />
+              <span
+                className={CHIP_CTX}
+                onClick={() => setTurbo(!turbo)}
+                title="Turbo / Auto-Pilot vs Safe / Supervised"
+              >
+                {turbo ? <Zap size={12} strokeWidth={1.5} /> : <Shield size={12} strokeWidth={1.5} />}
+                {turbo ? "Turbo" : "Safe"}
+              </span>
+              <span className={CHIP_CTX} title="Context: local workspace">
+                <Folder size={12} strokeWidth={1.5} />
+                Local
+                <ChevronDown size={12} />
+              </span>
+            </div>
+
+            <div className="flex shrink-0 items-center gap-1">
+              <button
+                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                title="Voice input"
+              >
+                <Mic size={15} strokeWidth={1.5} />
+              </button>
+              <button
+                className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--accent)] text-white transition-colors hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--bg-elevated)] disabled:text-[var(--text-dim)]"
+                onClick={send}
+                disabled={!text.trim()}
+                title="Send"
+              >
+                <Send size={14} />
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -815,7 +950,7 @@ function PromptBox({
   );
 }
 
-/* ---------- History view (shown in chat area) ---------- */
+/* ---------- History view ---------- */
 
 function HistoryView({
   projects,
@@ -824,32 +959,41 @@ function HistoryView({
   projects: Project[];
   onOpen: (project: string, convId: string) => void;
 }) {
-  const all = projects.flatMap((p) => p.conversations.map((c) => ({ p: p.name, c })));
+  const all = projects.flatMap((p) => p.conversations);
   return (
     <motion.div
-      className="view-panel"
+      className="mx-auto flex w-full max-w-[760px] flex-col"
       initial={{ opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.2, ease: "easeOut" }}
     >
-      <div className="view-panel__title">
+      <div className="flex items-center gap-2 text-[18px] font-semibold text-[var(--text-main)]">
         <History size={18} strokeWidth={1.5} /> Conversation History
       </div>
-      <div className="view-panel__hint">All conversations across projects</div>
-      {all.length === 0 && <div className="view-panel__empty">No conversations yet</div>}
+      <div className="mb-4 mt-1 text-[13px] text-[var(--text-muted)]">
+        All conversations across projects
+      </div>
+      {all.length === 0 && (
+        <div className="p-6 text-center text-[var(--text-muted)]">No conversations yet</div>
+      )}
       {projects.map((p) => {
-        const convs = p.conversations;
-        if (convs.length === 0) return null;
+        if (p.conversations.length === 0) return null;
         return (
-          <div key={p.name} className="view-group">
-            <div className="view-group__title">
+          <div key={p.name} className="mb-4">
+            <div className="mb-1 flex items-center gap-2 px-2 py-1 text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
               <Folder size={14} strokeWidth={1.5} /> {p.name}
             </div>
-            {convs.map((c) => (
-              <button key={c.id} className="view-row" onClick={() => onOpen(p.name, c.id)}>
+            {p.conversations.map((c) => (
+              <button
+                key={c.id}
+                className="flex h-8 w-full items-center gap-2 rounded-lg px-3 text-left text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+                onClick={() => onOpen(p.name, c.id)}
+              >
                 <MessageSquare size={16} strokeWidth={1.5} className="shrink-0" />
                 <span className="truncate">{c.title}</span>
-                <span className="ml-auto shrink-0 font-mono text-[11px] text-[#6e6e6e]">{c.age}</span>
+                <span className="ml-auto shrink-0 font-mono text-[11px] text-[var(--text-dim)]">
+                  {c.age}
+                </span>
               </button>
             ))}
           </div>
@@ -859,7 +1003,7 @@ function HistoryView({
   );
 }
 
-/* ---------- Scheduled tasks view (shown in chat area) ---------- */
+/* ---------- Scheduled tasks view ---------- */
 
 function TasksView({
   scheduled,
@@ -870,31 +1014,38 @@ function TasksView({
 }) {
   return (
     <motion.div
-      className="view-panel"
+      className="mx-auto flex w-full max-w-[760px] flex-col"
       initial={{ opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.2, ease: "easeOut" }}
     >
-      <div className="view-panel__title">
+      <div className="flex items-center gap-2 text-[18px] font-semibold text-[var(--text-main)]">
         <Timer size={18} strokeWidth={1.5} /> Scheduled Tasks
-        <button className="btn ml-auto" onClick={onScheduleTask}>
-          <CalendarClock size={14} /> Schedule Task
+        <button className={`${SBUTTON} ml-auto`} onClick={onScheduleTask}>
+          <CalendarClock size={14} className="mr-1.5" /> Schedule Task
         </button>
       </div>
-      <div className="view-panel__hint">Recurring agent jobs</div>
-      {scheduled.length === 0 && <div className="view-panel__empty">No scheduled tasks</div>}
+      <div className="mb-4 mt-1 text-[13px] text-[var(--text-muted)]">Recurring agent jobs</div>
+      {scheduled.length === 0 && (
+        <div className="p-6 text-center text-[var(--text-muted)]">No scheduled tasks</div>
+      )}
       {scheduled.map((s) => (
-        <div key={s} className="view-row view-row--static">
+        <div
+          key={s}
+          className="flex h-8 items-center gap-2 rounded-lg px-3 text-[13px] text-[var(--text-main)]"
+        >
           <Clock size={16} strokeWidth={1.5} className="shrink-0" />
           <span className="truncate font-mono">{s}</span>
-          <span className="badge badge--run ml-auto shrink-0">active</span>
+          <span className="ml-auto shrink-0">
+            <Badge kind="run">active</Badge>
+          </span>
         </div>
       ))}
     </motion.div>
   );
 }
 
-/* ---------- Modal shell (Motion) ---------- */
+/* ---------- Small modal shell (Schedule Task) ---------- */
 
 function Modal({
   title,
@@ -911,37 +1062,39 @@ function Modal({
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
   return (
-    <AnimatePresence>
+    <motion.div
+      className="fixed inset-0 z-[400] flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.15 }}
+      onClick={onClose}
+    >
       <motion.div
-        className="modal-backdrop"
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-        transition={{ duration: 0.15 }}
-        onClick={onClose}
+        className="flex w-[min(480px,calc(100vw-48px))] flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-surface)] shadow-[var(--shadow-popup)]"
+        initial={{ opacity: 0, y: 16, scale: 0.97 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={{ opacity: 0, y: 16, scale: 0.97 }}
+        transition={{ duration: 0.2, ease: "easeOut" }}
+        onClick={(e) => e.stopPropagation()}
       >
-        <motion.div
-          className="modal"
-          initial={{ opacity: 0, y: 16, scale: 0.97 }}
-          animate={{ opacity: 1, y: 0, scale: 1 }}
-          exit={{ opacity: 0, y: 16, scale: 0.97 }}
-          transition={{ duration: 0.2, ease: "easeOut" }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div className="modal__head">
-            <span className="modal__title">{title}</span>
-            <button className="btn modal__close" onClick={onClose} title="Close">
-              <X size={14} />
-            </button>
-          </div>
-          <div className="modal__body">{children}</div>
-        </motion.div>
+        <div className="flex items-center border-b border-[var(--border)] px-5 py-4">
+          <span className="flex-1 text-[20px] font-semibold text-[var(--text-main)]">{title}</span>
+          <button
+            className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+            onClick={onClose}
+            title="Close"
+          >
+            <X size={14} />
+          </button>
+        </div>
+        <div className="flex flex-col gap-2 px-5 pb-5 pt-4">{children}</div>
       </motion.div>
-    </AnimatePresence>
+    </motion.div>
   );
 }
 
-/* ---------- Settings modal (two-column layout) ---------- */
+/* ---------- Settings modal (two-column) ---------- */
 
 const THEMES: Theme[] = ["dark", "light", "slate", "amoled"];
 
@@ -957,9 +1110,17 @@ function Segmented({
   onChange: (v: string) => void;
 }) {
   return (
-    <div className="seg">
+    <div className="flex h-[30px] items-center gap-0.5 rounded-md bg-[var(--bg-input)] p-0.5">
       {options.map((o) => (
-        <button key={o} className={`seg__opt ${value === o ? "seg__opt--active" : ""}`} onClick={() => onChange(o)}>
+        <button
+          key={o}
+          className={`h-full whitespace-nowrap rounded px-2.5 text-[12px] transition-colors ${
+            value === o
+              ? "bg-[var(--bg-elevated)] text-[var(--text-main)]"
+              : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
+          }`}
+          onClick={() => onChange(o)}
+        >
           {o}
         </button>
       ))}
@@ -977,14 +1138,26 @@ function SettingRow({
   children?: React.ReactNode;
 }) {
   return (
-    <div className="set-row">
-      <div className="set-row__label">
-        <div className="set-row__title">{title}</div>
-        {hint && <div className="set-row__hint">{hint}</div>}
+    <div className="flex items-center gap-3">
+      <div className="min-w-0 flex-1">
+        <div className="text-[13px] text-[var(--text-main)]">{title}</div>
+        {hint && <div className="mt-0.5 text-[12px] text-[var(--text-dim)]">{hint}</div>}
       </div>
-      {children && <div className="set-row__ctrl">{children}</div>}
+      {children && <div className="flex shrink-0 items-center">{children}</div>}
     </div>
   );
+}
+
+function SettingsCard({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-3 rounded-xl border border-[var(--border)] bg-[var(--bg-surface)] px-4 py-3.5">
+      {children}
+    </div>
+  );
+}
+
+function Sep() {
+  return <div className="h-px bg-[var(--border-soft)]" />;
 }
 
 function SettingsModal({
@@ -1048,23 +1221,36 @@ function SettingsModal({
   };
 
   return (
-    <div className="settings-backdrop" onClick={onClose}>
+    <motion.div
+      className="fixed inset-0 z-[400] flex items-center justify-center bg-black/65 backdrop-blur-md"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.15 }}
+      onClick={onClose}
+    >
       <motion.div
-        className="settings-modal"
+        className="flex h-[min(580px,calc(100vh-48px))] w-[min(820px,calc(100vw-48px))] overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-app)] shadow-[0_25px_50px_-12px_rgba(0,0,0,0.7)]"
         initial={{ opacity: 0, y: 16, scale: 0.97 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
         transition={{ duration: 0.2, ease: "easeOut" }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Left column — categories */}
-        <div className="settings-nav">
+        <div className="flex w-[210px] shrink-0 flex-col overflow-y-auto border-r border-[var(--border)] px-3 py-4">
           {navItems.map((grp) => (
             <div key={grp.group}>
-              <div className="settings-nav__group">{grp.group}</div>
+              <div className="mb-1.5 mt-3 px-2.5 text-[11px] font-medium uppercase tracking-wide text-[var(--text-dim)] first:mt-0">
+                {grp.group}
+              </div>
               {grp.items.map((it) => (
                 <button
                   key={it.id}
-                  className={`settings-nav__item ${section === it.id ? "settings-nav__item--active" : ""}`}
+                  className={`flex h-8 w-full items-center rounded-lg px-2.5 text-left text-[13px] transition-colors ${
+                    section === it.id
+                      ? "bg-[var(--bg-elevated)] text-[var(--text-main)]"
+                      : "text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                  }`}
                   onClick={() => setSection(it.id)}
                 >
                   {it.label}
@@ -1072,39 +1258,47 @@ function SettingsModal({
               ))}
             </div>
           ))}
-          <div className="settings-nav__profile">
-            <div className="settings-nav__avatar">N</div>
+          <div className="mt-auto flex items-center gap-2.5 border-t border-[var(--border)] pt-3">
+            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[12px] font-semibold text-white">
+              N
+            </div>
             <div className="min-w-0">
-              <div className="truncate text-[12px] font-bold text-white">nezuss</div>
-              <div className="truncate text-[11px] text-[#6B7280]">nezuss@local</div>
+              <div className="truncate text-[12px] font-bold text-[var(--text-main)]">nezuss</div>
+              <div className="truncate text-[11px] text-[var(--text-dim)]">nezuss@local</div>
             </div>
           </div>
         </div>
 
         {/* Right column — content */}
-        <div className="settings-content">
-          <div className="settings-content__head">
+        <div className="flex-1 overflow-y-auto px-7 py-6">
+          <div className="mb-6 flex items-start">
             <div>
-              <div className="settings-content__title">{titles[section][0]}</div>
-              <div className="settings-content__desc">{titles[section][1]}</div>
+              <div className="text-[21px] font-semibold text-[var(--text-main)]">
+                {titles[section][0]}
+              </div>
+              <div className="mt-1 text-[13px] text-[var(--text-dim)]">{titles[section][1]}</div>
             </div>
-            <button className="settings-close" onClick={onClose} title="Close">
+            <button
+              className="ml-auto flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+              onClick={onClose}
+              title="Close"
+            >
               <X size={14} />
             </button>
           </div>
 
           {section === "general" && (
-            <div className="settings-card">
+            <SettingsCard>
               <SettingRow title="Theme" hint="Application color scheme">
                 <Segmented options={THEMES} value={theme} onChange={(v) => onTheme(v as Theme)} />
               </SettingRow>
-              <div className="settings-card__sep" />
+              <Sep />
               <SettingRow title="Send Behavior" hint="How submitted prompts are handled">
                 <Segmented options={["Queue", "Send Immediately"]} value={sendMode} onChange={setSendMode} />
               </SettingRow>
-              <div className="settings-card__sep" />
+              <Sep />
               <SettingRow title="Default Gateway" hint="Model provider for new conversations">
-                <select className="settings-select" defaultValue="dsh">
+                <select className={SSELECT} defaultValue="dsh">
                   {GATEWAYS.map((g) => (
                     <option key={g.id} value={g.id}>
                       {g.name.split(" ·")[0]}
@@ -1112,98 +1306,115 @@ function SettingsModal({
                   ))}
                 </select>
               </SettingRow>
-            </div>
+            </SettingsCard>
           )}
 
           {section === "execution" && (
-            <div className="settings-card">
+            <SettingsCard>
               <SettingRow title="Run Mode" hint="Auto-pilot vs supervised execution">
-                <select className="settings-select" value={turboMode} onChange={(e) => setTurboMode(e.target.value)}>
+                <select className={SSELECT} value={turboMode} onChange={(e) => setTurboMode(e.target.value)}>
                   <option>Turbo Mode</option>
                   <option>Safe Mode</option>
                 </select>
               </SettingRow>
-              <div className="settings-card__sep" />
+              <Sep />
               <SettingRow title="Artifact Review Policy" hint="When diffs require human approval">
-                <select className="settings-select" value={reviewPolicy} onChange={(e) => setReviewPolicy(e.target.value)}>
+                <select
+                  className={SSELECT}
+                  value={reviewPolicy}
+                  onChange={(e) => setReviewPolicy(e.target.value)}
+                >
                   <option>Always Ask</option>
                   <option>Auto-accept</option>
                   <option>Reject by default</option>
                 </select>
               </SettingRow>
-              <div className="settings-card__sep" />
+              <Sep />
               <SettingRow title="Workspace" hint="Root folder opened for agents">
-                <button className="settings-btn">Open</button>
+                <button className={SBUTTON}>Open</button>
               </SettingRow>
-            </div>
+            </SettingsCard>
           )}
 
           {section === "behavior" && (
-            <div className="settings-card">
+            <SettingsCard>
               <SettingRow title="Autonomy Level" hint="How much freedom agents get">
                 <Segmented options={["Low", "Medium", "High"]} value={autonomy} onChange={setAutonomy} />
               </SettingRow>
-              <div className="settings-card__sep" />
+              <Sep />
               <SettingRow title="Stop on Error" hint="Halt the pipeline when a step fails">
                 <button
-                  className={`settings-toggle ${stopOnError ? "settings-toggle--on" : ""}`}
+                  className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
+                    stopOnError ? "bg-[var(--accent)]" : "bg-[var(--bg-elevated)]"
+                  }`}
                   onClick={() => setStopOnError(!stopOnError)}
                   aria-label="toggle"
                 >
-                  <span className="settings-toggle__knob" />
+                  <span
+                    className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform ${
+                      stopOnError ? "translate-x-[18px]" : "translate-x-0.5"
+                    }`}
+                  />
                 </button>
               </SettingRow>
-            </div>
+            </SettingsCard>
           )}
 
           {section === "permissions" && (
-            <div className="settings-card">
+            <SettingsCard>
               <SettingRow title="Tool Permissions">
-                <span className="settings-badge">59</span>
-                <button className="settings-btn ml-2">Manage</button>
+                <span className="inline-flex h-[18px] items-center rounded-full bg-[var(--bg-elevated)] px-1.5 text-[11px] text-[var(--text-muted)]">
+                  59
+                </span>
+                <button className={`${SBUTTON} ml-2`}>Manage</button>
               </SettingRow>
-              <div className="settings-card__sep" />
+              <Sep />
               <SettingRow title="Filesystem Access" hint="Scope of writable paths">
-                <select className="settings-select" defaultValue="workspace">
+                <select className={SSELECT} defaultValue="workspace">
                   <option value="workspace">Workspace only</option>
                   <option value="full">Full access</option>
                   <option value="none">Read-only</option>
                 </select>
               </SettingRow>
-            </div>
+            </SettingsCard>
           )}
 
           {section === "projects" && (
-            <>
-              <div className="settings-card">
-                <div className="settings-projects">
+            <div className="flex flex-col gap-3">
+              <SettingsCard>
+                <div className="flex max-h-[300px] flex-col gap-1 overflow-y-auto">
                   {projects.map((p) => (
-                    <span key={p.name} className="settings-project-chip">
+                    <span
+                      key={p.name}
+                      className="flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+                    >
                       <Folder size={12} /> {p.name}
-                      <span className="ml-auto font-mono text-[11px] text-[#6B7280]">{p.conversations.length}</span>
+                      <span className="ml-auto font-mono text-[11px] text-[var(--text-dim)]">
+                        {p.conversations.length}
+                      </span>
                     </span>
                   ))}
                 </div>
-              </div>
-              <div className="settings-card mt-3">
+              </SettingsCard>
+              <SettingsCard>
                 <SettingRow title="New project" hint="Adds a folder to the sidebar tree">
                   <input
-                    className="settings-input"
+                    className={SINPUT}
                     placeholder="Project name…"
                     value={name}
                     onChange={(e) => setName(e.target.value)}
                     onKeyDown={(e) => e.key === "Enter" && add()}
                   />
-                  <button className="settings-btn ml-2" onClick={add} disabled={!name.trim()}>
+                  <button className={`${SBUTTON} ml-2`} onClick={add} disabled={!name.trim()}>
                     Add
                   </button>
                 </SettingRow>
-              </div>
-            </>
+              </SettingsCard>
+            </div>
           )}
         </div>
       </motion.div>
-    </div>
+    </motion.div>
   );
 }
 
@@ -1225,30 +1436,38 @@ function ScheduleModal({
   };
   return (
     <Modal title="Schedule Task" onClose={onClose}>
-      <div className="settings__section">Command</div>
+      <div className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">Command</div>
       <input
-        className="settings__input mono"
+        className={`${SINPUT} w-full font-mono`}
         placeholder="/review @main"
         value={cmd}
         onChange={(e) => setCmd(e.target.value)}
         onKeyDown={(e) => e.key === "Enter" && submit()}
         autoFocus
       />
-      <div className="settings__section">Frequency</div>
-      <div className="settings__row">
+      <div className="mt-2 text-[11px] uppercase tracking-wide text-[var(--text-dim)]">Frequency</div>
+      <div className="flex items-center gap-2">
         {["once", "daily", "weekly"].map((f) => (
           <button
             key={f}
-            className={`chip mono ${freq === f ? "chip--active" : ""}`}
+            className={`h-7 rounded-md border px-2.5 font-mono text-[12px] transition-colors ${
+              freq === f
+                ? "border-[var(--accent)] bg-[var(--hover-bg)] text-[var(--text-main)]"
+                : "border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
+            }`}
             onClick={() => setFreq(f)}
           >
             {f}
           </button>
         ))}
       </div>
-      <div className="settings__actions">
-        <button className="btn btn--primary" onClick={submit} disabled={!cmd.trim()}>
-          <CalendarClock size={14} /> Schedule
+      <div className="mt-4 flex justify-end">
+        <button
+          className="flex h-8 items-center rounded-lg bg-[var(--accent)] px-3 text-[13px] text-white transition-colors hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+          onClick={submit}
+          disabled={!cmd.trim()}
+        >
+          <CalendarClock size={14} className="mr-1.5" /> Schedule
         </button>
       </div>
     </Modal>
@@ -1271,6 +1490,10 @@ export default function App() {
   });
   const [newChatProject, setNewChatProject] = useState("Singularity");
   const chatRef = useRef<HTMLDivElement>(null);
+  // Hooks must run unconditionally, so all scroll areas get their indicator here.
+  const historyRef = useScrollIndicator<HTMLDivElement>();
+  const tasksRef = useScrollIndicator<HTMLDivElement>();
+  const chatScrollRef = useScrollIndicator<HTMLDivElement>(chatRef);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -1313,12 +1536,10 @@ export default function App() {
     setView("chat");
   };
 
-  const isNewChat = view === "new";
-
   return (
-    <div className="app-col">
+    <div className="flex h-full flex-col">
       <TitleBar />
-      <div className="app">
+      <div className="flex min-h-0 flex-1">
         <Sidebar
           width={sidebarWidth}
           startResize={startResize}
@@ -1335,27 +1556,35 @@ export default function App() {
           onOpenSettings={() => setModal("settings")}
           onNewProject={() => setModal("settings")}
         />
-        <div className="main">
+
+        <div className="flex min-w-0 flex-1 flex-col bg-[var(--bg-app)]">
           {view !== "new" && (
-            <div className="main__header">
+            <div className="flex items-center gap-2 px-4 py-3 text-[16px] font-semibold text-[var(--text-main)]">
               {activeTitle}
-              {view === "chat" && activeConv && <span className="badge badge--run">agent active</span>}
+              {view === "chat" && activeConv && <Badge kind="run">agent active</Badge>}
             </div>
           )}
+
           {view === "history" && (
-            <div className="chat">
-              <HistoryView projects={projects} onOpen={openConversation} />
+            <div className="flex-1 overflow-y-auto py-4" ref={historyRef}>
+              <div className="px-6">
+                <HistoryView projects={projects} onOpen={openConversation} />
+              </div>
             </div>
           )}
+
           {view === "tasks" && (
-            <div className="chat">
-              <TasksView scheduled={scheduled} onScheduleTask={() => setModal("schedule")} />
+            <div className="flex-1 overflow-y-auto py-4" ref={tasksRef}>
+              <div className="px-6">
+                <TasksView scheduled={scheduled} onScheduleTask={() => setModal("schedule")} />
+              </div>
             </div>
           )}
-          {isNewChat && (
-            <div className="chat chat--centered">
+
+          {view === "new" && (
+            <div className="flex flex-1 items-center justify-center overflow-hidden p-6">
               <motion.div
-                className="prompt-centered"
+                className="w-full max-w-[760px]"
                 initial={{ opacity: 0, y: 16, scale: 0.98 }}
                 animate={{ opacity: 1, y: 0, scale: 1 }}
                 transition={{ duration: 0.25, ease: "easeOut" }}
@@ -1374,25 +1603,29 @@ export default function App() {
               </motion.div>
             </div>
           )}
+
           {view === "chat" && (
             <>
-              <div className="chat" ref={chatRef}>
-                <div className="chat__inner" key={activeConv?.id ?? "new"}>
+              <div className="flex-1 overflow-y-auto py-4" ref={chatScrollRef}>
+                <div className="px-6 pr-2">
+                  <div
+                    className="mx-auto flex w-full max-w-[760px] flex-col gap-4"
+                    key={activeConv?.id ?? "new"}
+                  >
                   {activeConv?.id === "fix-terminal-tests" && <ChatBody />}
-                  <AnimatePresence initial={false}>
-                    {draftMsgs.map((m, i) => (
-                      <motion.div
-                        key={i}
-                        className={`msg ${m.role === "user" ? "msg--user" : ""}`}
-                        initial={{ opacity: 0, y: 12 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ duration: 0.2, ease: "easeOut" }}
-                      >
-                        {m.role === "agent" && <div className="msg__role">Agent</div>}
-                        <MessageBody text={m.text} />
-                      </motion.div>
-                    ))}
-                  </AnimatePresence>
+                    <AnimatePresence initial={false}>
+                      {draftMsgs.map((m, i) => (
+                        <motion.div
+                          key={i}
+                          initial={{ opacity: 0, y: 12 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          transition={{ duration: 0.2, ease: "easeOut" }}
+                        >
+                          <ChatMessage role={m.role} text={m.text} />
+                        </motion.div>
+                      ))}
+                    </AnimatePresence>
+                  </div>
                 </div>
               </div>
               <PromptBox
@@ -1405,21 +1638,23 @@ export default function App() {
           )}
         </div>
 
-        {modal === "settings" && (
-          <SettingsModal
-            theme={theme}
-            onTheme={setTheme}
-            projects={projects}
-            onAddProject={(n) => setProjects((p) => [...p, { name: n, conversations: [] }])}
-            onClose={() => setModal("none")}
-          />
-        )}
-        {modal === "schedule" && (
-          <ScheduleModal
-            onAdd={(t) => setScheduled((s) => [...s, t])}
-            onClose={() => setModal("none")}
-          />
-        )}
+        <AnimatePresence>
+          {modal === "settings" && (
+            <SettingsModal
+              theme={theme}
+              onTheme={setTheme}
+              projects={projects}
+              onAddProject={(n) => setProjects((p) => [...p, { name: n, conversations: [] }])}
+              onClose={() => setModal("none")}
+            />
+          )}
+          {modal === "schedule" && (
+            <ScheduleModal
+              onAdd={(t) => setScheduled((s) => [...s, t])}
+              onClose={() => setModal("none")}
+            />
+          )}
+        </AnimatePresence>
       </div>
     </div>
   );

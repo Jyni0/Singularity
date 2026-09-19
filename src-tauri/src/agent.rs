@@ -27,6 +27,15 @@ pub struct AgentText {
     pub delta: String,
 }
 
+/// Reasoning the model streams separately from its answer (DeepSeek "think"
+/// mode, Anthropic extended thinking, OpenAI o-series). Shown in its own
+/// collapsible block so it never pollutes the reply.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentThink {
+    pub run_id: String,
+    pub delta: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentStep {
     pub run_id: String,
@@ -38,6 +47,9 @@ pub struct AgentStep {
     pub ok: bool,
     /// 1-based index of this step within the run.
     pub index: usize,
+    /// False while the tool is still running, true once the result is in. The UI
+    /// shows the card as soon as it starts, so a long command is visible.
+    pub done: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,7 +264,19 @@ fn emit_text(app: &AppHandle, run_id: &str, delta: impl Into<String>) {
     );
 }
 
-fn emit_step(app: &AppHandle, run_id: &str, index: usize, name: &str, input: String, res: &tools::ToolResult) {
+fn emit_think(app: &AppHandle, run_id: &str, delta: impl Into<String>) {
+    let _ = app.emit(
+        "agent://think",
+        AgentThink {
+            run_id: run_id.to_string(),
+            delta: delta.into(),
+        },
+    );
+}
+
+/// Emits a step. `done=false` marks "this tool just started" so the UI shows the
+/// card immediately; `done=true` carries the result.
+fn emit_step(app: &AppHandle, run_id: &str, index: usize, name: &str, input: String, done: bool, res: &tools::ToolResult) {
     let _ = app.emit(
         "agent://step",
         AgentStep {
@@ -262,6 +286,7 @@ fn emit_step(app: &AppHandle, run_id: &str, index: usize, name: &str, input: Str
             result: res.output.clone(),
             ok: res.ok,
             index,
+            done,
         },
     );
 }
@@ -311,6 +336,9 @@ struct StreamChoice {
 #[derive(Deserialize)]
 struct StreamDelta {
     content: Option<String>,
+    /// DeepSeek and OpenAI o-series stream reasoning separately from content.
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
@@ -442,6 +470,19 @@ async fn run_openai(
                 let Some(choices) = parsed.choices else { continue };
                 for choice in choices {
                     let Some(delta) = choice.delta else { continue };
+                    // Reasoning streams separately from the answer on DeepSeek
+                    // and o-series models. It is shown in its own block and is
+                    // deliberately kept out of `round_text`, so it never becomes
+                    // part of what gets stored as the reply.
+                    if let Some(think) = delta
+                        .reasoning_content
+                        .as_deref()
+                        .or(delta.reasoning.as_deref())
+                    {
+                        if !think.is_empty() {
+                            emit_think(app, run_id, think);
+                        }
+                    }
                     if let Some(text) = delta.content {
                         if !text.is_empty() {
                             round_text.push_str(&text);
@@ -503,9 +544,37 @@ async fn run_openai(
             let args: Value = serde_json::from_str(&call.args).unwrap_or(json!({}));
             let summary = summarize(&call.name, &args);
 
-            let result = tools::dispatch(root, &call.name, &args);
             step_index += 1;
-            emit_step(app, run_id, step_index, &call.name, summary, &result);
+            let this_index = step_index;
+
+            // Announce the call BEFORE it runs, so a long command is visible
+            // instead of leaving the UI on "Generating…" with no output.
+            emit_step(
+                app,
+                run_id,
+                this_index,
+                &call.name,
+                summary.clone(),
+                false,
+                &tools::ToolResult::ok(""),
+            );
+
+            // Tools block (file IO, waiting on a process). Running them on the
+            // async worker thread stalls the whole task and starves event
+            // delivery, so hand them to the blocking pool and await the result.
+            let tool_root = root.to_path_buf();
+            let tool_name = call.name.clone();
+            let tool_args = args.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                tools::dispatch(&tool_root, &tool_name, &tool_args)
+            })
+            .await
+            .unwrap_or_else(|e| tools::ToolResult {
+                ok: false,
+                output: format!("tool task failed: {e}"),
+            });
+
+            emit_step(app, run_id, this_index, &call.name, summary, true, &result);
 
             messages.push(json!({
                 "role": "tool",
@@ -544,6 +613,8 @@ struct AnthropicStreamDelta {
     kind: Option<String>,
     text: Option<String>,
     partial_json: Option<String>,
+    /// Extended thinking arrives as `thinking_delta` with the text here.
+    thinking: Option<String>,
 }
 
 async fn run_anthropic(
@@ -687,6 +758,15 @@ async fn run_anthropic(
                                         }
                                     }
                                 }
+                                // Extended thinking — displayed separately, never
+                                // stored as part of the answer.
+                                Some("thinking_delta") => {
+                                    if let Some(think) = d.thinking {
+                                        if !think.is_empty() {
+                                            emit_think(app, run_id, think);
+                                        }
+                                    }
+                                }
                                 Some("input_json_delta") => {
                                     if let Some(json) = d.partial_json {
                                         let i = parsed.index.unwrap_or(0);
@@ -732,9 +812,34 @@ async fn run_anthropic(
             let args: Value = serde_json::from_str(&b.args).unwrap_or(json!({}));
             let summary = summarize(&b.name, &args);
 
-            let result = tools::dispatch(root, &b.name, &args);
             step_index += 1;
-            emit_step(app, run_id, step_index, &b.name, summary, &result);
+            let this_index = step_index;
+
+            // Show the call before it runs, so long commands are visible.
+            emit_step(
+                app,
+                run_id,
+                this_index,
+                &b.name,
+                summary.clone(),
+                false,
+                &tools::ToolResult::ok(""),
+            );
+
+            // Tools block; keep the async worker free so events keep flowing.
+            let tool_root = root.to_path_buf();
+            let tool_name = b.name.clone();
+            let tool_args = args.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                tools::dispatch(&tool_root, &tool_name, &tool_args)
+            })
+            .await
+            .unwrap_or_else(|e| tools::ToolResult {
+                ok: false,
+                output: format!("tool task failed: {e}"),
+            });
+
+            emit_step(app, run_id, this_index, &b.name, summary, true, &result);
 
             results.push(json!({
                 "type": "tool_result",

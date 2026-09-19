@@ -737,13 +737,16 @@ export interface AgentStepEvent {
   result: string;
   ok: boolean;
   index: number;
+  /** False while the tool runs; the UI then shows a spinner instead of "done". */
+  done: boolean;
 }
 
 /**
  * Runs the agent loop in Rust.
  *
- * Progress arrives on `agent://text` (model prose), `agent://step` (each tool
- * call and its output) and terminates with `agent://done` or `agent://error`.
+ * Progress arrives on `agent://think` (model reasoning, shown but never stored),
+ * `agent://text` (the answer prose), `agent://step` (each tool call and its
+ * output) and terminates with `agent://done` or `agent://error`.
  * Returns the final answer text.
  */
 export async function runAgent(
@@ -753,6 +756,8 @@ export async function runAgent(
   handlers: {
     onText: (delta: string) => void;
     onStep: (step: AgentStepEvent) => void;
+    /** Reasoning deltas — optional, so plain chat callers are unaffected. */
+    onThink?: (delta: string) => void;
   }
 ): Promise<string> {
   if (!inTauri) {
@@ -771,6 +776,12 @@ export async function runAgent(
     listen<AgentStepEvent & { run_id: string }>("agent://step", (e) => {
       if (e.payload.run_id !== runId) return;
       handlers.onStep(e.payload);
+    }),
+    listen<{ run_id: string; delta: string }>("agent://think", (e) => {
+      if (e.payload.run_id !== runId) return;
+      // Reasoning is deliberately excluded from `full`, so it never ends up in
+      // the stored answer or in the next request's history.
+      handlers.onThink?.(e.payload.delta);
     }),
   ]);
 

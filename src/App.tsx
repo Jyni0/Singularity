@@ -13,7 +13,7 @@ import {
 } from "./types";
 import * as db from "./db";
 import { ModelsSettings } from "./ModelsSettings";
-import { Markdown, ToolCall } from "./Markdown";
+import { Markdown, ToolCall, ThinkBlock } from "./Markdown";
 import { toAttachments, formatSize, composePrompt } from "./attachments";
 import type { Effort, Attachment } from "./types";
 import { EFFORTS } from "./types";
@@ -240,8 +240,9 @@ export interface DiffLine {
   no?: string;
 }
 
-/** One piece of an agent turn: prose, or a tool call that ran mid-answer. */
+/** One piece of an agent turn: reasoning, prose, or a tool call. */
 type Segment =
+  | { kind: "think"; text: string }
   | { kind: "text"; text: string }
   | { kind: "step"; step: db.AgentStepEvent };
 
@@ -1266,10 +1267,13 @@ function ChatMessage({
   role,
   text,
   segments,
+  streaming,
 }: {
   role: "user" | "agent";
   text: string;
   segments?: Segment[];
+  /** True while this turn is still being produced — shows a "thinking…" marker. */
+  streaming?: boolean;
 }) {
   if (role === "user") {
     return (
@@ -1287,22 +1291,33 @@ function ChatMessage({
     return (
       <div className="flex flex-col gap-2">
         <div className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">Agent</div>
-        {segments.map((seg, i) =>
-          seg.kind === "step" ? (
-            <ToolCall
-              key={`s${seg.step.index}-${i}`}
-              call={{
-                name: seg.step.name,
-                input: seg.step.input,
-                result: seg.step.result,
-                ok: seg.step.ok,
-                running: false,
-              }}
-            />
-          ) : seg.text.trim() ? (
-            <Markdown key={`t${i}`} text={seg.text} />
-          ) : null
-        )}
+        {segments.map((seg, i) => {
+          const isLast = i === segments.length - 1;
+          if (seg.kind === "step") {
+            return (
+              <ToolCall
+                key={`s${seg.step.index}-${i}`}
+                call={{
+                  name: seg.step.name,
+                  input: seg.step.input,
+                  result: seg.step.result,
+                  ok: seg.step.ok,
+                  running: !seg.step.done,
+                }}
+              />
+            );
+          }
+          if (seg.kind === "think") {
+            return seg.text.trim() ? (
+              <ThinkBlock
+                key={`k${i}`}
+                text={seg.text}
+                live={!!streaming && isLast}
+              />
+            ) : null;
+          }
+          return seg.text.trim() ? <Markdown key={`t${i}`} text={seg.text} /> : null;
+        })}
       </div>
     );
   }
@@ -2892,13 +2907,43 @@ export default function App() {
       });
     };
 
-    /** Inserts a finished tool call into the turn, keeping the order. */
+    /** Appends model reasoning to its own block, kept out of the answer. */
+    const appendThink = (delta: string) => {
+      setDraftMsgs((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (!last || last.role !== "agent") return prev;
+
+        const segs = [...(last.segments ?? [])];
+        const tail = segs[segs.length - 1];
+        if (tail && tail.kind === "think") {
+          segs[segs.length - 1] = { kind: "think", text: tail.text + delta };
+        } else {
+          segs.push({ kind: "think", text: delta });
+        }
+        // `text` stays reasoning-free: it is what gets stored and replayed.
+        next[next.length - 1] = { ...last, segments: segs };
+        return next;
+      });
+    };
+
+    /** Records a tool call: `done=false` shows it as running, `done=true`
+     * replaces the same card with its result. */
     const appendStep = (step: db.AgentStepEvent) => {
       setDraftMsgs((prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
         if (!last || last.role !== "agent") return prev;
-        const segs = [...(last.segments ?? []), { kind: "step" as const, step }];
+
+        const segs = [...(last.segments ?? [])];
+        const at = segs.findIndex(
+          (s) => s.kind === "step" && s.step.index === step.index
+        );
+        if (at >= 0) {
+          segs[at] = { kind: "step", step };
+        } else {
+          segs.push({ kind: "step", step });
+        }
         next[next.length - 1] = { ...last, segments: segs };
         return next;
       });
@@ -2929,6 +2974,7 @@ export default function App() {
             {
               onText: appendDelta,
               onStep: appendStep,
+              onThink: appendThink,
             }
           )
         : await db.streamChat(
@@ -3061,7 +3107,12 @@ export default function App() {
                           animate={{ opacity: 1, y: 0 }}
                           transition={{ duration: 0.2, ease: "easeOut" }}
                         >
-                          <ChatMessage role={m.role} text={m.text} segments={m.segments} />
+                          <ChatMessage
+                            role={m.role}
+                            text={m.text}
+                            segments={m.segments}
+                            streaming={streaming && i === draftMsgs.length - 1}
+                          />
                         </motion.div>
                       ))}
                     </AnimatePresence>

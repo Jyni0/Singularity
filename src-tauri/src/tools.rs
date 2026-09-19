@@ -24,13 +24,13 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
-    fn ok(output: impl Into<String>) -> Self {
+    pub fn ok(output: impl Into<String>) -> Self {
         Self {
             ok: true,
             output: output.into(),
         }
     }
-    fn err(output: impl Into<String>) -> Self {
+    pub fn err(output: impl Into<String>) -> Self {
         Self {
             ok: false,
             output: output.into(),

@@ -8,7 +8,20 @@
  * over how a shell command is presented (with its own copy button).
  */
 import { useState, type ReactNode } from "react";
-import { Check, Copy, Terminal, ChevronRight } from "lucide-react";
+import {
+  Brain,
+  Check,
+  Copy,
+  Eye,
+  FilePlus2,
+  FolderOpen,
+  Loader2,
+  Pencil,
+  Search,
+  Terminal,
+  Wrench,
+  ChevronRight,
+} from "lucide-react";
 
 /* ---------- Inline formatting ---------- */
 
@@ -381,11 +394,30 @@ export interface ToolCallView {
   running?: boolean;
 }
 
-/** Renders one tool invocation: what was called, and what came back. */
-export function ToolCall({ call }: { call: ToolCallView }) {
-  const [open, setOpen] = useState(false);
-  const running = call.running ?? false;
-  const ok = call.ok ?? true;
+/** Each tool gets its own icon and verb, so the transcript reads at a glance. */
+const TOOL_META: Record<
+  string,
+  { icon: typeof Terminal; label: string }
+> = {
+  read_file: { icon: Eye, label: "Read" },
+  write_file: { icon: FilePlus2, label: "Write" },
+  edit_file: { icon: Pencil, label: "Edit" },
+  list_dir: { icon: FolderOpen, label: "List" },
+  grep: { icon: Search, label: "Search" },
+  run_command: { icon: Terminal, label: "Run" },
+};
+
+/** Reasoning the model streamed before or between its actions. */
+export function ThinkBlock({
+  text,
+  live,
+}: {
+  text: string;
+  live?: boolean;
+}) {
+  // Collapsed while streaming would hide progress; open by default, and the
+  // user can fold it away once the turn is done.
+  const [open, setOpen] = useState(true);
 
   return (
     <div className="my-1 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-surface)]">
@@ -397,15 +429,69 @@ export function ToolCall({ call }: { call: ToolCallView }) {
           size={12}
           className={`shrink-0 text-[var(--text-dim)] transition-transform ${open ? "rotate-90" : ""}`}
         />
-        <Terminal size={12} className="shrink-0 text-[var(--text-dim)]" />
-        <span className="shrink-0 font-mono text-[12px] text-[var(--text-main)]">{call.name}</span>
+        <Brain size={12} className="shrink-0 text-[var(--text-dim)]" />
+        <span className="shrink-0 text-[12px] font-medium text-[var(--text-muted)]">
+          Think
+        </span>
+        {live && (
+          <span className="shrink-0 text-[10px] uppercase tracking-wide text-[var(--accent)]">
+            thinking…
+          </span>
+        )}
+        {!open && (
+          <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-dim)]">
+            {text.replace(/\s+/g, " ").slice(0, 90)}
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div className="max-h-[280px] overflow-auto border-t border-[var(--border)] bg-[var(--bg-input)] px-3 py-2">
+          {/* Reasoning is prose, not markdown the model meant for the user. */}
+          <p className="whitespace-pre-wrap text-[12px] leading-[1.6] text-[var(--text-muted)]">
+            {text}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Renders one tool invocation: what was called, and what came back. */
+export function ToolCall({ call }: { call: ToolCallView }) {
+  const [open, setOpen] = useState(false);
+  const running = call.running ?? false;
+  const ok = call.ok ?? true;
+  const meta = TOOL_META[call.name] ?? { icon: Wrench, label: call.name };
+  const Icon = meta.icon;
+
+  return (
+    <div className="my-1 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-surface)]">
+      <button
+        className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
+        onClick={() => setOpen(!open)}
+      >
+        <ChevronRight
+          size={12}
+          className={`shrink-0 text-[var(--text-dim)] transition-transform ${open ? "rotate-90" : ""}`}
+        />
+        <Icon size={12} className="shrink-0 text-[var(--text-dim)]" />
+        <span className="shrink-0 text-[12px] font-medium text-[var(--text-main)]">
+          {meta.label}
+        </span>
         <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--text-dim)]">
           {call.input}
         </span>
         {running ? (
-          <span className="shrink-0 text-[10px] uppercase tracking-wide text-[var(--text-dim)]">
-            running
-          </span>
+          <>
+            <Loader2
+              size={11}
+              className="shrink-0 animate-spin text-[var(--accent)]"
+            />
+            <span className="shrink-0 text-[10px] uppercase tracking-wide text-[var(--text-dim)]">
+              running
+            </span>
+          </>
         ) : (
           <span
             className={`shrink-0 text-[10px] uppercase tracking-wide ${

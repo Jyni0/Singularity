@@ -11,10 +11,10 @@
 }
 
 [data-theme="dark"] {
-  --bg-app: #111113;
+  --bg-app: #101010;
   --bg-sidebar: #181818;
   --bg-titlebar: #181818;
-  --bg-surface: #1B1B1E;
+  --bg-surface: #1c1c1c;
   --bg-input: #212124;
   --bg-elevated: #2A2A2E;
   --border: rgba(255, 255, 255, 0.08);

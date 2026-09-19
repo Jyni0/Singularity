@@ -1,5 +1,34 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import {
+  type Conversation,
+  type Model,
+  type Project,
+  type Provider,
+  type Theme,
+  type ViewKind,
+  type Gateway,
+  CONV_LIMIT,
+  NO_PROJECT,
+} from "./types";
+import * as db from "./db";
+import { ModelsSettings } from "./ModelsSettings";
+import { Markdown, ToolCall } from "./Markdown";
+import { toAttachments, formatSize, composePrompt } from "./attachments";
+import type { Effort, Attachment } from "./types";
+import { EFFORTS } from "./types";
+
+export type {
+  Conversation,
+  Model,
+  ModelOption,
+  Project,
+  Provider,
+  ProviderKind,
+  ProviderStatus,
+  Theme,
+  ViewKind,
+} from "./types";
 import { motion, AnimatePresence } from "motion/react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -35,9 +64,25 @@ import {
   FolderCog,
   CopyPlus,
   ChevronLast,
+  Loader2,
+  Gauge,
+  Paperclip,
+  FileText,
 } from "lucide-react";
 
 /* ---------- Shared class fragments (single source of truth) ---------- */
+
+/**
+ * Suppresses the default right-click menu for the whole window. A desktop app
+ * should own its own menus rather than show Back / Reload / Inspect.
+ */
+function useBlockContextMenu() {
+  useEffect(() => {
+    const block = (e: MouseEvent) => e.preventDefault();
+    document.addEventListener("contextmenu", block);
+    return () => document.removeEventListener("contextmenu", block);
+  }, []);
+}
 
 /** Sidebar / titlebar row: h 32px, padding 0 8px, radius 6px, gap 10px */
 const ROW = "flex h-8 shrink-0 items-center gap-2.5 rounded-md px-2 text-left text-[13px]";
@@ -187,21 +232,7 @@ function ScrollBox({
   );
 }
 
-/* ---------- Types ---------- */
-
-export type Theme = "dark" | "light" | "slate" | "amoled";
-
-export interface ModelOption {
-  id: string;
-  name: string;
-  meta: string;
-}
-
-export interface Gateway {
-  id: string;
-  name: string;
-  models: ModelOption[];
-}
+/* ---------- Types (domain types live in ./types) ---------- */
 
 export interface DiffLine {
   kind: "add" | "del" | "ctx" | "hunk";
@@ -214,63 +245,7 @@ interface Msg {
   text: string;
 }
 
-export interface Conversation {
-  id: string;
-  title: string;
-  age: string;
-  pinned?: boolean;
-}
-
-export interface Project {
-  name: string;
-  path: string;
-  conversations: Conversation[];
-}
-
-export type ViewKind = "chat" | "new" | "history" | "tasks";
-
-/** Pseudo-project holding chats that belong to no folder. */
-const NO_PROJECT = "No project";
-
-/** How many conversations a project shows before "See all (N)". */
-const CONV_LIMIT = 6;
-
-/* ---------- Data ---------- */
-
-const GATEWAYS: Gateway[] = [
-  {
-    id: "antigravity",
-    name: "Google Antigravity",
-    models: [
-      { id: "gemini-3-pro", name: "Gemini 3 Pro", meta: "Artifacts" },
-      { id: "gemini-3-flash", name: "Gemini 3 Flash", meta: "fast" },
-    ],
-  },
-  {
-    id: "dsh",
-    name: "DeepSeek Harness",
-    models: [
-      { id: "deepseek-v4", name: "DeepSeek V4", meta: "Reasoner" },
-      { id: "deepseek-r2", name: "DeepSeek Reasoner R2", meta: "thinking" },
-    ],
-  },
-  {
-    id: "ollama",
-    name: "Ollama · localhost:11434",
-    models: [
-      { id: "llama3-70b", name: "Llama 3 70B", meta: "local" },
-      { id: "qwen2.5-coder", name: "Qwen 2.5 Coder 32B", meta: "local" },
-    ],
-  },
-  {
-    id: "openai",
-    name: "OpenAI · BYOK",
-    models: [
-      { id: "gpt-4o", name: "GPT-4o", meta: "BYOK" },
-      { id: "o3-mini", name: "o3-mini", meta: "BYOK" },
-    ],
-  },
-];
+/* ---------- Seed data (used by the in-memory fallback outside Tauri) ---------- */
 
 const R = "C:\\Users\\nezuss\\Documents\\GitHub\\";
 
@@ -285,7 +260,7 @@ const NO_PROJECT_ENTRY: Project = {
   ],
 };
 
-const INITIAL_PROJECTS: Project[] = [
+const SEED_PROJECTS: Project[] = [
   {
     name: "Singularity",
     path: R + "Singularity",
@@ -333,6 +308,92 @@ const INITIAL_PROJECTS: Project[] = [
   { name: "TSKS_1gg7sgds", path: R + "TSKS_1gg7sgds", conversations: [] },
   NO_PROJECT_ENTRY,
 ];
+
+const SEED_PROVIDERS: Provider[] = [
+  {
+    id: "dsh",
+    name: "DeepSeek Harness",
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:8080",
+    api_key: "",
+    enabled: true,
+    status: "ready",
+    last_sync: null,
+    auth: "key",
+  },
+  {
+    id: "google",
+    name: "Google Antigravity",
+    kind: "google",
+    base_url: "https://generativelanguage.googleapis.com",
+    api_key: "",
+    enabled: false,
+    status: "disconnected",
+    last_sync: null,
+    auth: "key",
+  },
+  {
+    id: "openai",
+    name: "OpenAI",
+    kind: "openai",
+    base_url: "https://api.openai.com/v1",
+    api_key: "",
+    enabled: false,
+    status: "disconnected",
+    last_sync: null,
+    auth: "key",
+  },
+];
+
+const SEED_MODELS: Model[] = [
+  ...[
+    ["gemini-3-pro", "Gemini 3 Pro", "Artifacts"],
+    ["gemini-3-flash", "Gemini 3 Flash", "fast"],
+  ].map<Model>(([model_id, name, meta]) => ({
+    id: `google:${model_id}`,
+    provider_id: "google",
+    model_id,
+    name,
+    meta,
+    enabled: true,
+  })),
+  ...[
+    ["deepseek-v4", "DeepSeek V4", "Reasoner"],
+    ["deepseek-r2", "DeepSeek Reasoner R2", "thinking"],
+  ].map<Model>(([model_id, name, meta]) => ({
+    id: `dsh:${model_id}`,
+    provider_id: "dsh",
+    model_id,
+    name,
+    meta,
+    enabled: true,
+  })),
+  ...[
+    ["gpt-4o", "GPT-4o", "BYOK"],
+    ["o3-mini", "o3-mini", "BYOK"],
+  ].map<Model>(([model_id, name, meta]) => ({
+    id: `openai:${model_id}`,
+    provider_id: "openai",
+    model_id,
+    name,
+    meta,
+    enabled: true,
+  })),
+];
+
+/** Groups providers and their models into the shape the pickers consume. */
+function toGateways(providers: Provider[], models: Model[]): Gateway[] {
+  return providers.map((p) => ({
+    id: p.id,
+    name: p.name,
+    kind: p.kind,
+    status: p.status,
+    enabled: p.enabled,
+    models: models
+      .filter((m) => m.provider_id === p.id && m.enabled)
+      .map((m) => ({ id: m.model_id, name: m.name, meta: m.meta })),
+  }));
+}
 
 const INITIAL_SCHEDULED = ["Nightly /review @main", "Weekly /test all"];
 
@@ -407,7 +468,7 @@ function TitleBar() {
     >
       {/* Left: app menu */}
       <div className="flex h-full items-center gap-1 pl-2">
-        <span className="mr-0.5 px-2 text-[13px] font-semibold tracking-wide bg-gradient-to-r from-[#348867] to-[#64d5a4] bg-clip-text text-transparent">
+        <span className="mr-0.5 px-2 text-[13px] font-semibold tracking-wide bg-[var(--text-muted)] bg-clip-text text-transparent">
           Singularity
         </span>
         {Object.keys(MENUS).map((m) => (
@@ -1206,7 +1267,8 @@ function ChatMessage({ role, text }: { role: "user" | "agent"; text: string }) {
   return (
     <div className="flex flex-col gap-2">
       <div className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">Agent</div>
-      <MessageBody text={text} />
+      {/* Model output is markdown: headings, lists, tables and fenced code. */}
+      <Markdown text={text} />
     </div>
   );
 }
@@ -1280,10 +1342,12 @@ const MENU_ITEM =
 /* ---------- Model selector (gateways → submenu flies right) ---------- */
 
 function ModelSelector({
+  gateways,
   gatewayId,
   modelId,
   onSelect,
 }: {
+  gateways: Gateway[];
   gatewayId: string;
   modelId: string;
   onSelect: (gatewayId: string, modelId: string) => void;
@@ -1300,15 +1364,26 @@ function ModelSelector({
     return () => document.removeEventListener("mousedown", close);
   }, []);
 
-  const gw = GATEWAYS.find((g) => g.id === gatewayId)!;
-  const model = gw.models.find((m) => m.id === modelId)!;
+  // Providers with at least one enabled model are the ones worth showing.
+  const usable = gateways.filter((g) => g.models.length > 0);
+  const gw = usable.find((g) => g.id === gatewayId) ?? usable[0];
+  const model = gw?.models.find((m) => m.id === modelId) ?? gw?.models[0];
+
+  if (!gw || !model) {
+    return (
+      <span className={`${CHIP} cursor-default opacity-60`} title="No models available — connect a provider in Settings → Models">
+        <Zap size={12} strokeWidth={1.5} />
+        No models
+      </span>
+    );
+  }
 
   return (
     <div className="relative" ref={ref}>
       <span className={CHIP} onClick={() => setOpen(!open)}>
         <Zap size={12} strokeWidth={1.5} />
         {model.name}
-        <span className="text-[var(--text-dim)]">· {gw.name.split(" ·")[0]}</span>
+        <span className="text-[var(--text-dim)]">· {gw.name}</span>
         <ChevronDown size={12} />
       </span>
       <AnimatePresence>
@@ -1320,7 +1395,7 @@ function ModelSelector({
             exit={{ opacity: 0, y: 8, scale: 0.96 }}
             transition={{ duration: 0.15, ease: "easeOut" }}
           >
-            {GATEWAYS.map((g) => (
+            {usable.map((g) => (
               <div
                 key={g.id}
                 className="relative"
@@ -1328,8 +1403,14 @@ function ModelSelector({
                 onClick={() => setHoveredGw(g.id)}
               >
                 <button className={MENU_ITEM}>
-                  <span>{g.name.split(" ·")[0]}</span>
-                  {g.id === gatewayId && <Check size={12} />}
+                  <span>{g.name}</span>
+                  {g.id === gw.id && <Check size={12} />}
+                  <span
+                    className={`ml-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${
+                      g.status === "ready" ? "bg-[var(--accent)]" : "bg-[var(--text-dim)]"
+                    }`}
+                    title={g.status}
+                  />
                   <ChevronRight size={12} className="ml-auto text-[var(--text-dim)]" />
                 </button>
                 <AnimatePresence>
@@ -1344,7 +1425,7 @@ function ModelSelector({
                       {g.models.map((m) => (
                         <button
                           key={m.id}
-                          className={`${MENU_ITEM} ${g.id === gatewayId && m.id === modelId ? "bg-[var(--hover-bg)]" : ""}`}
+                          className={`${MENU_ITEM} ${g.id === gw.id && m.id === model.id ? "bg-[var(--hover-bg)]" : ""}`}
                           onClick={() => {
                             onSelect(g.id, m.id);
                             setOpen(false);
@@ -1475,11 +1556,12 @@ function getSpeechRecognition(): (new () => SpeechRec) | null {
 /**
  * Microphone → text. Streams recognized speech into the caller via onText
  * (interim results are shown live, final results are appended).
+ *
+ * Uses the Web Speech API, which is available in the WebView2 runtime. The
+ * language follows the browser locale, with a sane default when it cannot be
+ * detected.
  */
-function useSpeechToText(
-  lang: string,
-  onText: (chunk: string, isFinal: boolean) => void
-) {
+function useSpeechToText(onText: (chunk: string, isFinal: boolean) => void) {
   const [listening, setListening] = useState(false);
   const [supported] = useState(() => getSpeechRecognition() !== null);
   const recRef = useRef<SpeechRec | null>(null);
@@ -1503,7 +1585,8 @@ function useSpeechToText(
       const rec = new Ctor();
       rec.continuous = true;
       rec.interimResults = true;
-      rec.lang = lang;
+      // Match the user's language, falling back to English.
+      rec.lang = navigator.language || "en-US";
       finalRef.current = "";
 
       rec.onresult = (e: any) => {
@@ -1538,6 +1621,82 @@ function useSpeechToText(
   return { listening, supported, start, stop, toggle: () => (listening ? stop() : start()) };
 }
 
+/* ---------- Effort selector ---------- */
+
+const EFFORT_INFO: Record<Effort, { label: string; hint: string }> = {
+  low: { label: "Fast", hint: "Low effort — quick answers, minimal reasoning" },
+  medium: { label: "Balanced", hint: "Medium effort — default balance of speed and depth" },
+  high: { label: "Think", hint: "High effort — deeper reasoning, slower" },
+};
+
+/** Dropdown chip that picks the reasoning effort. */
+function EffortChip({ effort, onPick }: { effort: Effort; onPick: (e: Effort) => void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  // Close on outside click, matching the other dropdowns.
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open]);
+  const info = EFFORT_INFO[effort];
+
+  return (
+    <div className="relative shrink-0" ref={ref}>
+      <span
+        className={CHIP_CTX}
+        onClick={() => setOpen(!open)}
+        title="Reasoning effort"
+      >
+        <Gauge size={12} strokeWidth={1.5} />
+        {info.label}
+        <ChevronDown size={12} />
+      </span>
+
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            className="absolute bottom-full left-0 z-50 mb-1.5 w-[210px] rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] p-1.5 shadow-[0_12px_28px_-10px_rgba(0,0,0,0.55)]"
+            initial={{ opacity: 0, y: 6, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 6, scale: 0.98 }}
+            transition={{ duration: 0.12, ease: "easeOut" }}
+          >
+            <div className="px-2 py-1 text-[10px] uppercase tracking-wide text-[var(--text-dim)]">
+              Reasoning effort
+            </div>
+            {EFFORTS.map((lvl) => (
+              <button
+                key={lvl}
+                className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] transition-colors ${
+                  effort === lvl
+                    ? "bg-[var(--hover-bg)] text-[var(--text-main)]"
+                    : "text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                }`}
+                onClick={() => {
+                  onPick(lvl);
+                  setOpen(false);
+                }}
+              >
+                {effort === lvl ? <Check size={13} /> : <span className="w-[13px]" />}
+                <span className="min-w-0 flex-1">
+                  <span className="block font-medium">{EFFORT_INFO[lvl].label}</span>
+                  <span className="block truncate text-[10px] text-[var(--text-dim)]">
+                    {EFFORT_INFO[lvl].hint}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
 /* ---------- Prompt box ---------- */
 
 function PromptBox({
@@ -1545,20 +1704,48 @@ function PromptBox({
   projects,
   project,
   onSelectProject,
+  gateways,
   centered,
 }: {
-  onSend: (text: string) => void;
+  onSend: (
+    text: string,
+    selection: { gatewayId: string; modelId: string; effort: Effort },
+    attachments: Attachment[]
+  ) => void;
   projects: Project[];
   project: string;
   onSelectProject: (name: string) => void;
+  gateways: Gateway[];
   centered?: boolean;
 }) {
   const [text, setText] = useState("");
-  const [gatewayId, setGatewayId] = useState("dsh");
-  const [modelId, setModelId] = useState("deepseek-v4");
+  const [gatewayId, setGatewayId] = useState("");
+  const [modelId, setModelId] = useState("");
   const [turbo, setTurbo] = useState(true);
+  const [effort, setEffort] = useState<Effort>(
+    () => (localStorage.getItem("effort") as Effort) || "medium"
+  );
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
   const promptThumb = useOverlayThumb(ref);
+
+  // Keep the selection pointed at a model that actually exists: the provider
+  // list is loaded from the database and changes as providers are connected.
+  useEffect(() => {
+    const usable = gateways.filter((g) => g.models.length > 0);
+    const current = usable.find(
+      (g) => g.id === gatewayId && g.models.some((m) => m.id === modelId)
+    );
+    if (current) return;
+    const first = usable[0];
+    if (first) {
+      setGatewayId(first.id);
+      setModelId(first.models[0].id);
+    }
+  }, [gateways, gatewayId, modelId]);
 
   const autoGrow = () => {
     const el = ref.current;
@@ -1567,7 +1754,7 @@ function PromptBox({
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   };
 
-  const speech = useSpeechToText("ru-RU", (chunk, isFinal) => {
+  const speech = useSpeechToText((chunk, isFinal) => {
     if (!isFinal) return; // interim text is handled below via preview
     setText((prev) => `${prev}${prev && !prev.endsWith(" ") ? " " : ""}${chunk.trim()}`);
     requestAnimationFrame(autoGrow);
@@ -1578,11 +1765,63 @@ function PromptBox({
     else speech.start();
   };
 
+  /** Accepts picked or dropped files as attachments. */
+  const acceptFiles = async (files: File[]) => {
+    if (files.length === 0) return;
+    const { attachments: added, rejected } = await toAttachments(files);
+    if (added.length > 0) setAttachments((prev) => [...prev, ...added]);
+    setNotice(rejected.length > 0 ? rejected.join(" · ") : null);
+  };
+
+  /** Pastes from the clipboard: images (screenshots) and copied files. */
+  const onPaste = async (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+
+    const files: File[] = [];
+    let textPart = "";
+
+    for (const item of items) {
+      // A copied file or a screenshot in the clipboard.
+      if (item.kind === "file") {
+        const f = item.getAsFile();
+        if (f) files.push(f);
+      } else if (item.kind === "string" && item.type === "text/plain") {
+        textPart = e.clipboardData.getData("text/plain");
+      }
+    }
+
+    if (files.length > 0) {
+      // Let the browser skip its own file handling; we take over.
+      e.preventDefault();
+      await acceptFiles(files);
+      return;
+    }
+
+    // Plain text still goes into the textarea normally.
+    if (textPart) {
+      e.preventDefault();
+      setText((prev) => prev + textPart);
+      requestAnimationFrame(autoGrow);
+    }
+  };
+
+  const removeAttachment = (id: string) =>
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+
+  const pickEffort = (next: Effort) => {
+    setEffort(next);
+    localStorage.setItem("effort", next);
+  };
+
   const send = () => {
-    if (!text.trim()) return;
+    // A prompt can be just attachments — that is a legitimate request.
+    if (!text.trim() && attachments.length === 0) return;
     speech.stop();
-    onSend(text.trim());
+    onSend(text.trim(), { gatewayId, modelId, effort }, attachments);
     setText("");
+    setAttachments([]);
+    setNotice(null);
     requestAnimationFrame(autoGrow);
   };
 
@@ -1595,7 +1834,65 @@ function PromptBox({
           </div>
         )}
         {/* min-h 108px, radius 16, theme surface + border */}
-        <div className="flex min-h-[108px] w-full flex-col justify-between rounded-2xl border border-[var(--border)] bg-[var(--bg-surface)] transition-colors focus-within:border-[var(--accent)]">
+        <div
+          className={`flex min-h-[108px] w-full flex-col justify-between rounded-2xl border bg-[var(--bg-surface)] transition-colors focus-within:border-[var(--accent)] ${
+            dragging ? "border-[var(--accent)] bg-[var(--hover-bg)]" : "border-[var(--border)]"
+          }`}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragging(true);
+          }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragging(false);
+            void acceptFiles(Array.from(e.dataTransfer.files));
+          }}
+        >
+          {/* Attachment previews, above the input */}
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 px-3 pt-3">
+              {attachments.map((a) => (
+                <div
+                  key={a.id}
+                  className="group flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] py-1 pl-1 pr-2"
+                >
+                  {a.kind === "image" ? (
+                    <img
+                      src={a.data}
+                      alt={a.name}
+                      className="h-8 w-8 rounded object-cover"
+                    />
+                  ) : (
+                    <FileText size={13} className="mx-1 text-[var(--text-dim)]" />
+                  )}
+                  <span className="max-w-[160px] truncate text-[11px] text-[var(--text-main)]">
+                    {a.name}
+                  </span>
+                  <span className="shrink-0 text-[10px] text-[var(--text-dim)]">
+                    {formatSize(a.size)}
+                  </span>
+                  <button
+                    className="shrink-0 text-[var(--text-dim)] hover:text-[var(--diff-del)]"
+                    onClick={() => removeAttachment(a.id)}
+                    title="Remove attachment"
+                  >
+                    <X size={11} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {notice && (
+            <div className="px-4 pt-2 text-[11px] text-[var(--diff-del)]">{notice}</div>
+          )}
+          {dragging && (
+            <div className="px-4 pt-2 text-[12px] text-[var(--accent)]">
+              Drop to attach files or images…
+            </div>
+          )}
+
           {/* Textarea keeps the custom overlay bar too (native bar is hidden) */}
           <div className="relative">
             <textarea
@@ -1614,6 +1911,7 @@ function PromptBox({
                   send();
                 }
               }}
+              onPaste={(e) => void onPaste(e)}
             />
             <Thumb thumb={promptThumb} />
           </div>
@@ -1621,6 +1919,7 @@ function PromptBox({
           <div className="flex items-center justify-between gap-1.5 px-3 pb-2.5 pt-1.5">
             <div className="flex min-w-0 items-center gap-1.5">
               <ModelSelector
+                gateways={gateways}
                 gatewayId={gatewayId}
                 modelId={modelId}
                 onSelect={(g, m) => {
@@ -1636,14 +1935,29 @@ function PromptBox({
                 {turbo ? <Zap size={12} strokeWidth={1.5} /> : <Shield size={12} strokeWidth={1.5} />}
                 {turbo ? "Turbo" : "Safe"}
               </span>
-              <span className={CHIP_CTX} title="Context: local workspace">
-                <Folder size={12} strokeWidth={1.5} />
-                Local
-                <ChevronDown size={12} />
-              </span>
+              {/* Reasoning effort — low is fast, high thinks harder. */}
+              <EffortChip effort={effort} onPick={pickEffort} />
             </div>
 
             <div className="flex shrink-0 items-center gap-1">
+              {/* Hidden file input driven by the paperclip button */}
+              <input
+                ref={fileInput}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={(e) => {
+                  void acceptFiles(Array.from(e.target.files ?? []));
+                  e.target.value = "";
+                }}
+              />
+              <button
+                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                onClick={() => fileInput.current?.click()}
+                title="Attach files or images (or drag them onto the prompt)"
+              >
+                <Paperclip size={14} strokeWidth={1.5} />
+              </button>
               {/* Mic: 28×28, icon 15 — live speech-to-text while active */}
               <button
                 className={`relative flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
@@ -1834,7 +2148,13 @@ function Modal({
 
 const THEMES: Theme[] = ["dark", "light", "slate", "amoled"];
 
-type SettingsSection = "general" | "execution" | "permissions" | "behavior" | "projects";
+type SettingsSection =
+  | "general"
+  | "execution"
+  | "permissions"
+  | "behavior"
+  | "projects"
+  | "models";
 
 function Segmented({
   options,
@@ -1901,12 +2221,24 @@ function SettingsModal({
   onTheme,
   projects,
   onAddProject,
+  providers,
+  models,
+  persistent,
+  dbInfo,
+  onProvidersChanged,
+  onModelsChanged,
   onClose,
 }: {
   theme: Theme;
   onTheme: (t: Theme) => void;
   projects: Project[];
   onAddProject: (name: string) => void;
+  providers: Provider[];
+  models: Model[];
+  persistent: boolean;
+  dbInfo: string;
+  onProvidersChanged: (next: Provider[]) => void;
+  onModelsChanged: (next: Model[]) => void;
   onClose: () => void;
 }) {
   const [section, setSection] = useState<SettingsSection>("general");
@@ -1935,6 +2267,7 @@ function SettingsModal({
       group: "Settings",
       items: [
         { id: "general", label: "General" },
+        { id: "models", label: "Models" },
         { id: "execution", label: "Execution" },
         { id: "behavior", label: "Agent Behavior" },
       ],
@@ -1950,6 +2283,7 @@ function SettingsModal({
 
   const titles: Record<SettingsSection, [string, string]> = {
     general: ["General", "Appearance, theme and workspace defaults"],
+    models: ["Models", "Connect providers and manage the models they expose"],
     execution: ["Execution", "How agent tasks are queued and run"],
     behavior: ["Agent Behavior", "Autonomy, safety and review policies"],
     permissions: ["Global Permissions", "Tool and filesystem access rules"],
@@ -1966,7 +2300,7 @@ function SettingsModal({
       onClick={onClose}
     >
       <motion.div
-        className="flex h-[min(580px,calc(100vh-48px))] w-[min(820px,calc(100vw-48px))] overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-app)] shadow-[0_25px_50px_-12px_rgba(0,0,0,0.7)]"
+        className="flex h-[min(760px,calc(100vh-40px))] w-[min(1100px,calc(100vw-40px))] overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-app)] shadow-[0_25px_50px_-12px_rgba(0,0,0,0.7)]"
         initial={{ opacity: 0, scale: 0.97 }}
         animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.2, ease: "easeOut" }}
@@ -2028,15 +2362,29 @@ function SettingsModal({
               </SettingRow>
               <Sep />
               <SettingRow title="Default Gateway" hint="Model provider for new conversations">
-                <select className={SSELECT} defaultValue="dsh">
-                  {GATEWAYS.map((g) => (
+                <select className={SSELECT} defaultValue={providers[0]?.id}>
+                  {providers.map((g) => (
                     <option key={g.id} value={g.id}>
-                      {g.name.split(" ·")[0]}
+                      {g.name}
                     </option>
                   ))}
                 </select>
               </SettingRow>
+              <Sep />
+              <SettingRow title="Storage" hint="Where chats, projects and settings live">
+                <span className="font-mono text-[12px] text-[var(--text-muted)]">{dbInfo}</span>
+              </SettingRow>
             </SettingsCard>
+          )}
+
+          {section === "models" && (
+            <ModelsSettings
+              providers={providers}
+              models={models}
+              persistent={persistent}
+              onProvidersChanged={onProvidersChanged}
+              onModelsChanged={onModelsChanged}
+            />
           )}
 
           {section === "execution" && (
@@ -2207,19 +2555,93 @@ function ScheduleModal({
 /* ---------- App ---------- */
 
 export default function App() {
+  // No default browser context menu anywhere in the window.
+  useBlockContextMenu();
   const [draftMsgs, setDraftMsgs] = useState<Msg[]>([]);
   const [sidebarWidth, setSidebarWidth] = useState(240);
   const [theme, setTheme] = useState<Theme>("dark");
-  const [projects, setProjects] = useState<Project[]>(INITIAL_PROJECTS);
+  /** Workspace tree — hydrated from SQLite on mount. */
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [providers, setProviders] = useState<Provider[]>([]);
+  const [models, setModels] = useState<Model[]>([]);
   const [scheduled, setScheduled] = useState<string[]>(INITIAL_SCHEDULED);
   const [modal, setModal] = useState<"none" | "settings" | "schedule">("none");
   const [view, setView] = useState<ViewKind>("chat");
-  const [activeConv, setActiveConv] = useState<{ project: string; id: string } | null>({
-    project: "Singularity",
-    id: "fix-terminal-tests",
-  });
+  const [activeConv, setActiveConv] = useState<{ project: string; id: string } | null>(null);
   const [newChatProject, setNewChatProject] = useState("Singularity");
+  /** False until the first DB read finishes. */
+  const [persistent, setPersistent] = useState(false);
+  /** Human-readable description of where the workspace is stored. */
+  const [dbInfo, setDbInfo] = useState("");
+  /** True while a model response is streaming in. */
+  const [streaming, setStreaming] = useState(false);
+  /** Workspace root the agent's file/command tools operate inside. */
+  const [workspace, setWorkspace] = useState(
+    () => localStorage.getItem("agent_workspace") ?? ""
+  );
+  /** When off, prompts are answered by plain chat with no tool access. */
+  const [agentMode] = useState(() => localStorage.getItem("agent_mode") !== "off");
+  /** Tool calls made during the current turn, newest last. */
+  const [steps, setSteps] = useState<db.AgentStepEvent[]>([]);
   const chatRef = useRef<HTMLDivElement>(null);
+
+  // The agent always has a workspace: the app's own folder by default, or a
+  // project folder the user points it at once (no picker in the prompt box).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const dir = await db.defaultWorkspace();
+      if (!cancelled && dir) setWorkspace(dir);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /* ---------- Boot: hydrate the workspace from SQLite ---------- */
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const [persist, loadedProjects, loadedProviders, loadedModels] = await Promise.all([
+        db.isPersistent(),
+        db.loadProjects(),
+        db.loadProviders(),
+        db.loadModels(),
+      ]);
+      if (cancelled) return;
+
+      // Outside Tauri the DB is unavailable; fall back to the demo workspace.
+      const nextProjects = loadedProjects.length ? loadedProjects : SEED_PROJECTS;
+      const nextProviders = loadedProviders.length ? loadedProviders : SEED_PROVIDERS;
+      const nextModels = loadedModels.length ? loadedModels : SEED_MODELS;
+      if (!persist) db.seedMemory(nextProjects, nextProviders, nextModels);
+
+      setPersistent(persist);
+      setProjects(nextProjects);
+      setProviders(nextProviders);
+      setModels(nextModels);
+      setDbInfo(
+        persist
+          ? "SQLite · singularity.db (app data directory)"
+          : "In-memory (desktop shell not detected)"
+      );
+
+      // Open the most recent chat in the default project.
+      const first = nextProjects.find((p) => p.name === "Singularity") ?? nextProjects[0];
+      const conv = first?.conversations[0];
+      if (first && conv) {
+        setActiveConv({ project: first.name, id: conv.id });
+        const stored = await db.loadMessages(conv.id);
+        if (!cancelled && stored.length) {
+          setDraftMsgs(stored.map((m) => ({ role: m.role, text: m.text })));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -2256,10 +2678,232 @@ export default function App() {
     return "New Conversation";
   })();
 
-  const openConversation = (project: string, id: string) => {
+  const openConversation = async (project: string, id: string) => {
     setActiveConv({ project, id });
-    setDraftMsgs([]);
     setView("chat");
+    // Messages come from the database, not from an in-memory draft.
+    const stored = await db.loadMessages(id);
+    setDraftMsgs(stored.map((m) => ({ role: m.role, text: m.text })));
+  };
+
+  /** Providers grouped with their models — feeds the model picker. */
+  const gateways = useMemo(() => toGateways(providers, models), [providers, models]);
+
+  const addProject = async (name: string) => {
+    const project: Project = { name, path: R + name, conversations: [] };
+    setProjects((prev) => [...prev, project]);
+    await db.insertProject(project, projects.length);
+  };
+
+  const renameConversation = async (project: string, convId: string, title: string) => {
+    setProjects((prev) =>
+      prev.map((p) =>
+        p.name !== project
+          ? p
+          : { ...p, conversations: p.conversations.map((c) => (c.id === convId ? { ...c, title } : c)) }
+      )
+    );
+    await db.updateConversationTitle(convId, title);
+  };
+
+  const deleteConversation = async (project: string, convId: string) => {
+    setProjects((prev) =>
+      prev.map((p) =>
+        p.name !== project
+          ? p
+          : { ...p, conversations: p.conversations.filter((c) => c.id !== convId) }
+      )
+    );
+    await db.removeConversation(convId);
+    if (activeConv?.id === convId) {
+      setActiveConv(null);
+      setDraftMsgs([]);
+      setView("new");
+    }
+  };
+
+  const togglePin = async (project: string, convId: string) => {
+    let next = false;
+    setProjects((prev) =>
+      prev.map((p) => {
+        if (p.name !== project) return p;
+        return {
+          ...p,
+          conversations: p.conversations.map((c) => {
+            if (c.id !== convId) return c;
+            next = !c.pinned;
+            return { ...c, pinned: next };
+          }),
+        };
+      })
+    );
+    // `next` is captured during the state updater above.
+    await Promise.resolve();
+    await db.updateConversationPinned(convId, next);
+  };
+
+  /**
+   * Sends a message: persists it, then streams the model's answer into the
+   * conversation. The reply is written to SQLite once streaming completes, so a
+   * partially received turn is never stored as if it were finished.
+   */
+  const sendMessage = async (
+    text: string,
+    target: { project: string; id: string } | null,
+    selection: { gatewayId: string; modelId: string; effort: Effort },
+    attachments: Attachment[] = []
+  ) => {
+    // Text files are inlined into the prompt; images travel as data URLs and
+    // are converted to each provider's wire shape on the Rust side.
+    const promptText = composePrompt(text, attachments);
+    const images = attachments
+      .filter((a) => a.kind === "image")
+      .map((a) => ({ mime: a.mime, data_url: a.data }));
+
+    // Resolve (or create) the conversation this turn belongs to.
+    let convId: string;
+    let projectName: string;
+    let history: Msg[];
+
+    if (target) {
+      convId = target.id;
+      projectName = target.project;
+      history = [...draftMsgs, { role: "user", text: promptText }];
+      setDraftMsgs(history);
+    } else {
+      convId = `c-${Date.now()}`;
+      projectName = newChatProject;
+      const title = promptText.length > 42 ? `${promptText.slice(0, 42)}…` : promptText;
+      const conv: Conversation = { id: convId, title, age: "now" };
+      setProjects((prev) =>
+        prev.map((p) =>
+          p.name !== projectName ? p : { ...p, conversations: [conv, ...p.conversations] }
+        )
+      );
+      await db.insertConversation(projectName, conv);
+      history = [{ role: "user", text: promptText }];
+      setActiveConv({ project: projectName, id: convId });
+      setDraftMsgs(history);
+      setView("chat");
+    }
+    await db.appendMessage(convId, "user", promptText);
+
+    // Find the provider/model the user picked in the prompt box.
+    const provider = providers.find((p) => p.id === selection.gatewayId);
+    const modelRow = models.find(
+      (m) => m.provider_id === selection.gatewayId && m.model_id === selection.modelId
+    );
+    if (!provider || !modelRow) {
+      const note = "No model selected — add a provider in Settings → Models.";
+      setDraftMsgs((prev) => [...prev, { role: "agent", text: note }]);
+      return;
+    }
+
+    const oauth = {
+      clientId: localStorage.getItem("google_client_id") ?? "",
+      clientSecret: localStorage.getItem("google_client_secret") ?? "",
+    };
+    const cred = await db.credentialFor(provider, oauth);
+    if (cred.error) {
+      const note = `${provider.name}: ${cred.error}`;
+      setDraftMsgs((prev) => [...prev, { role: "agent", text: note }]);
+      return;
+    }
+
+    // With agent mode on the tools always have a workspace; the only case worth
+    // reporting is the shell not having one ready yet.
+    if (agentMode && !workspace.trim()) {
+      setDraftMsgs((prev) => [
+        ...prev,
+        {
+          role: "agent",
+          text:
+            "**Workspace not ready.**\n\nThe tools folder could not be resolved — " +
+            "restart the app and try again.",
+        },
+      ]);
+      return;
+    }
+
+    // Placeholder that grows as deltas arrive.
+    const requestId = `req-${Date.now()}`;
+    setDraftMsgs((prev) => [...prev, { role: "agent", text: "" }]);
+    setSteps([]);
+    setStreaming(true);
+
+    /** Appends streamed text to the agent's bubble. */
+    const appendDelta = (delta: string) => {
+      setDraftMsgs((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last && last.role === "agent") {
+          next[next.length - 1] = { ...last, text: last.text + delta };
+        }
+        return next;
+      });
+    };
+
+    const historyTurns = history.map((m) => ({ role: m.role, text: m.text }));
+
+    try {
+      // With a workspace set, run the full agent loop so the model can read,
+      // write and execute — otherwise it is a plain streaming chat.
+      const useAgent = !!workspace.trim() && agentMode;
+
+      const answer = useAgent
+        ? await db.runAgent(
+            requestId,
+            {
+              kind: provider.kind,
+              base_url: provider.base_url,
+              api_key: cred.apiKey,
+              auth: cred.auth,
+              model: modelRow.model_id,
+              system: "",
+              workspace,
+              effort: selection.effort,
+              images,
+            },
+            historyTurns,
+            {
+              onText: appendDelta,
+              onStep: (step) => setSteps((prev) => [...prev, step]),
+            }
+          )
+        : await db.streamChat(
+            requestId,
+            {
+              kind: provider.kind,
+              base_url: provider.base_url,
+              api_key: cred.apiKey,
+              auth: cred.auth,
+              model: modelRow.model_id,
+              effort: selection.effort,
+              images,
+              system:
+                "You are Singularity, a coding agent inside a desktop workspace. " +
+                "Answer concisely and prefer concrete, runnable steps.",
+            },
+            historyTurns,
+            appendDelta
+          );
+
+      await db.appendMessage(convId, "agent", answer);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setDraftMsgs((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last && last.role === "agent" && last.text === "") {
+          next[next.length - 1] = { role: "agent", text: `⚠️ ${msg}` };
+        } else {
+          next.push({ role: "agent", text: `⚠️ ${msg}` });
+        }
+        return next;
+      });
+    } finally {
+      setStreaming(false);
+    }
   };
 
   return (
@@ -2290,43 +2934,9 @@ export default function App() {
           onOpenSettings={() => setModal("settings")}
           onOpenProjectSettings={() => setModal("settings")}
           onNewProject={() => setModal("settings")}
-          onRenameConversation={(project, convId, title) =>
-            setProjects((prev) =>
-              prev.map((p) =>
-                p.name !== project
-                  ? p
-                  : {
-                      ...p,
-                      conversations: p.conversations.map((c) =>
-                        c.id === convId ? { ...c, title } : c
-                      ),
-                    }
-              )
-            )
-          }
-          onDeleteConversation={(project, convId) =>
-            setProjects((prev) =>
-              prev.map((p) =>
-                p.name !== project
-                  ? p
-                  : { ...p, conversations: p.conversations.filter((c) => c.id !== convId) }
-              )
-            )
-          }
-          onTogglePin={(project, convId) =>
-            setProjects((prev) =>
-              prev.map((p) =>
-                p.name !== project
-                  ? p
-                  : {
-                      ...p,
-                      conversations: p.conversations.map((c) =>
-                        c.id === convId ? { ...c, pinned: !c.pinned } : c
-                      ),
-                    }
-              )
-            )
-          }
+          onRenameConversation={renameConversation}
+          onDeleteConversation={deleteConversation}
+          onTogglePin={togglePin}
         />
 
         <div className="flex min-w-0 flex-1 flex-col bg-[var(--bg-app)]">
@@ -2366,27 +2976,8 @@ export default function App() {
                   projects={projects}
                   project={newChatProject}
                   onSelectProject={setNewChatProject}
-                  onSend={(text) => {
-                    const id = `new-${Date.now()}`;
-                    const title = text.length > 42 ? `${text.slice(0, 42)}…` : text;
-                    // Persist the chat into its project (or the loose-chat section).
-                    setProjects((prev) =>
-                      prev.map((p) =>
-                        p.name !== newChatProject
-                          ? p
-                          : {
-                              ...p,
-                              conversations: [
-                                { id, title, age: "now" },
-                                ...p.conversations,
-                              ],
-                            }
-                      )
-                    );
-                    setActiveConv({ project: newChatProject, id });
-                    setDraftMsgs([{ role: "user", text }]);
-                    setView("chat");
-                  }}
+                  gateways={gateways}
+                  onSend={(text, selection) => sendMessage(text, null, selection)}
                 />
               </motion.div>
             </div>
@@ -2413,14 +3004,53 @@ export default function App() {
                         </motion.div>
                       ))}
                     </AnimatePresence>
+
+                    {/* Tool calls for the current turn, in the order they ran */}
+                    {steps.length > 0 && (
+                      <div className="flex flex-col">
+                        <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
+                          Tool calls · {steps.length}
+                        </div>
+                        {steps.map((s) => (
+                          <ToolCall
+                            key={s.index}
+                            call={{
+                              name: s.name,
+                              input: s.input,
+                              result: s.result,
+                              ok: s.ok,
+                              running: false,
+                            }}
+                          />
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               </ScrollArea>
+
+              {/* Streaming indicator sits above the prompt while the model answers */}
+              <AnimatePresence>
+                {streaming && (
+                  <motion.div
+                    className="flex items-center gap-2 px-6 pb-1 text-[12px] text-[var(--text-dim)]"
+                    initial={{ opacity: 0, y: 4 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 4 }}
+                  >
+                    <span className="mx-auto flex w-full max-w-[760px] items-center gap-2">
+                      <Loader2 size={13} className="animate-spin" />
+                      Generating…
+                    </span>
+                  </motion.div>
+                )}
+              </AnimatePresence>
               <PromptBox
-                onSend={(text) => setDraftMsgs((prev) => [...prev, { role: "user", text }])}
+                onSend={(text, selection) => sendMessage(text, activeConv, selection)}
                 projects={projects}
-                project={activeConv?.project ?? "Singularity"}
+                project={activeConv?.project ?? NO_PROJECT}
                 onSelectProject={() => {}}
+                gateways={gateways}
               />
             </>
           )}
@@ -2432,9 +3062,13 @@ export default function App() {
               theme={theme}
               onTheme={setTheme}
               projects={projects}
-              onAddProject={(n) =>
-                setProjects((p) => [...p, { name: n, path: R + n, conversations: [] }])
-              }
+              onAddProject={addProject}
+              providers={providers}
+              models={models}
+              persistent={persistent}
+              dbInfo={dbInfo}
+              onProvidersChanged={setProviders}
+              onModelsChanged={setModels}
               onClose={() => setModal("none")}
             />
           )}

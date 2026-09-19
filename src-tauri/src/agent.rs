@@ -497,11 +497,11 @@ async fn run_openai(
             "tool_calls": assistant_calls,
         }));
 
-        // Run each tool and feed the results back.
+        // Run each tool and feed the results back. The step event carries the
+        // call, so the UI can place it inline — do not inject it into the text.
         for call in calls.iter().filter(|c| !c.name.is_empty()) {
             let args: Value = serde_json::from_str(&call.args).unwrap_or(json!({}));
             let summary = summarize(&call.name, &args);
-            emit_text(app, run_id, format!("\n\n*{}: {}*\n\n", call.name, summary));
 
             let result = tools::dispatch(root, &call.name, &args);
             step_index += 1;
@@ -731,7 +731,6 @@ async fn run_anthropic(
         for b in &used {
             let args: Value = serde_json::from_str(&b.args).unwrap_or(json!({}));
             let summary = summarize(&b.name, &args);
-            emit_text(app, run_id, format!("\n\n*{}: {}*\n\n", b.name, summary));
 
             let result = tools::dispatch(root, &b.name, &args);
             step_index += 1;

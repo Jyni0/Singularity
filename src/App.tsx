@@ -240,9 +240,17 @@ export interface DiffLine {
   no?: string;
 }
 
+/** One piece of an agent turn: prose, or a tool call that ran mid-answer. */
+type Segment =
+  | { kind: "text"; text: string }
+  | { kind: "step"; step: db.AgentStepEvent };
+
 interface Msg {
   role: "user" | "agent";
+  /** Full text of the turn — what gets stored and sent back as history. */
   text: string;
+  /** Interleaved prose and tool calls, newest last. Live turns only. */
+  segments?: Segment[];
 }
 
 /* ---------- Seed data (used by the in-memory fallback outside Tauri) ---------- */
@@ -1254,7 +1262,15 @@ function MessageBody({ text }: { text: string }) {
 
 /* ---------- Unified chat message row ---------- */
 
-function ChatMessage({ role, text }: { role: "user" | "agent"; text: string }) {
+function ChatMessage({
+  role,
+  text,
+  segments,
+}: {
+  role: "user" | "agent";
+  text: string;
+  segments?: Segment[];
+}) {
   if (role === "user") {
     return (
       <div className="flex flex-col items-end">
@@ -1264,6 +1280,33 @@ function ChatMessage({ role, text }: { role: "user" | "agent"; text: string }) {
       </div>
     );
   }
+
+  // Segments keep prose and tool calls in the order they happened, so the
+  // answer reads as a transcript rather than text with a dump of calls below.
+  if (segments && segments.length > 0) {
+    return (
+      <div className="flex flex-col gap-2">
+        <div className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">Agent</div>
+        {segments.map((seg, i) =>
+          seg.kind === "step" ? (
+            <ToolCall
+              key={`s${seg.step.index}-${i}`}
+              call={{
+                name: seg.step.name,
+                input: seg.step.input,
+                result: seg.step.result,
+                ok: seg.step.ok,
+                running: false,
+              }}
+            />
+          ) : seg.text.trim() ? (
+            <Markdown key={`t${i}`} text={seg.text} />
+          ) : null
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col gap-2">
       <div className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">Agent</div>
@@ -2581,8 +2624,6 @@ export default function App() {
   );
   /** When off, prompts are answered by plain chat with no tool access. */
   const [agentMode] = useState(() => localStorage.getItem("agent_mode") !== "off");
-  /** Tool calls made during the current turn, newest last. */
-  const [steps, setSteps] = useState<db.AgentStepEvent[]>([]);
   const chatRef = useRef<HTMLDivElement>(null);
 
   // The agent always has a workspace: the app's own folder by default, or a
@@ -2827,18 +2868,38 @@ export default function App() {
 
     // Placeholder that grows as deltas arrive.
     const requestId = `req-${Date.now()}`;
-    setDraftMsgs((prev) => [...prev, { role: "agent", text: "" }]);
-    setSteps([]);
+    setDraftMsgs((prev) => [...prev, { role: "agent", text: "", segments: [] }]);
     setStreaming(true);
 
-    /** Appends streamed text to the agent's bubble. */
+    /** Appends streamed prose to the current text segment of the live turn. */
     const appendDelta = (delta: string) => {
       setDraftMsgs((prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
-        if (last && last.role === "agent") {
-          next[next.length - 1] = { ...last, text: last.text + delta };
+        if (!last || last.role !== "agent") return prev;
+
+        const segs = [...(last.segments ?? [])];
+        const tail = segs[segs.length - 1];
+        // Keep appending into the open text segment; a step closes it, so the
+        // next prose starts a fresh segment right after that call.
+        if (tail && tail.kind === "text") {
+          segs[segs.length - 1] = { kind: "text", text: tail.text + delta };
+        } else {
+          segs.push({ kind: "text", text: delta });
         }
+        next[next.length - 1] = { ...last, text: last.text + delta, segments: segs };
+        return next;
+      });
+    };
+
+    /** Inserts a finished tool call into the turn, keeping the order. */
+    const appendStep = (step: db.AgentStepEvent) => {
+      setDraftMsgs((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (!last || last.role !== "agent") return prev;
+        const segs = [...(last.segments ?? []), { kind: "step" as const, step }];
+        next[next.length - 1] = { ...last, segments: segs };
         return next;
       });
     };
@@ -2867,7 +2928,7 @@ export default function App() {
             historyTurns,
             {
               onText: appendDelta,
-              onStep: (step) => setSteps((prev) => [...prev, step]),
+              onStep: appendStep,
             }
           )
         : await db.streamChat(
@@ -3000,31 +3061,10 @@ export default function App() {
                           animate={{ opacity: 1, y: 0 }}
                           transition={{ duration: 0.2, ease: "easeOut" }}
                         >
-                          <ChatMessage role={m.role} text={m.text} />
+                          <ChatMessage role={m.role} text={m.text} segments={m.segments} />
                         </motion.div>
                       ))}
                     </AnimatePresence>
-
-                    {/* Tool calls for the current turn, in the order they ran */}
-                    {steps.length > 0 && (
-                      <div className="flex flex-col">
-                        <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
-                          Tool calls · {steps.length}
-                        </div>
-                        {steps.map((s) => (
-                          <ToolCall
-                            key={s.index}
-                            call={{
-                              name: s.name,
-                              input: s.input,
-                              result: s.result,
-                              ok: s.ok,
-                              running: false,
-                            }}
-                          />
-                        ))}
-                      </div>
-                    )}
                   </div>
                 </div>
               </ScrollArea>

@@ -226,6 +226,12 @@ async fn agent_run(
     agent::run_agent(app, run_id, request, turns).await
 }
 
+/// The user's answer to an `agent://confirm` request (allow/deny a command).
+#[tauri::command]
+fn agent_confirm(run_id: String, approve: bool) {
+    agent::resolve_confirm(&run_id, approve);
+}
+
 pub fn run() {
     let migrations = db::migrations();
 
@@ -263,6 +269,7 @@ pub fn run() {
             list_google_models,
             discovery::list_provider_models,
             agent_run,
+            agent_confirm,
             chat_stream
         ])
         .run(tauri::generate_context!())

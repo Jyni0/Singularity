@@ -5,7 +5,7 @@
  * (`db.ts`) can import them without creating a circular dependency.
  */
 
-export type Theme = "dark" | "light" | "slate" | "amoled";
+export type Theme = "dark" | "light" | "slate" | "amoled" | "vibe";
 
 export interface Conversation {
   id: string;
@@ -18,6 +18,8 @@ export interface Project {
   name: string;
   path: string;
   conversations: Conversation[];
+  /** When true the agent runs commands without asking; false = confirm first. */
+  autoRun?: boolean;
 }
 
 export type ViewKind = "chat" | "new" | "history" | "tasks";

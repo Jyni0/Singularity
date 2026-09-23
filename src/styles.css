@@ -82,6 +82,25 @@
   --diff-del: #EF4444;
   --shadow-popup: 0 10px 30px rgba(0, 0, 0, 0.8);
 }
+/* Synthwave: deep plum night with neon pink and cyan glow. */
+[data-theme="vibe"] {
+  --bg-app: #12081F;
+  --bg-sidebar: #1A0B2E;
+  --bg-titlebar: #1A0B2E;
+  --bg-surface: #221039;
+  --bg-input: #2C1548;
+  --bg-elevated: #3A1D5C;
+  --border: rgba(255, 90, 197, 0.18);
+  --border-soft: rgba(255, 90, 197, 0.10);
+  --text-main: #F5E9FF;
+  --text-muted: #B497D6;
+  --text-dim: #8B6FB0;
+  --accent: #FF5AC5;
+  --accent-hover: #FF7AD1;
+  --diff-add: #3DF5C2;
+  --diff-del: #FF4D6D;
+  --shadow-popup: 0 10px 34px rgba(255, 90, 197, 0.28), 0 4px 18px rgba(18, 8, 31, 0.6);
+}
 
 /* ---- Minimal global layer ----
    Lives in @layer base so Tailwind utilities (cascade layers) always win. */
@@ -158,6 +177,12 @@
   --row-solid: #050505;
   --row-solid-hover: #171717;
   --row-solid-gradient: #171717;
+}
+[data-theme="vibe"] {
+  --hover-bg: rgba(255, 90, 197, 0.10);
+  --row-solid: #1A0B2E;
+  --row-solid-hover: #2C1548;
+  --row-solid-gradient: #2C1548;
 }
 
 /* Sidebar drag-resizer (kept as plain CSS, it's a behavior strip) */

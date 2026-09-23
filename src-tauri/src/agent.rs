@@ -13,8 +13,47 @@ use crate::tools;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
+use tokio::sync::oneshot;
+
+/* ---------- Command approval ---------- */
+
+/// Pending approval requests, keyed by run id. The agent loop inserts a oneshot
+/// sender before asking the UI, then awaits it; `agent_confirm` feeds the answer
+/// back in. Dropped senders (window closed) resolve as "denied".
+static PENDING: Mutex<Option<HashMap<String, oneshot::Sender<bool>>>> = Mutex::new(None);
+
+fn pending() -> &'static Mutex<Option<HashMap<String, oneshot::Sender<bool>>>> {
+    &PENDING
+}
+
+/// Called by the `agent_confirm` command with the user's decision.
+pub fn resolve_confirm(run_id: &str, approve: bool) {
+    if let Some(map) = pending().lock().unwrap().as_mut() {
+        if let Some(tx) = map.remove(run_id) {
+            let _ = tx.send(approve);
+        }
+    }
+}
+
+/// Asks the UI to approve a command and waits for the answer.
+async fn ask_confirm(app: &AppHandle, run_id: &str, command: &str, cwd: &str) -> bool {
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut guard = pending().lock().unwrap();
+        let map = guard.get_or_insert_with(HashMap::new);
+        map.insert(run_id.to_string(), tx);
+    }
+    let _ = app.emit(
+        "agent://confirm",
+        json!({ "run_id": run_id, "command": command, "cwd": cwd }),
+    );
+    // A dropped sender (app closed) reads as denial — safe default.
+    rx.await.unwrap_or(false)
+}
 
 /// Upper bound on model→tool→model rounds, so a confused model cannot spin.
 const MAX_STEPS: usize = 24;
@@ -188,6 +227,10 @@ pub struct AgentRequest {
     /// `low`, `medium`, `high` — reasoning depth where the provider supports it.
     #[serde(default)]
     pub effort: String,
+    /// Run commands without asking. False = every `run_command` needs the
+    /// user's approval through the `agent://confirm` event.
+    #[serde(default)]
+    pub auto_run: bool,
     /// Images attached to the last user turn.
     #[serde(default)]
     pub images: Vec<crate::chat::ImageAttachment>,
@@ -559,20 +602,39 @@ async fn run_openai(
                 &tools::ToolResult::ok(""),
             );
 
+            // Permission gate: unless the project runs commands automatically,
+            // `run_command` waits for the user's Allow/Deny in the UI.
+            let denied = if !req.auto_run && call.name == "run_command" {
+                let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                let cwd = args
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(req.workspace.as_str());
+                !ask_confirm(app, run_id, cmd, cwd).await
+            } else {
+                false
+            };
+
             // Tools block (file IO, waiting on a process). Running them on the
             // async worker thread stalls the whole task and starves event
             // delivery, so hand them to the blocking pool and await the result.
             let tool_root = root.to_path_buf();
             let tool_name = call.name.clone();
             let tool_args = args.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                tools::dispatch(&tool_root, &tool_name, &tool_args)
-            })
-            .await
-            .unwrap_or_else(|e| tools::ToolResult {
-                ok: false,
-                output: format!("tool task failed: {e}"),
-            });
+            let result = if denied {
+                tools::ToolResult::err(
+                    "The user denied this command. Do not retry it — continue without it.",
+                )
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    tools::dispatch(&tool_root, &tool_name, &tool_args)
+                })
+                .await
+                .unwrap_or_else(|e| tools::ToolResult {
+                    ok: false,
+                    output: format!("tool task failed: {e}"),
+                })
+            };
 
             emit_step(app, run_id, this_index, &call.name, summary, true, &result);
 
@@ -826,18 +888,37 @@ async fn run_anthropic(
                 &tools::ToolResult::ok(""),
             );
 
+            // Permission gate: same as the OpenAI branch — commands wait for
+            // the user unless the project runs them automatically.
+            let denied = if !req.auto_run && b.name == "run_command" {
+                let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                let cwd = args
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(req.workspace.as_str());
+                !ask_confirm(app, run_id, cmd, cwd).await
+            } else {
+                false
+            };
+
             // Tools block; keep the async worker free so events keep flowing.
             let tool_root = root.to_path_buf();
             let tool_name = b.name.clone();
             let tool_args = args.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                tools::dispatch(&tool_root, &tool_name, &tool_args)
-            })
-            .await
-            .unwrap_or_else(|e| tools::ToolResult {
-                ok: false,
-                output: format!("tool task failed: {e}"),
-            });
+            let result = if denied {
+                tools::ToolResult::err(
+                    "The user denied this command. Do not retry it — continue without it.",
+                )
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    tools::dispatch(&tool_root, &tool_name, &tool_args)
+                })
+                .await
+                .unwrap_or_else(|e| tools::ToolResult {
+                    ok: false,
+                    output: format!("tool task failed: {e}"),
+                })
+            };
 
             emit_step(app, run_id, this_index, &b.name, summary, true, &result);
 

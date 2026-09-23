@@ -28,6 +28,7 @@ import {
   LogOut,
   CircleCheck,
   ChevronDown,
+  Pencil,
 } from "lucide-react";
 import type { Model, OAuthTokens, Provider, ProviderKind } from "./types";
 import {
@@ -514,6 +515,9 @@ function ProviderCard({
   const [url, setUrl] = useState(provider.base_url);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  /** Inline rename state. */
+  const [renaming, setRenaming] = useState(false);
+  const [nameDraft, setNameDraft] = useState(provider.name);
   /** Manual model creation state. */
   const [showAddModel, setShowAddModel] = useState(false);
   const [newModelId, setNewModelId] = useState("");
@@ -599,6 +603,17 @@ function ProviderCard({
     onRemoved(provider.id);
   };
 
+  /** Saves the new display name; the id stays stable, so models survive. */
+  const saveName = async () => {
+    const next = nameDraft.trim();
+    setRenaming(false);
+    if (!next || next === provider.name) {
+      setNameDraft(provider.name);
+      return;
+    }
+    await persist({ name: next });
+  };
+
   // Only offer Refresh once there is something to authenticate with.
   const canRefresh = isGoogle ? provider.auth === "bearer" || !!key.trim() : true;
 
@@ -610,14 +625,33 @@ function ProviderCard({
           className="flex min-w-0 flex-1 flex-col items-start text-left"
           onClick={() => setExpanded(!expanded)}
         >
-          <span className="flex items-center gap-1.5 truncate text-[13px] font-medium text-[var(--text-main)]">
-            {provider.name}
-            {isGoogle && provider.auth === "bearer" && tokens?.access_token && (
-              <span className="rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--accent)]">
-                signed in
-              </span>
-            )}
-          </span>
+          {renaming ? (
+            // Inline rename: Enter or blur saves, Escape cancels.
+            <input
+              autoFocus
+              className="w-full max-w-[260px] rounded-md border border-[var(--accent)] bg-[var(--bg-input)] px-1.5 py-0.5 text-[13px] font-medium text-[var(--text-main)] outline-none"
+              value={nameDraft}
+              onClick={(e) => e.stopPropagation()}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onBlur={() => void saveName()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void saveName();
+                if (e.key === "Escape") {
+                  setNameDraft(provider.name);
+                  setRenaming(false);
+                }
+              }}
+            />
+          ) : (
+            <span className="flex items-center gap-1.5 truncate text-[13px] font-medium text-[var(--text-main)]">
+              {provider.name}
+              {isGoogle && provider.auth === "bearer" && tokens?.access_token && (
+                <span className="rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--accent)]">
+                  signed in
+                </span>
+              )}
+            </span>
+          )}
           <span className="truncate font-mono text-[11px] text-[var(--text-dim)]">
             {provider.kind}
             {provider.base_url ? ` · ${provider.base_url}` : ""}
@@ -634,6 +668,16 @@ function ProviderCard({
         >
           {busy ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
           Refresh
+        </button>
+        <button
+          className="flex h-[30px] w-[30px] items-center justify-center rounded-md text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+          onClick={() => {
+            setNameDraft(provider.name);
+            setRenaming(true);
+          }}
+          title="Rename provider"
+        >
+          <Pencil size={14} />
         </button>
         <button
           className="flex h-[30px] w-[30px] items-center justify-center rounded-md text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"

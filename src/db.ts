@@ -15,6 +15,7 @@ import type {
   ProviderStatus,
   StoredMessage,
 } from "./types";
+import { NO_PROJECT } from "./types";
 
 export type { Model, OAuthTokens, Provider, StoredMessage };
 
@@ -76,6 +77,7 @@ interface ProjectRow {
   name: string;
   path: string;
   sort_order: number;
+  auto_run: number;
 }
 
 interface ConvRow {
@@ -92,7 +94,7 @@ export async function loadProjects(): Promise<Project[]> {
   if (!db) return memory.projects;
 
   const projects = await db.select<ProjectRow[]>(
-    "SELECT id, name, path, sort_order FROM projects ORDER BY sort_order, name"
+    "SELECT id, name, path, sort_order, auto_run FROM projects ORDER BY sort_order, name"
   );
   const convs = await db.select<ConvRow[]>(
     `SELECT id, project_id, title, age_label, pinned
@@ -103,6 +105,7 @@ export async function loadProjects(): Promise<Project[]> {
   return projects.map((p) => ({
     name: p.name,
     path: p.path,
+    autoRun: p.auto_run === 1,
     conversations: convs
       .filter((c) => c.project_id === p.name)
       .map<Conversation>((c) => ({
@@ -121,18 +124,62 @@ export async function insertProject(project: Project, sortOrder: number): Promis
     return;
   }
   await db.execute(
-    "INSERT OR IGNORE INTO projects (id, name, path, sort_order) VALUES ($1, $2, $3, $4)",
-    [project.name, project.name, project.path, sortOrder]
+    `INSERT OR IGNORE INTO projects (id, name, path, sort_order, auto_run)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [project.name, project.name, project.path, sortOrder, project.autoRun ? 1 : 0]
   );
 }
 
+/**
+ * Deletes a project. Its conversations are NOT deleted — they move into the
+ * "No project" bucket so no chat history is ever lost.
+ */
 export async function deleteProject(name: string): Promise<void> {
   const db = await getDb();
   if (!db) {
+    const victim = memory.projects.find((p) => p.name === name);
+    const bucket = memory.projects.find((p) => p.name === NO_PROJECT);
+    if (victim && bucket) bucket.conversations.unshift(...victim.conversations);
     memory.projects = memory.projects.filter((p) => p.name !== name);
     return;
   }
+  await db.execute(
+    `UPDATE conversations SET project_id = $1 WHERE project_id = $2`,
+    [NO_PROJECT, name]
+  );
   await db.execute("DELETE FROM projects WHERE name = $1", [name]);
+}
+
+/** Sets the per-project execution permission (run commands without asking). */
+export async function setProjectAutoRun(name: string, autoRun: boolean): Promise<void> {
+  const db = await getDb();
+  if (!db) {
+    const p = memory.projects.find((x) => x.name === name);
+    if (p) p.autoRun = autoRun;
+    return;
+  }
+  await db.execute("UPDATE projects SET auto_run = $1 WHERE name = $2", [
+    autoRun ? 1 : 0,
+    name,
+  ]);
+}
+
+/** Renames a project everywhere: the row itself and all chats that point at it. */
+export async function renameProject(oldName: string, newName: string): Promise<void> {
+  const db = await getDb();
+  if (!db) {
+    const p = memory.projects.find((x) => x.name === oldName);
+    if (p) p.name = newName;
+    return;
+  }
+  await db.execute("UPDATE projects SET id = $1, name = $1 WHERE name = $2", [
+    newName,
+    oldName,
+  ]);
+  await db.execute("UPDATE conversations SET project_id = $1 WHERE project_id = $2", [
+    newName,
+    oldName,
+  ]);
 }
 
 /* ---------- Conversations ---------- */
@@ -727,6 +774,8 @@ export interface AgentRequest {
   workspace: string;
   /** `low`, `medium` or `high` — reasoning depth where the provider supports it. */
   effort?: "low" | "medium" | "high";
+  /** When true, commands run without asking; false shows an Allow/Deny prompt. */
+  auto_run?: boolean;
   /** Images attached to the final user turn. */
   images?: ImageAttachment[];
 }
@@ -739,6 +788,13 @@ export interface AgentStepEvent {
   index: number;
   /** False while the tool runs; the UI then shows a spinner instead of "done". */
   done: boolean;
+}
+
+/** A command waiting for the user's permission. */
+export interface ConfirmRequest {
+  run_id: string;
+  command: string;
+  cwd: string;
 }
 
 /**
@@ -758,6 +814,8 @@ export async function runAgent(
     onStep: (step: AgentStepEvent) => void;
     /** Reasoning deltas — optional, so plain chat callers are unaffected. */
     onThink?: (delta: string) => void;
+    /** A command is waiting for permission; the UI shows Allow/Deny. */
+    onConfirm?: (req: ConfirmRequest) => void;
   }
 ): Promise<string> {
   if (!inTauri) {
@@ -783,6 +841,10 @@ export async function runAgent(
       // the stored answer or in the next request's history.
       handlers.onThink?.(e.payload.delta);
     }),
+    listen<ConfirmRequest>("agent://confirm", (e) => {
+      if (e.payload.run_id !== runId) return;
+      handlers.onConfirm?.(e.payload);
+    }),
   ]);
 
   try {
@@ -791,6 +853,13 @@ export async function runAgent(
   } finally {
     listeners.forEach((off) => off());
   }
+}
+
+/** Sends the user's Allow/Deny decision for a pending command back to Rust. */
+export async function confirmCommand(runId: string, approve: boolean): Promise<void> {
+  if (!inTauri) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("agent_confirm", { runId, approve });
 }
 
 /** The folder the agent's tools operate in — always available, no UI needed. */

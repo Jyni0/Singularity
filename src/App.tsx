@@ -48,9 +48,6 @@ import {
   ChevronRight,
   Check,
   X,
-  Eye,
-  Circle,
-  CircleDot,
   Settings,
   CalendarClock,
   Minus,
@@ -254,141 +251,14 @@ interface Msg {
   segments?: Segment[];
 }
 
-/* ---------- Seed data (used by the in-memory fallback outside Tauri) ---------- */
-
-const R = "C:\\Users\\nezuss\\Documents\\GitHub\\";
+/* ---------- Fallback data (used by the in-memory store outside Tauri) ---------- */
 
 /** Loose chats (no folder). Kept as a real entry so every row action just works. */
 const NO_PROJECT_ENTRY: Project = {
   name: NO_PROJECT,
   path: "",
-  conversations: [
-    { id: "loose-scratch", title: "Scratch notes", age: "3h" },
-    { id: "loose-quick", title: "Quick question about regex", age: "9h" },
-    { id: "loose-draft", title: "Draft commit message", age: "2d" },
-  ],
+  conversations: [],
 };
-
-const SEED_PROJECTS: Project[] = [
-  {
-    name: "Singularity",
-    path: R + "Singularity",
-    conversations: [
-      { id: "fix-terminal-tests", title: "Fix flaky terminal tests", age: "1d", pinned: true },
-      { id: "model-router-fallback", title: "Add Model Router fallback", age: "2d" },
-      { id: "git-sync", title: "Branchless git sync redesign", age: "3d" },
-      { id: "sidebar-v2", title: "Sidebar v2 layout pass", age: "4d" },
-      { id: "theme-tokens", title: "Theme tokens refactor", age: "6d" },
-      { id: "cmd-palette", title: "Command palette wiring", age: "8d" },
-      { id: "voice-input", title: "Voice input prototype", age: "11d" },
-      { id: "tool-diff", title: "Tool diff review panel", age: "15d" },
-    ],
-  },
-  {
-    name: "accounting",
-    path: R + "accounting",
-    conversations: [{ id: "acc-invoices", title: "Invoice parser refactor", age: "7d" }],
-  },
-  {
-    name: "Auth",
-    path: R + "Auth",
-    conversations: [
-      { id: "auth-jwt", title: "JWT refresh flow", age: "12d" },
-      { id: "auth-oauth", title: "OAuth device flow", age: "14d" },
-      { id: "auth-sessions", title: "Session storage hardening", age: "18d" },
-      { id: "auth-mfa", title: "MFA enrollment", age: "21d" },
-      { id: "auth-keys", title: "Key rotation job", age: "25d" },
-      { id: "auth-audit", title: "Audit log table", age: "28d" },
-      { id: "auth-lockout", title: "Lockout policy", age: "31d" },
-      { id: "auth-passkeys", title: "Passkeys spike", age: "34d" },
-    ],
-  },
-  { name: "CourcesPlatform", path: R + "CourcesPlatform", conversations: [] },
-  { name: "DataVisualizationMatplotlib", path: R + "DataVisualizationMatplotlib", conversations: [] },
-  {
-    name: "Education-Website",
-    path: R + "Education-Website",
-    conversations: [{ id: "edu-landing", title: "Landing page rewrite", age: "5d" }],
-  },
-  { name: "Frontend_Booking", path: R + "Frontend_Booking", conversations: [] },
-  { name: "hosty", path: R + "hosty", conversations: [] },
-  { name: "landing", path: R + "landing", conversations: [] },
-  { name: "TermosClient", path: R + "TermosClient", conversations: [] },
-  { name: "TSKS_1gg7sgds", path: R + "TSKS_1gg7sgds", conversations: [] },
-  NO_PROJECT_ENTRY,
-];
-
-const SEED_PROVIDERS: Provider[] = [
-  {
-    id: "dsh",
-    name: "DeepSeek Harness",
-    kind: "openai-compatible",
-    base_url: "http://127.0.0.1:8080",
-    api_key: "",
-    enabled: true,
-    status: "ready",
-    last_sync: null,
-    auth: "key",
-  },
-  {
-    id: "google",
-    name: "Google Antigravity",
-    kind: "google",
-    base_url: "https://generativelanguage.googleapis.com",
-    api_key: "",
-    enabled: false,
-    status: "disconnected",
-    last_sync: null,
-    auth: "key",
-  },
-  {
-    id: "openai",
-    name: "OpenAI",
-    kind: "openai",
-    base_url: "https://api.openai.com/v1",
-    api_key: "",
-    enabled: false,
-    status: "disconnected",
-    last_sync: null,
-    auth: "key",
-  },
-];
-
-const SEED_MODELS: Model[] = [
-  ...[
-    ["gemini-3-pro", "Gemini 3 Pro", "Artifacts"],
-    ["gemini-3-flash", "Gemini 3 Flash", "fast"],
-  ].map<Model>(([model_id, name, meta]) => ({
-    id: `google:${model_id}`,
-    provider_id: "google",
-    model_id,
-    name,
-    meta,
-    enabled: true,
-  })),
-  ...[
-    ["deepseek-v4", "DeepSeek V4", "Reasoner"],
-    ["deepseek-r2", "DeepSeek Reasoner R2", "thinking"],
-  ].map<Model>(([model_id, name, meta]) => ({
-    id: `dsh:${model_id}`,
-    provider_id: "dsh",
-    model_id,
-    name,
-    meta,
-    enabled: true,
-  })),
-  ...[
-    ["gpt-4o", "GPT-4o", "BYOK"],
-    ["o3-mini", "o3-mini", "BYOK"],
-  ].map<Model>(([model_id, name, meta]) => ({
-    id: `openai:${model_id}`,
-    provider_id: "openai",
-    model_id,
-    name,
-    meta,
-    enabled: true,
-  })),
-];
 
 /** Groups providers and their models into the shape the pickers consume. */
 function toGateways(providers: Provider[], models: Model[]): Gateway[] {
@@ -405,19 +275,6 @@ function toGateways(providers: Provider[], models: Model[]): Gateway[] {
 }
 
 const INITIAL_SCHEDULED = ["Nightly /review @main", "Weekly /test all"];
-
-const DIFF: DiffLine[] = [
-  { kind: "hunk", text: "@@ src/router/fallback.ts @@" },
-  { kind: "ctx", text: "export class ModelRouter {", no: "12" },
-  { kind: "ctx", text: "  private providers: Gateway[];", no: "13" },
-  { kind: "del", text: "  async route(req: Request) {", no: "14" },
-  { kind: "del", text: "    return this.providers[0].send(req);", no: "15" },
-  { kind: "add", text: "  async route(req: Request) {", no: "14" },
-  { kind: "add", text: "  for (const gw of this.providers) {", no: "15" },
-  { kind: "add", text: "      try { return await gw.send(req); }", no: "16" },
-  { kind: "add", text: "      catch (e) { if (!is429(e)) throw e; }", no: "17" },
-  { kind: "ctx", text: "  }", no: "18" },
-];
 
 /* ---------- Custom title bar ---------- */
 
@@ -1151,92 +1008,6 @@ function Badge({ kind, children }: { kind: "add" | "del" | "run"; children: Reac
   );
 }
 
-/* ---------- Collapsible task card ---------- */
-
-function TaskCard({
-  title,
-  badge,
-  children,
-  defaultOpen = true,
-}: {
-  title: string;
-  badge: React.ReactNode;
-  children: React.ReactNode;
-  defaultOpen?: boolean;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
-  return (
-    <div className="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-surface)]">
-      <div
-        className="flex cursor-pointer select-none items-center gap-2 border-b border-[var(--border)] px-3 py-2"
-        onClick={() => setOpen(!open)}
-      >
-        {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        <span className="flex-1 font-semibold">{title}</span>
-        {badge}
-      </div>
-      <AnimatePresence initial={false}>
-        {open && (
-          <motion.div
-            className="overflow-hidden"
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2, ease: "easeOut" }}
-          >
-            <div className="flex flex-col gap-2 p-3">{children}</div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
-  );
-}
-
-/* ---------- Diff viewer ---------- */
-
-function DiffViewer({ file }: { file: string }) {
-  const [decision, setDecision] = useState<"none" | "accepted" | "rejected">("none");
-  return (
-    <div className="max-w-full overflow-x-auto rounded-xl border border-[var(--border)] font-mono text-[13px] leading-normal">
-      <div className="flex items-center gap-2 border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 py-2">
-        <span className="flex-1 text-[12px]">{file}</span>
-        <Badge kind="add">+4</Badge>
-        <Badge kind="del">-2</Badge>
-        <div className="flex gap-2">
-          {decision === "none" ? (
-            <>
-              <button className={`${SBUTTON} h-6 px-2 text-[11px]`} onClick={() => setDecision("accepted")}>
-                <Check size={12} className="mr-1" /> Accept
-              </button>
-              <button className={`${SBUTTON} h-6 px-2 text-[11px]`} onClick={() => setDecision("rejected")}>
-                <X size={12} className="mr-1" /> Reject
-              </button>
-              <button className={`${SBUTTON} h-6 px-2 text-[11px]`}>
-                <Eye size={12} className="mr-1" /> Review
-              </button>
-            </>
-          ) : (
-            <Badge kind={decision === "accepted" ? "add" : "del"}>{decision}</Badge>
-          )}
-        </div>
-      </div>
-      {DIFF.map((l, i) => (
-        <div
-          key={i}
-          className={`flex whitespace-pre px-2 ${
-            l.kind === "add" ? "diff-line--add" : l.kind === "del" ? "diff-line--del" : ""
-          } ${l.kind === "hunk" ? "bg-[var(--bg-surface)] py-0.5 text-[var(--text-dim)]" : ""}`}
-        >
-          {l.no !== undefined && (
-            <span className="w-11 shrink-0 select-none text-[var(--text-dim)]">{l.no}</span>
-          )}
-          <span>{l.text}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
 /* ---------- Collapsible message ---------- */
 
 function MessageBody({ text }: { text: string }) {
@@ -1328,67 +1099,6 @@ function ChatMessage({
       {/* Model output is markdown: headings, lists, tables and fenced code. */}
       <Markdown text={text} />
     </div>
-  );
-}
-
-/* ---------- Demo conversation ---------- */
-
-function ChatBody() {
-  const steps: Array<[string, "done" | "run" | "todo"]> = [
-    ["Locate rate-limit handling in router", "done"],
-    ["Implement 429 fallback loop", "done"],
-    ["Run terminal tests (pnpm test)", "run"],
-    ["Commit changes", "todo"],
-  ];
-  return (
-    <>
-      <ChatMessage
-        role="user"
-        text="/fix Rate limits on the official gateway cause task failures — add a fallback strategy. @src"
-      />
-
-      <div className="flex flex-col gap-2">
-        <div className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
-          Agent · DeepSeek V4
-        </div>
-        <MessageBody
-          text={`Found the issue: ModelRouter only ever used the first provider and never retried on 429.
-
-Root cause analysis:
-- providers[0] hardcoded in route()
-- no fallback strategy on rate limits
-- no network error handling
-
-Plan: iterate over all gateways, retry on 429, fail fast on other errors.`}
-        />
-
-        <TaskCard title="Walkthrough — Model Router fallback" badge={<Badge kind="run">running</Badge>}>
-          {steps.map(([text, st]) => (
-            <div key={text} className="flex items-center gap-2 rounded-lg px-2 py-1">
-              {st === "done" ? (
-                <Check size={14} color="var(--diff-add)" />
-              ) : st === "run" ? (
-                <CircleDot size={14} color="var(--accent)" />
-              ) : (
-                <Circle size={14} color="var(--text-dim)" />
-              )}
-              <span className={st === "todo" ? "text-[var(--text-dim)]" : ""}>{text}</span>
-              {st === "run" && <Badge kind="run">step 3/4</Badge>}
-            </div>
-          ))}
-        </TaskCard>
-
-        <DiffViewer file="src/router/fallback.ts" />
-
-        <TaskCard title="Terminal — pnpm test" badge={<Badge kind="add">exit 0</Badge>} defaultOpen={false}>
-          <div className="max-w-full overflow-x-auto rounded-xl border border-[var(--border)] bg-[var(--bg-sidebar)] p-3 font-mono text-[13px] leading-normal text-[var(--text-main)]">
-            <div className="text-[var(--text-dim)]">$ pnpm test</div>
-            <div>OK router/fallback (12 tests) 843ms</div>
-            <div>Test Files 1 passed (1)</div>
-          </div>
-        </TaskCard>
-      </div>
-    </>
   );
 }
 
@@ -2204,7 +1914,224 @@ function Modal({
 
 /* ---------- Settings modal (two-column) ---------- */
 
-const THEMES: Theme[] = ["dark", "light", "slate", "amoled"];
+const THEMES: Theme[] = ["dark", "light", "slate", "amoled", "vibe"];
+
+/** Creating a project: a name and (optionally) a folder on disk. */
+function NewProjectModal({
+  onCreate,
+  onClose,
+}: {
+  onCreate: (name: string, path: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [path, setPath] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    const n = name.trim();
+    if (!n || busy) return;
+    setBusy(true);
+    await onCreate(n, path.trim());
+  };
+
+  /** Opens the native folder picker — a project does not require one. */
+  const pickFolder = async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const picked = await open({ directory: true, multiple: false });
+      if (typeof picked === "string") {
+        setPath(picked);
+        // Suggest the folder name when the user hasn't typed one yet.
+        if (!name.trim()) {
+          const last = picked.split(/[\\/]/).filter(Boolean).pop();
+          if (last) setName(last);
+        }
+      }
+    } catch {
+      /* outside Tauri: manual path entry still works */
+    }
+  };
+
+  const inputCls =
+    "w-full rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2 text-[13px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
+
+  return (
+    <Modal title="New Project" onClose={onClose}>
+      <div className="flex flex-col gap-3">
+        <label className="flex flex-col gap-1.5">
+          <span className="text-[12px] font-medium text-[var(--text-muted)]">Name</span>
+          <input
+            autoFocus
+            className={inputCls}
+            placeholder="my-project"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && void submit()}
+          />
+        </label>
+        <label className="flex flex-col gap-1.5">
+          <span className="text-[12px] font-medium text-[var(--text-muted)]">
+            Folder on disk <span className="text-[var(--text-dim)]">(optional)</span>
+          </span>
+          <div className="flex gap-2">
+            <input
+              className={inputCls}
+              placeholder="C:\Users\you\Documents\project — or leave empty"
+              value={path}
+              onChange={(e) => setPath(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && void submit()}
+            />
+            <button
+              className="flex shrink-0 items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] px-3 text-[12px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+              onClick={() => void pickFolder()}
+            >
+              <FolderOpen size={13} /> Browse…
+            </button>
+          </div>
+          <span className="text-[11px] text-[var(--text-dim)]">
+            A project is just a folder for your chats — it works without a path.
+          </span>
+        </label>
+        <div className="mt-1 flex justify-end gap-2">
+          <button
+            className="rounded-lg px-3 py-1.5 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)]"
+            onClick={onClose}
+          >
+            Cancel
+          </button>
+          <button
+            className="rounded-lg bg-[var(--accent)] px-4 py-1.5 text-[12px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+            disabled={!name.trim() || busy}
+            onClick={() => void submit()}
+          >
+            Create
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/** Per-project settings: rename, execution permission, delete. */
+function ProjectSettingsModal({
+  project,
+  onRename,
+  onToggleAutoRun,
+  onDelete,
+  onClose,
+}: {
+  project: Project | null;
+  onRename: (oldName: string, newName: string) => Promise<void>;
+  onToggleAutoRun: (name: string, autoRun: boolean) => Promise<void>;
+  onDelete: (name: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState(project?.name ?? "");
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  if (!project) return null;
+
+  const inputCls =
+    "w-full rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2 text-[13px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
+
+  const save = async () => {
+    const n = name.trim();
+    if (!n || n === project.name || busy) return;
+    setBusy(true);
+    await onRename(project.name, n);
+  };
+
+  const remove = async () => {
+    if (busy) return;
+    setBusy(true);
+    await onDelete(project.name);
+  };
+
+  return (
+    <Modal title={`Project · ${project.name}`} onClose={onClose}>
+      <div className="flex flex-col gap-4">
+        <label className="flex flex-col gap-1.5">
+          <span className="text-[12px] font-medium text-[var(--text-muted)]">Name</span>
+          <div className="flex gap-2">
+            <input
+              className={inputCls}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && void save()}
+            />
+            <button
+              className="shrink-0 rounded-lg bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+              disabled={!name.trim() || name.trim() === project.name || busy}
+              onClick={() => void save()}
+            >
+              Save
+            </button>
+          </div>
+        </label>
+
+        {project.path && (
+          <div className="flex flex-col gap-1">
+            <span className="text-[12px] font-medium text-[var(--text-muted)]">Folder</span>
+            <span className="truncate font-mono text-[11px] text-[var(--text-dim)]">{project.path}</span>
+          </div>
+        )}
+
+        <div className="flex items-start gap-3 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2.5">
+          <Shield size={16} className="mt-0.5 shrink-0 text-[var(--text-muted)]" />
+          <div className="flex flex-1 flex-col gap-0.5">
+            <span className="text-[12px] font-medium text-[var(--text-main)]">
+              Run commands without asking
+            </span>
+            <span className="text-[11px] text-[var(--text-dim)]">
+              Off: the agent asks before every command. On: it executes right away.
+            </span>
+          </div>
+          <button
+            className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
+              project.autoRun ? "bg-[var(--accent)]" : "bg-[var(--bg-elevated)]"
+            }`}
+            onClick={() => void onToggleAutoRun(project.name, !project.autoRun)}
+            title="Toggle auto-run"
+          >
+            <span
+              className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
+                project.autoRun ? "left-[18px]" : "left-0.5"
+              }`}
+            />
+          </button>
+        </div>
+
+        {confirming ? (
+          <div className="flex items-center gap-2 rounded-lg border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-3 py-2.5">
+            <span className="flex-1 text-[12px] text-[var(--text-main)]">
+              Delete this project? Its chats move to “No project”.
+            </span>
+            <button
+              className="rounded-md bg-[var(--diff-del)] px-2.5 py-1 text-[11px] font-medium text-white"
+              onClick={() => void remove()}
+            >
+              Delete
+            </button>
+            <button
+              className="rounded-md px-2 py-1 text-[11px] text-[var(--text-muted)] hover:bg-[var(--hover-bg)]"
+              onClick={() => setConfirming(false)}
+            >
+              Cancel
+            </button>
+          </div>
+        ) : (
+          <button
+            className="flex items-center gap-2 self-start rounded-lg px-3 py-1.5 text-[12px] text-[var(--diff-del)] transition-colors hover:bg-[var(--hover-bg)]"
+            onClick={() => setConfirming(true)}
+          >
+            <Trash2 size={13} /> Delete project
+          </button>
+        )}
+      </div>
+    </Modal>
+  );
+}
 
 type SettingsSection =
   | "general"
@@ -2282,7 +2209,6 @@ function SettingsModal({
   providers,
   models,
   persistent,
-  dbInfo,
   onProvidersChanged,
   onModelsChanged,
   onClose,
@@ -2294,7 +2220,6 @@ function SettingsModal({
   providers: Provider[];
   models: Model[];
   persistent: boolean;
-  dbInfo: string;
   onProvidersChanged: (next: Provider[]) => void;
   onModelsChanged: (next: Model[]) => void;
   onClose: () => void;
@@ -2417,20 +2342,6 @@ function SettingsModal({
               <Sep />
               <SettingRow title="Send Behavior" hint="How submitted prompts are handled">
                 <Segmented options={["Queue", "Send Immediately"]} value={sendMode} onChange={setSendMode} />
-              </SettingRow>
-              <Sep />
-              <SettingRow title="Default Gateway" hint="Model provider for new conversations">
-                <select className={SSELECT} defaultValue={providers[0]?.id}>
-                  {providers.map((g) => (
-                    <option key={g.id} value={g.id}>
-                      {g.name}
-                    </option>
-                  ))}
-                </select>
-              </SettingRow>
-              <Sep />
-              <SettingRow title="Storage" hint="Where chats, projects and settings live">
-                <span className="font-mono text-[12px] text-[var(--text-muted)]">{dbInfo}</span>
               </SettingRow>
             </SettingsCard>
           )}
@@ -2623,14 +2534,14 @@ export default function App() {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [models, setModels] = useState<Model[]>([]);
   const [scheduled, setScheduled] = useState<string[]>(INITIAL_SCHEDULED);
-  const [modal, setModal] = useState<"none" | "settings" | "schedule">("none");
+  const [modal, setModal] = useState<"none" | "settings" | "schedule" | "new-project" | "project-settings">("none");
+  /** Which project the settings modal edits. */
+  const [settingsProject, setSettingsProject] = useState<string | null>(null);
   const [view, setView] = useState<ViewKind>("chat");
   const [activeConv, setActiveConv] = useState<{ project: string; id: string } | null>(null);
-  const [newChatProject, setNewChatProject] = useState("Singularity");
+  const [newChatProject, setNewChatProject] = useState(NO_PROJECT);
   /** False until the first DB read finishes. */
   const [persistent, setPersistent] = useState(false);
-  /** Human-readable description of where the workspace is stored. */
-  const [dbInfo, setDbInfo] = useState("");
   /** True while a model response is streaming in. */
   const [streaming, setStreaming] = useState(false);
   /** Workspace root the agent's file/command tools operate inside. */
@@ -2639,6 +2550,8 @@ export default function App() {
   );
   /** When off, prompts are answered by plain chat with no tool access. */
   const [agentMode] = useState(() => localStorage.getItem("agent_mode") !== "off");
+  /** A command waiting for Allow/Deny while the agent loop is paused. */
+  const [confirmReq, setConfirmReq] = useState<db.ConfirmRequest | null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
 
   // The agent always has a workspace: the app's own folder by default, or a
@@ -2654,6 +2567,23 @@ export default function App() {
     };
   }, []);
 
+  // A project with a folder on disk scopes the agent to that folder; projects
+  // without one fall back to the default workspace.
+  useEffect(() => {
+    let cancelled = false;
+    const project = projects.find((p) => p.name === activeConv?.project);
+    (async () => {
+      const dir = project?.path || (await db.defaultWorkspace());
+      if (!cancelled && dir) {
+        setWorkspace(dir);
+        await db.setWorkspace(dir);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeConv?.project, projects]);
+
   /* ---------- Boot: hydrate the workspace from SQLite ---------- */
 
   useEffect(() => {
@@ -2667,24 +2597,20 @@ export default function App() {
       ]);
       if (cancelled) return;
 
-      // Outside Tauri the DB is unavailable; fall back to the demo workspace.
-      const nextProjects = loadedProjects.length ? loadedProjects : SEED_PROJECTS;
-      const nextProviders = loadedProviders.length ? loadedProviders : SEED_PROVIDERS;
-      const nextModels = loadedModels.length ? loadedModels : SEED_MODELS;
+      // Outside Tauri the DB is unavailable; start clean — only the bucket for
+      // loose chats, no demo projects, providers or models.
+      const nextProjects = loadedProjects.length ? loadedProjects : [NO_PROJECT_ENTRY];
+      const nextProviders = loadedProviders;
+      const nextModels = loadedModels;
       if (!persist) db.seedMemory(nextProjects, nextProviders, nextModels);
 
       setPersistent(persist);
       setProjects(nextProjects);
       setProviders(nextProviders);
       setModels(nextModels);
-      setDbInfo(
-        persist
-          ? "SQLite · singularity.db (app data directory)"
-          : "In-memory (desktop shell not detected)"
-      );
 
-      // Open the most recent chat in the default project.
-      const first = nextProjects.find((p) => p.name === "Singularity") ?? nextProjects[0];
+      // Open the most recent chat, whichever project it lives in.
+      const first = nextProjects.find((p) => p.conversations.length > 0);
       const conv = first?.conversations[0];
       if (first && conv) {
         setActiveConv({ project: first.name, id: conv.id });
@@ -2745,10 +2671,41 @@ export default function App() {
   /** Providers grouped with their models — feeds the model picker. */
   const gateways = useMemo(() => toGateways(providers, models), [providers, models]);
 
-  const addProject = async (name: string) => {
-    const project: Project = { name, path: R + name, conversations: [] };
+  /** Creates a project. `path` is optional — a project can be just a folder
+   * for chats with no directory on disk behind it. */
+  const addProject = async (name: string, path: string = "") => {
+    const project: Project = { name, path, conversations: [], autoRun: false };
     setProjects((prev) => [...prev, project]);
     await db.insertProject(project, projects.length);
+  };
+
+  /** Renames a project and re-points all of its chats at the new name. */
+  const renameProject = async (oldName: string, newName: string) => {
+    setProjects((prev) =>
+      prev.map((p) => (p.name === oldName ? { ...p, name: newName } : p))
+    );
+    if (activeConv?.project === oldName) {
+      setActiveConv({ project: newName, id: activeConv.id });
+    }
+    await db.renameProject(oldName, newName);
+  };
+
+  /** Deletes a project; its conversations survive under “No project”. */
+  const removeProject = async (name: string) => {
+    const victim = projects.find((p) => p.name === name);
+    const moved = victim?.conversations ?? [];
+    setProjects((prev) =>
+      prev
+        .filter((p) => p.name !== name)
+        .map((p) =>
+          p.name === NO_PROJECT ? { ...p, conversations: [...moved, ...p.conversations] } : p
+        )
+    );
+    // A chat from the deleted project now lives under “No project”.
+    if (activeConv?.project === name) {
+      setActiveConv({ project: NO_PROJECT, id: activeConv.id });
+    }
+    await db.deleteProject(name);
   };
 
   const renameConversation = async (project: string, convId: string, title: string) => {
@@ -2955,6 +2912,8 @@ export default function App() {
       // With a workspace set, run the full agent loop so the model can read,
       // write and execute — otherwise it is a plain streaming chat.
       const useAgent = !!workspace.trim() && agentMode;
+      // Per-project permission: run commands without asking.
+      const activeProject = projects.find((p) => p.name === activeConv?.project);
 
       const answer = useAgent
         ? await db.runAgent(
@@ -2968,6 +2927,7 @@ export default function App() {
               system: "",
               workspace,
               effort: selection.effort,
+              auto_run: !!activeProject?.autoRun,
               images,
             },
             historyTurns,
@@ -2975,6 +2935,7 @@ export default function App() {
               onText: appendDelta,
               onStep: appendStep,
               onThink: appendThink,
+              onConfirm: (req) => setConfirmReq(req),
             }
           )
         : await db.streamChat(
@@ -3010,6 +2971,7 @@ export default function App() {
       });
     } finally {
       setStreaming(false);
+      setConfirmReq(null);
     }
   };
 
@@ -3039,8 +3001,11 @@ export default function App() {
           }}
           onShowView={(v) => setView(v)}
           onOpenSettings={() => setModal("settings")}
-          onOpenProjectSettings={() => setModal("settings")}
-          onNewProject={() => setModal("settings")}
+          onOpenProjectSettings={(name) => {
+            setSettingsProject(name);
+            setModal("project-settings");
+          }}
+          onNewProject={() => setModal("new-project")}
           onRenameConversation={renameConversation}
           onDeleteConversation={deleteConversation}
           onTogglePin={togglePin}
@@ -3098,7 +3063,6 @@ export default function App() {
                     className="mx-auto flex w-full max-w-[760px] flex-col gap-4"
                     key={activeConv?.id ?? "new"}
                   >
-                    {activeConv?.id === "fix-terminal-tests" && <ChatBody />}
                     <AnimatePresence initial={false}>
                       {draftMsgs.map((m, i) => (
                         <motion.div
@@ -3119,6 +3083,50 @@ export default function App() {
                   </div>
                 </div>
               </ScrollArea>
+
+              {/* The agent is paused on a command that needs permission. */}
+              <AnimatePresence>
+                {confirmReq && (
+                  <motion.div
+                    className="px-6 pb-1"
+                    initial={{ opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 6 }}
+                  >
+                    <div className="mx-auto flex w-full max-w-[760px] items-center gap-3 rounded-xl border border-[var(--accent)]/50 bg-[var(--bg-surface)] px-3.5 py-2.5 shadow-[var(--shadow-popup)]">
+                      <Shield size={15} className="shrink-0 text-[var(--accent)]" />
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[12px] font-medium text-[var(--text-main)]">
+                          The agent wants to run a command
+                        </div>
+                        <code className="mt-0.5 block truncate font-mono text-[11px] text-[var(--text-muted)]">
+                          {confirmReq.command}
+                        </code>
+                      </div>
+                      <button
+                        className="shrink-0 rounded-lg bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-white transition-opacity hover:opacity-90"
+                        onClick={() => {
+                          const req = confirmReq;
+                          setConfirmReq(null);
+                          void db.confirmCommand(req.run_id, true);
+                        }}
+                      >
+                        Allow
+                      </button>
+                      <button
+                        className="shrink-0 rounded-lg border border-[var(--border)] px-3 py-1.5 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
+                        onClick={() => {
+                          const req = confirmReq;
+                          setConfirmReq(null);
+                          void db.confirmCommand(req.run_id, false);
+                        }}
+                      >
+                        Deny
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
 
               {/* Streaming indicator sits above the prompt while the model answers */}
               <AnimatePresence>
@@ -3157,7 +3165,6 @@ export default function App() {
               providers={providers}
               models={models}
               persistent={persistent}
-              dbInfo={dbInfo}
               onProvidersChanged={setProviders}
               onModelsChanged={setModels}
               onClose={() => setModal("none")}
@@ -3166,6 +3173,35 @@ export default function App() {
           {modal === "schedule" && (
             <ScheduleModal
               onAdd={(t) => setScheduled((s) => [...s, t])}
+              onClose={() => setModal("none")}
+            />
+          )}
+          {modal === "new-project" && (
+            <NewProjectModal
+              onCreate={async (name, path) => {
+                await addProject(name, path);
+                setModal("none");
+              }}
+              onClose={() => setModal("none")}
+            />
+          )}
+          {modal === "project-settings" && settingsProject && (
+            <ProjectSettingsModal
+              project={projects.find((p) => p.name === settingsProject) ?? null}
+              onRename={async (oldName, newName) => {
+                await renameProject(oldName, newName);
+                setSettingsProject(newName);
+              }}
+              onToggleAutoRun={async (name, autoRun) => {
+                setProjects((prev) =>
+                  prev.map((p) => (p.name === name ? { ...p, autoRun } : p))
+                );
+                await db.setProjectAutoRun(name, autoRun);
+              }}
+              onDelete={async (name) => {
+                await removeProject(name);
+                setModal("none");
+              }}
               onClose={() => setModal("none")}
             />
           )}

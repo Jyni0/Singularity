@@ -135,6 +135,7 @@ pub async fn stream_chat(
             Ok(())
         }
         Err(e) => {
+            crate::cancel::clear(&request_id);
             let _ = app.emit(
                 "chat://error",
                 StreamError {
@@ -263,6 +264,10 @@ async fn stream_google(
     let mut saw_text = false;
 
     while let Some(chunk) = stream.next().await {
+        // The Stop button aborts the stream; the UI keeps the partial text.
+        if crate::cancel::is_requested(request_id) {
+            return Err(crate::cancel::STOPPED.to_string());
+        }
         let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -416,6 +421,10 @@ async fn stream_openai(
     let mut buf = String::new();
 
     while let Some(chunk) = stream.next().await {
+        // The Stop button aborts the stream; the UI keeps the partial text.
+        if crate::cancel::is_requested(request_id) {
+            return Err(crate::cancel::STOPPED.to_string());
+        }
         let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -554,6 +563,10 @@ async fn stream_anthropic(
     let mut buf = String::new();
 
     while let Some(chunk) = stream.next().await {
+        // The Stop button aborts the stream; the UI keeps the partial text.
+        if crate::cancel::is_requested(request_id) {
+            return Err(crate::cancel::STOPPED.to_string());
+        }
         let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -646,6 +659,10 @@ async fn stream_responses(
     let mut buf = String::new();
 
     while let Some(chunk) = stream.next().await {
+        // The Stop button aborts the stream; the UI keeps the partial text.
+        if crate::cancel::is_requested(request_id) {
+            return Err(crate::cancel::STOPPED.to_string());
+        }
         let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
 

@@ -10,8 +10,22 @@ export type Theme = "dark" | "light" | "slate" | "amoled" | "vibe";
 export interface Conversation {
   id: string;
   title: string;
-  age: string;
+  /** Unix seconds of the last stored message; the sidebar renders "41s/2h/3d" from it. */
+  updatedAt: number;
   pinned?: boolean;
+}
+
+/** Humanizes an age in seconds as 41S / 5M / 2H / 3D (matches the UI's caps style). */
+export function ageLabel(updatedAtUnix: number, nowUnix: number): string {
+  if (!updatedAtUnix) return "";
+  const s = Math.max(0, nowUnix - updatedAtUnix);
+  if (s < 60) return `${s}S`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}M`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}H`;
+  const d = Math.floor(h / 24);
+  return `${d}D`;
 }
 
 export interface Project {

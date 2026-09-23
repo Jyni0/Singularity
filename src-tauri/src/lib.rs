@@ -1,6 +1,7 @@
 /// Singularity — Next-Gen Agentic Desktop.
 /// Agent Harness Layer entry point.
 mod agent;
+mod cancel;
 mod chat;
 mod db;
 mod discovery;
@@ -232,6 +233,13 @@ fn agent_confirm(run_id: String, approve: bool) {
     agent::resolve_confirm(&run_id, approve);
 }
 
+/// Stops a running generation (the Stop button). Works for both the agent loop
+/// and plain chat streams, which are keyed by the same id.
+#[tauri::command]
+fn stop_generation(run_id: String) {
+    cancel::request(&run_id);
+}
+
 pub fn run() {
     let migrations = db::migrations();
 
@@ -270,6 +278,7 @@ pub fn run() {
             discovery::list_provider_models,
             agent_run,
             agent_confirm,
+            stop_generation,
             chat_stream
         ])
         .run(tauri::generate_context!())

@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/markdown.tsx","./src/modelssettings.tsx","./src/attachments.ts","./src/db.ts","./src/main.tsx","./src/types.ts"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/markdown.tsx","./src/modelssettings.tsx","./src/attachments.ts","./src/db.ts","./src/diff.ts","./src/main.tsx","./src/types.ts"],"version":"5.9.3"}

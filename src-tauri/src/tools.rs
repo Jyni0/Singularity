@@ -21,6 +21,27 @@ pub struct ToolResult {
     pub ok: bool,
     /// Text handed back to the model.
     pub output: String,
+    /// File touched by a write/edit, for the UI's Changes panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Content before the change (None when the file did not exist).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    /// Content after the change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
+}
+
+/// Cap on the before/after snapshots attached to a result — the Changes panel
+/// does not need multi-megabyte files, and they ride along in UI events.
+const MAX_SNAPSHOT_BYTES: usize = 200_000;
+
+fn clip(text: String) -> String {
+    if text.len() <= MAX_SNAPSHOT_BYTES {
+        text
+    } else {
+        text.chars().take(MAX_SNAPSHOT_BYTES).collect()
+    }
 }
 
 impl ToolResult {
@@ -28,13 +49,26 @@ impl ToolResult {
         Self {
             ok: true,
             output: output.into(),
+            path: None,
+            old_text: None,
+            new_text: None,
         }
     }
     pub fn err(output: impl Into<String>) -> Self {
         Self {
             ok: false,
             output: output.into(),
+            path: None,
+            old_text: None,
+            new_text: None,
         }
+    }
+    /// Attaches the before/after snapshot so the UI can render a diff.
+    pub fn with_change(mut self, path: &str, old: Option<String>, new: String) -> Self {
+        self.path = Some(path.to_string());
+        self.old_text = old.map(clip);
+        self.new_text = Some(clip(new));
+        self
     }
 }
 
@@ -113,12 +147,16 @@ pub fn write_file(root: &Path, path: &str, content: &str) -> ToolResult {
             return ToolResult::err(format!("cannot create directory for {path}: {e}"));
         }
     }
+    // Snapshot the previous content (None for a brand-new file) so the UI can
+    // show what exactly changed.
+    let old = std::fs::read_to_string(&full).ok();
     match std::fs::write(&full, content) {
         Ok(()) => ToolResult::ok(format!(
             "wrote {path} ({} bytes, {} lines)",
             content.len(),
             content.lines().count()
-        )),
+        ))
+        .with_change(path, old, content.to_string()),
         Err(e) => ToolResult::err(format!("cannot write {path}: {e}")),
     }
 }
@@ -147,7 +185,10 @@ pub fn edit_file(root: &Path, path: &str, old: &str, new: &str) -> ToolResult {
     }
 
     match std::fs::write(&full, text.replacen(old, new, 1)) {
-        Ok(()) => ToolResult::ok(format!("edited {path}")),
+        Ok(()) => {
+            let updated = text.replacen(old, new, 1);
+            ToolResult::ok(format!("edited {path}")).with_change(path, Some(text), updated)
+        }
         Err(e) => ToolResult::err(format!("cannot write {path}: {e}")),
     }
 }
@@ -340,7 +381,7 @@ pub fn run_command(root: &Path, command: &str, cwd: Option<&str>, timeout_secs: 
     if output.status.success() {
         ToolResult::ok(body)
     } else {
-        ToolResult { ok: false, output: body }
+        ToolResult::err(body)
     }
 }
 

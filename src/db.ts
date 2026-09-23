@@ -86,6 +86,9 @@ interface ConvRow {
   title: string;
   age_label: string;
   pinned: number;
+  /** Unix seconds of the last message; 0 on databases predating migration 6. */
+  updated_at?: number;
+  created_at?: number;
 }
 
 /** Loads the whole project tree with its conversations, ordered for the sidebar. */
@@ -93,16 +96,37 @@ export async function loadProjects(): Promise<Project[]> {
   const db = await getDb();
   if (!db) return memory.projects;
 
-  const projects = await db.select<ProjectRow[]>(
-    "SELECT id, name, path, sort_order, auto_run FROM projects ORDER BY sort_order, name"
-  );
-  const convs = await db.select<ConvRow[]>(
-    `SELECT id, project_id, title, age_label, pinned
-       FROM conversations
-      ORDER BY pinned DESC, created_at DESC`
-  );
+  // `auto_run` arrived in migration 4. If the schema is somehow older, retry
+  // without the column instead of failing the whole sidebar load.
+  let rows: ProjectRow[];
+  try {
+    rows = await db.select<ProjectRow[]>(
+      "SELECT id, name, path, sort_order, auto_run FROM projects ORDER BY sort_order, name"
+    );
+  } catch {
+    rows = await db.select<Omit<ProjectRow, "auto_run">[]>(
+      "SELECT id, name, path, sort_order FROM projects ORDER BY sort_order, name"
+    ).then((rs) => rs.map((r) => ({ ...r, auto_run: 0 })));
+  }
 
-  return projects.map((p) => ({
+  // `updated_at` arrived in migration 6; fall back to `created_at` on an
+  // older schema so the sidebar still loads either way.
+  let convs: ConvRow[];
+  try {
+    convs = await db.select<ConvRow[]>(
+      `SELECT id, project_id, title, age_label, pinned, updated_at, created_at
+         FROM conversations
+        ORDER BY pinned DESC, updated_at DESC`
+    );
+  } catch {
+    convs = await db.select<ConvRow[]>(
+      `SELECT id, project_id, title, age_label, pinned, created_at
+         FROM conversations
+        ORDER BY pinned DESC, created_at DESC`
+    );
+  }
+
+  return rows.map((p) => ({
     name: p.name,
     path: p.path,
     autoRun: p.auto_run === 1,
@@ -111,7 +135,7 @@ export async function loadProjects(): Promise<Project[]> {
       .map<Conversation>((c) => ({
         id: c.id,
         title: c.title,
-        age: c.age_label,
+        updatedAt: c.updated_at || c.created_at || 0,
         pinned: c.pinned === 1,
       })),
   }));
@@ -189,15 +213,16 @@ export async function insertConversation(
   conv: Conversation
 ): Promise<void> {
   const db = await getDb();
+  const stamp = conv.updatedAt || Math.floor(Date.now() / 1000);
   if (!db) {
     const p = memory.projects.find((x) => x.name === project);
-    p?.conversations.unshift(conv);
+    p?.conversations.unshift({ ...conv, updatedAt: stamp });
     return;
   }
   await db.execute(
-    `INSERT OR IGNORE INTO conversations (id, project_id, title, age_label, pinned)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [conv.id, project, conv.title, conv.age, conv.pinned ? 1 : 0]
+    `INSERT OR IGNORE INTO conversations (id, project_id, title, age_label, pinned, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [conv.id, project, conv.title, "", conv.pinned ? 1 : 0, stamp]
   );
 }
 
@@ -263,14 +288,19 @@ export async function appendMessage(
   text: string
 ): Promise<void> {
   const db = await getDb();
+  const now = Math.floor(Date.now() / 1000);
   const row: StoredMessage = {
     conversation_id: conversationId,
     role,
     text,
-    created_at: Math.floor(Date.now() / 1000),
+    created_at: now,
   };
   if (!db) {
     memory.messages.push(row);
+    for (const p of memory.projects) {
+      const c = p.conversations.find((x) => x.id === conversationId);
+      if (c) c.updatedAt = now;
+    }
     return;
   }
   await db.execute(
@@ -278,6 +308,38 @@ export async function appendMessage(
      VALUES ($1, $2, $3, $4)`,
     [memId(), conversationId, role, text]
   );
+  // Bump the conversation's activity stamp so the sidebar shows a live age.
+  // Guarded: on a database predating migration 6 the column does not exist.
+  try {
+    await db.execute("UPDATE conversations SET updated_at = $1 WHERE id = $2", [
+      now,
+      conversationId,
+    ]);
+  } catch {
+    /* older schema — the sidebar falls back to created_at */
+  }
+}
+
+/** Touches a conversation's activity stamp without storing a message. */
+export async function touchConversation(conversationId: string): Promise<number> {
+  const now = Math.floor(Date.now() / 1000);
+  const db = await getDb();
+  if (!db) {
+    for (const p of memory.projects) {
+      const c = p.conversations.find((x) => x.id === conversationId);
+      if (c) c.updatedAt = now;
+    }
+    return now;
+  }
+  try {
+    await db.execute("UPDATE conversations SET updated_at = $1 WHERE id = $2", [
+      now,
+      conversationId,
+    ]);
+  } catch {
+    /* older schema */
+  }
+  return now;
 }
 
 /* ---------- Providers & models ---------- */
@@ -741,6 +803,10 @@ export async function streamChat(
   try {
     await invoke("chat_stream", { requestId, provider, turns });
     return full;
+  } catch (e) {
+    // Stop is not a failure: whatever streamed in is the answer.
+    if (isStopError(e instanceof Error ? e.message : String(e))) return full;
+    throw e;
   } finally {
     unlisten();
   }
@@ -788,6 +854,25 @@ export interface AgentStepEvent {
   index: number;
   /** False while the tool runs; the UI then shows a spinner instead of "done". */
   done: boolean;
+  /** Set by write_file/edit_file — the file the Changes panel can diff. */
+  path?: string;
+  /** Content before the change; undefined when the file was newly created. */
+  old_text?: string;
+  /** Content after the change. */
+  new_text?: string;
+}
+
+/** Marks an error as "the user pressed Stop", so callers keep partial output. */
+export const STOPPED = "stopped by user";
+export function isStopError(message: string): boolean {
+  return message.startsWith(STOPPED);
+}
+
+/** Asks Rust to stop a running generation (agent loop or chat stream). */
+export async function stopGeneration(runId: string): Promise<void> {
+  if (!inTauri) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("stop_generation", { runId });
 }
 
 /** A command waiting for the user's permission. */
@@ -850,6 +935,10 @@ export async function runAgent(
   try {
     await invoke("agent_run", { runId, request, turns });
     return full;
+  } catch (e) {
+    // Stop is not a failure: keep the partial answer and any steps shown.
+    if (isStopError(e instanceof Error ? e.message : String(e))) return full;
+    throw e;
   } finally {
     listeners.forEach((off) => off());
   }

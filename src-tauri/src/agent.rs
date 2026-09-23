@@ -19,6 +19,22 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::oneshot;
 
+/* ---------- Cancellation ---------- */
+
+/// Result for a run the user stopped: an error so the UI shows "stopped",
+/// but the text already streamed to the UI stays visible in the message.
+fn cancelled_result(final_text: String) -> Result<String, String> {
+    Err(if final_text.trim().is_empty() {
+        crate::cancel::STOPPED.to_string()
+    } else {
+        format!("{} — partial answer kept:\n\n{final_text}", crate::cancel::STOPPED)
+    })
+}
+
+fn is_cancelled(run_id: &str) -> bool {
+    crate::cancel::is_requested(run_id)
+}
+
 /* ---------- Command approval ---------- */
 
 /// Pending approval requests, keyed by run id. The agent loop inserts a oneshot
@@ -39,7 +55,9 @@ pub fn resolve_confirm(run_id: &str, approve: bool) {
     }
 }
 
-/// Asks the UI to approve a command and waits for the answer.
+/// Asks the UI to approve a command and waits for the answer. Returns as soon
+/// as the user decides — or as soon as the run is stopped, so a Stop pressed
+/// while the Allow/Deny banner is up does not hang the loop.
 async fn ask_confirm(app: &AppHandle, run_id: &str, command: &str, cwd: &str) -> bool {
     let (tx, rx) = oneshot::channel();
     {
@@ -51,12 +69,28 @@ async fn ask_confirm(app: &AppHandle, run_id: &str, command: &str, cwd: &str) ->
         "agent://confirm",
         json!({ "run_id": run_id, "command": command, "cwd": cwd }),
     );
-    // A dropped sender (app closed) reads as denial — safe default.
-    rx.await.unwrap_or(false)
+
+    // Wait on the answer, but keep an eye on cancellation so Stop unblocks us.
+    let mut rx = std::pin::pin!(rx);
+    loop {
+        tokio::select! {
+            res = &mut rx => {
+                // A dropped sender (app closed) reads as denial — safe default.
+                return res.unwrap_or(false);
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {
+                if is_cancelled(run_id) {
+                    // Remove our sender so a late decision is ignored.
+                    resolve_confirm(run_id, false);
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 /// Upper bound on model→tool→model rounds, so a confused model cannot spin.
-const MAX_STEPS: usize = 24;
+const MAX_STEPS: usize = 64;
 
 /* ---------- Events ---------- */
 
@@ -89,6 +123,13 @@ pub struct AgentStep {
     /// False while the tool is still running, true once the result is in. The UI
     /// shows the card as soon as it starts, so a long command is visible.
     pub done: bool,
+    /// File changed by a write/edit, with before/after content for the Changes panel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,11 +307,16 @@ pub async fn run_agent(
         req.system.clone()
     };
 
+    // A stale stop request must never kill a fresh run that reuses the id.
+    crate::cancel::clear(&run_id);
+
     let result = match req.kind.as_str() {
         "anthropic-messages" => run_anthropic(&app, &run_id, &req, &system, &root, turns).await,
         // Google and everything OpenAI-shaped use the tool_calls protocol here.
         _ => run_openai(&app, &run_id, &req, &system, &root, turns).await,
     };
+
+    crate::cancel::clear(&run_id);
 
     match result {
         Ok(answer) => {
@@ -330,6 +376,9 @@ fn emit_step(app: &AppHandle, run_id: &str, index: usize, name: &str, input: Str
             ok: res.ok,
             index,
             done,
+            path: res.path.clone(),
+            old_text: res.old_text.clone(),
+            new_text: res.new_text.clone(),
         },
     );
 }
@@ -450,6 +499,9 @@ async fn run_openai(
     let mut step_index = 0usize;
 
     for _ in 0..MAX_STEPS {
+        if is_cancelled(run_id) {
+            return cancelled_result(final_text);
+        }
         let mut body = json!({
             "model": req.model,
             "messages": messages,
@@ -492,6 +544,10 @@ async fn run_openai(
         let mut round_text = String::new();
 
         while let Some(chunk) = stream.next().await {
+            if is_cancelled(run_id) {
+                drop(stream);
+                return cancelled_result(final_text.clone() + &round_text);
+            }
             let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
             buf.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -584,6 +640,9 @@ async fn run_openai(
         // Run each tool and feed the results back. The step event carries the
         // call, so the UI can place it inline — do not inject it into the text.
         for call in calls.iter().filter(|c| !c.name.is_empty()) {
+            if is_cancelled(run_id) {
+                return cancelled_result(final_text);
+            }
             let args: Value = serde_json::from_str(&call.args).unwrap_or(json!({}));
             let summary = summarize(&call.name, &args);
 
@@ -630,10 +689,7 @@ async fn run_openai(
                     tools::dispatch(&tool_root, &tool_name, &tool_args)
                 })
                 .await
-                .unwrap_or_else(|e| tools::ToolResult {
-                    ok: false,
-                    output: format!("tool task failed: {e}"),
-                })
+                .unwrap_or_else(|e| tools::ToolResult::err(format!("tool task failed: {e}")))
             };
 
             emit_step(app, run_id, this_index, &call.name, summary, true, &result);
@@ -738,6 +794,9 @@ async fn run_anthropic(
     };
 
     for _ in 0..MAX_STEPS {
+        if is_cancelled(run_id) {
+            return cancelled_result(final_text);
+        }
         let mut body = json!({
             "model": req.model,
             "max_tokens": max_tokens,
@@ -779,6 +838,10 @@ async fn run_anthropic(
         let mut blocks: Vec<PendingCall> = Vec::new();
 
         while let Some(chunk) = stream.next().await {
+            if is_cancelled(run_id) {
+                drop(stream);
+                return cancelled_result(final_text.clone() + &round_text);
+            }
             let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
             buf.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -871,6 +934,9 @@ async fn run_anthropic(
         // Results come back as tool_result blocks in a single user turn.
         let mut results: Vec<Value> = Vec::new();
         for b in &used {
+            if is_cancelled(run_id) {
+                return cancelled_result(final_text);
+            }
             let args: Value = serde_json::from_str(&b.args).unwrap_or(json!({}));
             let summary = summarize(&b.name, &args);
 
@@ -914,10 +980,7 @@ async fn run_anthropic(
                     tools::dispatch(&tool_root, &tool_name, &tool_args)
                 })
                 .await
-                .unwrap_or_else(|e| tools::ToolResult {
-                    ok: false,
-                    output: format!("tool task failed: {e}"),
-                })
+                .unwrap_or_else(|e| tools::ToolResult::err(format!("tool task failed: {e}")))
             };
 
             emit_step(app, run_id, this_index, &b.name, summary, true, &result);

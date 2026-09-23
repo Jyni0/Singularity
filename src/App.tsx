@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   type Conversation,
@@ -16,7 +16,7 @@ import { ModelsSettings } from "./ModelsSettings";
 import { Markdown, ToolCall, ThinkBlock } from "./Markdown";
 import { toAttachments, formatSize, composePrompt } from "./attachments";
 import type { Effort, Attachment } from "./types";
-import { EFFORTS } from "./types";
+import { EFFORTS, ageLabel } from "./types";
 
 export type {
   Conversation,
@@ -65,7 +65,10 @@ import {
   Gauge,
   Paperclip,
   FileText,
+  FileDiff,
+  Terminal,
 } from "lucide-react";
+import { computeDiff, diffStats } from "./diff";
 
 /* ---------- Shared class fragments (single source of truth) ---------- */
 
@@ -79,6 +82,21 @@ function useBlockContextMenu() {
     document.addEventListener("contextmenu", block);
     return () => document.removeEventListener("contextmenu", block);
   }, []);
+}
+
+/**
+ * Unix seconds, ticking every 15s. Conversation rows derive their "41S / 2H /
+ * 3D" age from it, so a chat opened an hour ago stops claiming to be "now".
+ * The cadence is coarse on purpose — the labels only change by the minute at
+ * best, and re-rendering the sidebar every second would be pure waste.
+ */
+function useNow(): number {
+  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Math.floor(Date.now() / 1000)), 15_000);
+    return () => window.clearInterval(t);
+  }, []);
+  return now;
 }
 
 /** Sidebar / titlebar row: h 32px, padding 0 8px, radius 6px, gap 10px */
@@ -524,6 +542,7 @@ function Sidebar({
   projects,
   activeConversation,
   view,
+  runningConversations,
   onSelectConversation,
   onNewConversation,
   onNewConversationInProject,
@@ -540,6 +559,8 @@ function Sidebar({
   projects: Project[];
   activeConversation: string | null;
   view: ViewKind;
+  /** Conversation ids with a generation running — rows get a pulsing dot. */
+  runningConversations: string[];
   onSelectConversation: (projectId: string, convId: string) => void;
   onNewConversation: () => void;
   onNewConversationInProject: (project: string) => void;
@@ -555,6 +576,8 @@ function Sidebar({
   const [sortAZ, setSortAZ] = useState(true);
   const [projectsOpen, setProjectsOpen] = useState(true);
   const [convsOpen, setConvsOpen] = useState(true);
+  /** Ticking clock so conversation ages stay live (41S → 2M → 3H). */
+  const now = useNow();
   /** Expanded past the 6-chat limit; reset whenever the project is collapsed. */
   const [showAll, setShowAll] = useState<Record<string, boolean>>({});
   const [hoveredProject, setHoveredProject] = useState<string | null>(null);
@@ -606,6 +629,7 @@ function Sidebar({
     const active = activeConversation === c.id && view === "chat";
     const convActive = hoveredConv === c.id || convMenu === c.id;
     const isRenaming = renaming === c.id;
+    const running = runningConversations.includes(c.id);
     return (
       <div
         key={`${projectName}:${c.id}`}
@@ -632,7 +656,7 @@ function Sidebar({
         ) : (
           <button
             className={`${ROW} w-full ${
-              topLevel ? "" : "pl-6"
+              topLevel ? "" : "pl-8"
             } ${
               active
                 ? ROW_ACTIVE
@@ -651,9 +675,18 @@ function Sidebar({
                 className="shrink-0 text-[var(--text-muted)]"
               />
             )}
-            <span className="truncate">{c.title}</span>
+            {/* A generation is running in this chat — pulsing accent dot. */}
+            {running && (
+              <motion.span
+                className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--accent)]"
+                animate={{ opacity: [1, 0.25, 1], scale: [1, 0.85, 1] }}
+                transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
+                title="Generating…"
+              />
+            )}
+            <span className={`truncate ${running ? "text-[var(--text-main)]" : ""}`}>{c.title}</span>
             <span className="ml-auto shrink-0 font-mono text-[11px] text-[var(--text-dim)]">
-              {c.age}
+              {ageLabel(c.updatedAt, now)}
             </span>
           </button>
         )}
@@ -778,7 +811,7 @@ function Sidebar({
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         <ScrollArea
           className="min-h-0 flex-1"
-          innerClassName="flex flex-col gap-0.5 px-2.5 [&>*]:shrink-0"
+          innerClassName="flex flex-col gap-0.5 px-2.5 pt-2 [&>*]:shrink-0"
         >
           {/* Projects header — click the label to collapse the whole section */}
           <div className="mb-1 mt-3 flex h-6 shrink-0 items-center pl-1 pr-0.5">
@@ -1474,6 +1507,8 @@ function PromptBox({
   onSelectProject,
   gateways,
   centered,
+  busy,
+  onStop,
 }: {
   onSend: (
     text: string,
@@ -1485,6 +1520,9 @@ function PromptBox({
   onSelectProject: (name: string) => void;
   gateways: Gateway[];
   centered?: boolean;
+  /** True while this conversation's generation is running — Send becomes Stop. */
+  busy?: boolean;
+  onStop?: () => void;
 }) {
   const [text, setText] = useState("");
   const [gatewayId, setGatewayId] = useState("");
@@ -1752,14 +1790,27 @@ function PromptBox({
                   />
                 )}
               </button>
-              <button
-                className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--accent)] text-white transition-colors hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--bg-elevated)] disabled:text-[var(--text-dim)]"
-                onClick={send}
-                disabled={!text.trim()}
-                title="Send"
-              >
-                <Send size={14} />
-              </button>
+              {busy ? (
+                <motion.button
+                  className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--diff-del)] text-white transition-opacity hover:opacity-90"
+                  onClick={onStop}
+                  title="Stop generation"
+                  initial={{ scale: 0.8 }}
+                  animate={{ scale: 1 }}
+                  transition={{ type: "spring", stiffness: 500, damping: 28 }}
+                >
+                  <Square size={12} fill="currentColor" strokeWidth={0} />
+                </motion.button>
+              ) : (
+                <button
+                  className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--accent)] text-white transition-colors hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--bg-elevated)] disabled:text-[var(--text-dim)]"
+                  onClick={send}
+                  disabled={!text.trim()}
+                  title="Send"
+                >
+                  <Send size={14} />
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -1777,6 +1828,7 @@ function HistoryView({
   projects: Project[];
   onOpen: (project: string, convId: string) => void;
 }) {
+  const now = useNow();
   const all = projects.flatMap((p) => p.conversations);
   return (
     <motion.div
@@ -1810,7 +1862,7 @@ function HistoryView({
                 <MessageSquare size={16} strokeWidth={1.5} className="shrink-0" />
                 <span className="truncate">{c.title}</span>
                 <span className="ml-auto shrink-0 font-mono text-[11px] text-[var(--text-dim)]">
-                  {c.age}
+                  {ageLabel(c.updatedAt, now)}
                 </span>
               </button>
             ))}
@@ -2521,12 +2573,214 @@ function ScheduleModal({
   );
 }
 
+/* ---------- Inspection panel (Changes / Commands) ---------- */
+
+/** Collects every tool step from a conversation's messages, in order. */
+function collectSteps(msgs: Msg[]): db.AgentStepEvent[] {
+  const out: db.AgentStepEvent[] = [];
+  for (const m of msgs) {
+    for (const s of m.segments ?? []) {
+      if (s.kind === "step") out.push(s.step);
+    }
+  }
+  return out;
+}
+
+function InspectionPanel({
+  mode,
+  msgs,
+  onClose,
+}: {
+  mode: "changes" | "commands";
+  msgs: Msg[];
+  onClose: () => void;
+}) {
+  const steps = collectSteps(msgs);
+  const [openFile, setOpenFile] = useState<string | null>(null);
+  const [openCmd, setOpenCmd] = useState<number | null>(null);
+
+  const changes = steps.filter((s) => s.done && s.ok && s.path && s.new_text !== undefined);
+  // Latest change per file wins — the panel shows the net result of the run.
+  const byFile = new Map<string, db.AgentStepEvent>();
+  for (const c of changes) byFile.set(c.path!, c);
+  const files = [...byFile.entries()];
+
+  const commands = steps.filter((s) => s.name === "run_command");
+
+  return (
+    <motion.aside
+      className="flex h-full w-[340px] shrink-0 flex-col border-l border-[var(--border)] bg-[var(--bg-main)]"
+      initial={{ opacity: 0, x: 24 }}
+      animate={{ opacity: 1, x: 0 }}
+      exit={{ opacity: 0, x: 24 }}
+      transition={{ duration: 0.18, ease: "easeOut" }}
+    >
+      <div className="flex items-center gap-2 border-b border-[var(--border)] px-4 py-3">
+        {mode === "changes" ? <FileDiff size={15} /> : <Terminal size={15} />}
+        <span className="text-[13px] font-semibold text-[var(--text-main)]">
+          {mode === "changes" ? "Changes" : "Commands"}
+        </span>
+        <span className="rounded-full bg-[var(--hover-bg)] px-2 py-0.5 font-mono text-[11px] text-[var(--text-dim)]">
+          {mode === "changes" ? files.length : commands.length}
+        </span>
+        <button
+          className="ml-auto rounded-md p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+          onClick={onClose}
+          title="Close panel"
+        >
+          <X size={15} />
+        </button>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto p-2">
+        {mode === "changes" && files.length === 0 && (
+          <p className="px-2 py-6 text-center text-[12px] text-[var(--text-dim)]">
+            No file changes in this conversation yet.
+          </p>
+        )}
+        {mode === "changes" &&
+          files.map(([path, step]) => {
+            const stats = diffStats(step.old_text ?? "", step.new_text ?? "");
+            const open = openFile === path;
+            const lines = open ? computeDiff(step.old_text ?? "", step.new_text ?? "") : [];
+            return (
+              <div key={path} className="mb-1.5 overflow-hidden rounded-lg border border-[var(--border)]">
+                <button
+                  className="flex w-full items-center gap-2 bg-[var(--bg-surface)] px-2.5 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
+                  onClick={() => setOpenFile(open ? null : path)}
+                >
+                  {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                  <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-[var(--text-main)]">
+                    {path.split(/[\\/]/).pop()}
+                  </span>
+                  <span className="shrink-0 font-mono text-[11px] text-[var(--diff-add)]">+{stats.added}</span>
+                  <span className="shrink-0 font-mono text-[11px] text-[var(--diff-del)]">-{stats.removed}</span>
+                </button>
+                {!open && (
+                  <div className="truncate border-t border-[var(--border)] px-2.5 py-1 font-mono text-[10px] text-[var(--text-dim)]">
+                    {path}
+                  </div>
+                )}
+                <AnimatePresence initial={false}>
+                  {open && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.15, ease: "easeOut" }}
+                      className="overflow-hidden"
+                    >
+                      <div className="truncate border-b border-[var(--border)] bg-[var(--bg-surface)] px-2.5 py-1 font-mono text-[10px] text-[var(--text-dim)]">
+                        {path}
+                      </div>
+                      <div className="max-h-[320px] overflow-auto bg-[var(--bg-app)] font-mono text-[11px] leading-[1.55]">
+                        {lines.map((l, i) => (
+                          <div
+                            key={i}
+                            className={`flex whitespace-pre-wrap break-all px-1.5 ${
+                              l.kind === "add"
+                                ? "diff-line--add"
+                                : l.kind === "del"
+                                  ? "diff-line--del"
+                                  : l.kind === "hunk"
+                                    ? "bg-[var(--bg-surface)] py-0.5 text-[var(--text-dim)]"
+                                    : "text-[var(--text-muted)]"
+                            }`}
+                          >
+                            <span className="w-4 shrink-0 select-none text-center text-[var(--text-dim)]">
+                              {l.kind === "add" ? "+" : l.kind === "del" ? "−" : l.kind === "hunk" ? "⋯" : ""}
+                            </span>
+                            <span className="w-8 shrink-0 select-none text-right text-[var(--text-dim)]">
+                              {l.kind === "add"
+                                ? l.newNo
+                                : l.kind === "del"
+                                  ? l.oldNo
+                                  : l.kind === "ctx"
+                                    ? l.newNo
+                                    : ""}
+                            </span>
+                            <span className="ml-1.5 min-w-0">{l.text || " "}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+            );
+          })}
+
+        {mode === "commands" && commands.length === 0 && (
+          <p className="px-2 py-6 text-center text-[12px] text-[var(--text-dim)]">
+            No commands have run in this conversation yet.
+          </p>
+        )}
+        {mode === "commands" &&
+          commands.map((c, i) => {
+            const open = openCmd === i;
+            return (
+              <div key={i} className="mb-1.5 overflow-hidden rounded-lg border border-[var(--border)]">
+                <button
+                  className="flex w-full items-center gap-2 bg-[var(--bg-surface)] px-2.5 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
+                  onClick={() => setOpenCmd(open ? null : i)}
+                >
+                  {c.done ? (
+                    c.ok ? (
+                      <Check size={13} className="shrink-0 text-[var(--diff-add)]" />
+                    ) : (
+                      <X size={13} className="shrink-0 text-[var(--diff-del)]" />
+                    )
+                  ) : (
+                    <Loader2 size={13} className="shrink-0 animate-spin text-[var(--accent)]" />
+                  )}
+                  <code className="min-w-0 flex-1 truncate font-mono text-[12px] text-[var(--text-main)]">
+                    {c.input}
+                  </code>
+                  {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                </button>
+                <AnimatePresence initial={false}>
+                  {open && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.15, ease: "easeOut" }}
+                      className="overflow-hidden"
+                    >
+                      <pre className="max-h-[280px] overflow-auto whitespace-pre-wrap break-all border-t border-[var(--border)] bg-[var(--bg-app)] px-2.5 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
+                        {c.done ? c.result : "running…"}
+                      </pre>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+            );
+          })}
+      </div>
+    </motion.aside>
+  );
+}
+
 /* ---------- App ---------- */
+
+/** Buffer key for the "new chat" view before a conversation exists. */
+const DRAFT_ID = "__new__";
 
 export default function App() {
   // No default browser context menu anywhere in the window.
   useBlockContextMenu();
-  const [draftMsgs, setDraftMsgs] = useState<Msg[]>([]);
+  /**
+   * Live message buffers, keyed by conversation id. A run keeps streaming into
+   * its own buffer even while the user reads another chat or another view —
+   * background generation falls out of this shape for free.
+   */
+  const [convMsgs, setConvMsgs] = useState<Record<string, Msg[]>>({});
+  const convMsgsRef = useRef(convMsgs);
+  convMsgsRef.current = convMsgs;
+  /** convId → requestId of the generation currently running for it. */
+  const [activeRuns, setActiveRuns] = useState<Record<string, string>>({});
+  /** Right inspection panel of the chat view. */
+  const [panel, setPanel] = useState<"none" | "changes" | "commands">("none");
   const [sidebarWidth, setSidebarWidth] = useState(240);
   const [theme, setTheme] = useState<Theme>("dark");
   /** Workspace tree — hydrated from SQLite on mount. */
@@ -2542,17 +2796,44 @@ export default function App() {
   const [newChatProject, setNewChatProject] = useState(NO_PROJECT);
   /** False until the first DB read finishes. */
   const [persistent, setPersistent] = useState(false);
-  /** True while a model response is streaming in. */
-  const [streaming, setStreaming] = useState(false);
   /** Workspace root the agent's file/command tools operate inside. */
   const [workspace, setWorkspace] = useState(
     () => localStorage.getItem("agent_workspace") ?? ""
   );
   /** When off, prompts are answered by plain chat with no tool access. */
   const [agentMode] = useState(() => localStorage.getItem("agent_mode") !== "off");
-  /** A command waiting for Allow/Deny while the agent loop is paused. */
-  const [confirmReq, setConfirmReq] = useState<db.ConfirmRequest | null>(null);
+  /** Commands waiting for Allow/Deny, keyed by run id — a background run's
+   * request survives navigation and shows again when the chat is opened. */
+  const [confirmReqs, setConfirmReqs] = useState<Record<string, db.ConfirmRequest>>({});
   const chatRef = useRef<HTMLDivElement>(null);
+
+  /** Messages of the conversation currently on screen. */
+  const draftMsgs = activeConv
+    ? convMsgs[activeConv.id] ?? []
+    : convMsgs[DRAFT_ID] ?? [];
+  /** True while THIS conversation has a generation running. */
+  const streaming = !!activeConv && !!activeRuns[activeConv.id];
+  /** The pending Allow/Deny request of the conversation on screen, if any. */
+  const confirmReq = streaming ? confirmReqs[activeRuns[activeConv!.id]] ?? null : null;
+  /** Ids of conversations with a live run — drives the sidebar pulse. */
+  const runningConvIds = Object.keys(activeRuns);
+
+  /** Counts for the header badges: distinct files changed / commands run. */
+  const { changeCount, commandCount } = useMemo(() => {
+    const steps = collectSteps(draftMsgs);
+    const files = new Set<string>();
+    let cmds = 0;
+    for (const s of steps) {
+      if (s.done && s.ok && s.path && s.new_text !== undefined) files.add(s.path);
+      if (s.name === "run_command") cmds++;
+    }
+    return { changeCount: files.size, commandCount: cmds };
+  }, [draftMsgs]);
+
+  /** Writes to a specific conversation's buffer; safe for background runs. */
+  const updateConvMsgs = useCallback((key: string, updater: (prev: Msg[]) => Msg[]) => {
+    setConvMsgs((prev) => ({ ...prev, [key]: updater(prev[key] ?? []) }));
+  }, []);
 
   // The agent always has a workspace: the app's own folder by default, or a
   // project folder the user points it at once (no picker in the prompt box).
@@ -2616,7 +2897,10 @@ export default function App() {
         setActiveConv({ project: first.name, id: conv.id });
         const stored = await db.loadMessages(conv.id);
         if (!cancelled && stored.length) {
-          setDraftMsgs(stored.map((m) => ({ role: m.role, text: m.text })));
+          setConvMsgs((prev) => ({
+            ...prev,
+            [conv.id]: stored.map((m) => ({ role: m.role, text: m.text })),
+          }));
         }
       }
     })();
@@ -2663,9 +2947,16 @@ export default function App() {
   const openConversation = async (project: string, id: string) => {
     setActiveConv({ project, id });
     setView("chat");
+    setPanel("none");
+    // A live run owns its buffer — loading over it would wipe the streaming
+    // turn. Stored messages already arrived before the run started.
+    if (activeRuns[id]) return;
     // Messages come from the database, not from an in-memory draft.
     const stored = await db.loadMessages(id);
-    setDraftMsgs(stored.map((m) => ({ role: m.role, text: m.text })));
+    setConvMsgs((prev) => ({
+      ...prev,
+      [id]: stored.map((m) => ({ role: m.role, text: m.text })),
+    }));
   };
 
   /** Providers grouped with their models — feeds the model picker. */
@@ -2720,6 +3011,17 @@ export default function App() {
   };
 
   const deleteConversation = async (project: string, convId: string) => {
+    // A run streaming into a deleted chat would keep emitting into a buffer
+    // nobody can see — stop it first.
+    const run = activeRuns[convId];
+    if (run) {
+      await db.stopGeneration(run);
+      setActiveRuns((prev) => {
+        const next = { ...prev };
+        delete next[convId];
+        return next;
+      });
+    }
     setProjects((prev) =>
       prev.map((p) =>
         p.name !== project
@@ -2727,10 +3029,14 @@ export default function App() {
           : { ...p, conversations: p.conversations.filter((c) => c.id !== convId) }
       )
     );
+    setConvMsgs((prev) => {
+      const next = { ...prev };
+      delete next[convId];
+      return next;
+    });
     await db.removeConversation(convId);
     if (activeConv?.id === convId) {
       setActiveConv(null);
-      setDraftMsgs([]);
       setView("new");
     }
   };
@@ -2756,9 +3062,28 @@ export default function App() {
   };
 
   /**
+   * Refreshes a conversation's activity stamp in the in-memory tree so the
+   * sidebar's age label ("now" → "41S") updates the moment a message lands,
+   * without waiting for the next full reload.
+   */
+  const bumpConversationActivity = (convId: string) => {
+    const stamp = Math.floor(Date.now() / 1000);
+    setProjects((prev) =>
+      prev.map((p) => ({
+        ...p,
+        conversations: p.conversations.map((c) =>
+          c.id === convId ? { ...c, updatedAt: stamp } : c
+        ),
+      }))
+    );
+  };
+
+  /**
    * Sends a message: persists it, then streams the model's answer into the
-   * conversation. The reply is written to SQLite once streaming completes, so a
-   * partially received turn is never stored as if it were finished.
+   * conversation's own buffer, keyed by conversation id. The run keeps going
+   * when the user navigates away — the sidebar shows a pulse while it lasts.
+   * The reply is written to SQLite once streaming completes, so a partially
+   * received turn is never stored as if it were finished.
    */
   const sendMessage = async (
     text: string,
@@ -2779,15 +3104,21 @@ export default function App() {
     let history: Msg[];
 
     if (target) {
+      // One run per conversation — ignore sends while this chat is busy.
+      if (activeRuns[target.id]) return;
       convId = target.id;
       projectName = target.project;
-      history = [...draftMsgs, { role: "user", text: promptText }];
-      setDraftMsgs(history);
+      history = [...(convMsgsRef.current[convId] ?? []), { role: "user", text: promptText }];
+      updateConvMsgs(convId, (prev) => [...prev, { role: "user", text: promptText }]);
     } else {
       convId = `c-${Date.now()}`;
       projectName = newChatProject;
       const title = promptText.length > 42 ? `${promptText.slice(0, 42)}…` : promptText;
-      const conv: Conversation = { id: convId, title, age: "now" };
+      const conv: Conversation = {
+        id: convId,
+        title,
+        updatedAt: Math.floor(Date.now() / 1000),
+      };
       setProjects((prev) =>
         prev.map((p) =>
           p.name !== projectName ? p : { ...p, conversations: [conv, ...p.conversations] }
@@ -2796,10 +3127,17 @@ export default function App() {
       await db.insertConversation(projectName, conv);
       history = [{ role: "user", text: promptText }];
       setActiveConv({ project: projectName, id: convId });
-      setDraftMsgs(history);
+      // The new-chat draft becomes this conversation's buffer.
+      setConvMsgs((prev) => {
+        const next = { ...prev };
+        delete next[DRAFT_ID];
+        next[convId] = history;
+        return next;
+      });
       setView("chat");
     }
     await db.appendMessage(convId, "user", promptText);
+    bumpConversationActivity(convId);
 
     // Find the provider/model the user picked in the prompt box.
     const provider = providers.find((p) => p.id === selection.gatewayId);
@@ -2808,7 +3146,7 @@ export default function App() {
     );
     if (!provider || !modelRow) {
       const note = "No model selected — add a provider in Settings → Models.";
-      setDraftMsgs((prev) => [...prev, { role: "agent", text: note }]);
+      updateConvMsgs(convId, (prev) => [...prev, { role: "agent", text: note }]);
       return;
     }
 
@@ -2819,14 +3157,14 @@ export default function App() {
     const cred = await db.credentialFor(provider, oauth);
     if (cred.error) {
       const note = `${provider.name}: ${cred.error}`;
-      setDraftMsgs((prev) => [...prev, { role: "agent", text: note }]);
+      updateConvMsgs(convId, (prev) => [...prev, { role: "agent", text: note }]);
       return;
     }
 
     // With agent mode on the tools always have a workspace; the only case worth
     // reporting is the shell not having one ready yet.
     if (agentMode && !workspace.trim()) {
-      setDraftMsgs((prev) => [
+      updateConvMsgs(convId, (prev) => [
         ...prev,
         {
           role: "agent",
@@ -2838,14 +3176,15 @@ export default function App() {
       return;
     }
 
-    // Placeholder that grows as deltas arrive.
+    // Placeholder that grows as deltas arrive — always into THIS conversation,
+    // whatever the user is looking at while the run streams.
     const requestId = `req-${Date.now()}`;
-    setDraftMsgs((prev) => [...prev, { role: "agent", text: "", segments: [] }]);
-    setStreaming(true);
+    updateConvMsgs(convId, (prev) => [...prev, { role: "agent", text: "", segments: [] }]);
+    setActiveRuns((prev) => ({ ...prev, [convId]: requestId }));
 
     /** Appends streamed prose to the current text segment of the live turn. */
     const appendDelta = (delta: string) => {
-      setDraftMsgs((prev) => {
+      updateConvMsgs(convId, (prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
         if (!last || last.role !== "agent") return prev;
@@ -2866,7 +3205,7 @@ export default function App() {
 
     /** Appends model reasoning to its own block, kept out of the answer. */
     const appendThink = (delta: string) => {
-      setDraftMsgs((prev) => {
+      updateConvMsgs(convId, (prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
         if (!last || last.role !== "agent") return prev;
@@ -2887,7 +3226,7 @@ export default function App() {
     /** Records a tool call: `done=false` shows it as running, `done=true`
      * replaces the same card with its result. */
     const appendStep = (step: db.AgentStepEvent) => {
-      setDraftMsgs((prev) => {
+      updateConvMsgs(convId, (prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
         if (!last || last.role !== "agent") return prev;
@@ -2913,7 +3252,7 @@ export default function App() {
       // write and execute — otherwise it is a plain streaming chat.
       const useAgent = !!workspace.trim() && agentMode;
       // Per-project permission: run commands without asking.
-      const activeProject = projects.find((p) => p.name === activeConv?.project);
+      const runProject = projects.find((p) => p.name === projectName);
 
       const answer = useAgent
         ? await db.runAgent(
@@ -2927,7 +3266,7 @@ export default function App() {
               system: "",
               workspace,
               effort: selection.effort,
-              auto_run: !!activeProject?.autoRun,
+              auto_run: !!runProject?.autoRun,
               images,
             },
             historyTurns,
@@ -2935,7 +3274,10 @@ export default function App() {
               onText: appendDelta,
               onStep: appendStep,
               onThink: appendThink,
-              onConfirm: (req) => setConfirmReq(req),
+              // Parked per run id: a background run's request stays available
+              // and reappears the moment the user opens that chat.
+              onConfirm: (req) =>
+                setConfirmReqs((prev) => ({ ...prev, [req.run_id]: req })),
             }
           )
         : await db.streamChat(
@@ -2956,10 +3298,13 @@ export default function App() {
             appendDelta
           );
 
-      await db.appendMessage(convId, "agent", answer);
+      if (answer.trim()) {
+        await db.appendMessage(convId, "agent", answer);
+        bumpConversationActivity(convId);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      setDraftMsgs((prev) => {
+      updateConvMsgs(convId, (prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
         if (last && last.role === "agent" && last.text === "") {
@@ -2970,8 +3315,16 @@ export default function App() {
         return next;
       });
     } finally {
-      setStreaming(false);
-      setConfirmReq(null);
+      setActiveRuns((prev) => {
+        const next = { ...prev };
+        delete next[convId];
+        return next;
+      });
+      setConfirmReqs((prev) => {
+        const next = { ...prev };
+        delete next[requestId];
+        return next;
+      });
     }
   };
 
@@ -2985,18 +3338,19 @@ export default function App() {
           projects={projects}
           activeConversation={activeConv?.id ?? null}
           view={view}
+          runningConversations={runningConvIds}
           onSelectConversation={openConversation}
           onNewConversation={() => {
             // Plain "New Conversation" starts a chat with no project folder.
             setNewChatProject(NO_PROJECT);
             setActiveConv(null);
-            setDraftMsgs([]);
+            setConvMsgs((prev) => ({ ...prev, [DRAFT_ID]: [] }));
             setView("new");
           }}
           onNewConversationInProject={(project) => {
             setNewChatProject(project);
             setActiveConv(null);
-            setDraftMsgs([]);
+            setConvMsgs((prev) => ({ ...prev, [DRAFT_ID]: [] }));
             setView("new");
           }}
           onShowView={(v) => setView(v)}
@@ -3015,7 +3369,44 @@ export default function App() {
           {view !== "new" && (
             <div className="flex items-center gap-2 px-4 py-3 text-[16px] font-semibold text-[var(--text-main)]">
               {activeTitle}
-              {view === "chat" && activeConv && <Badge kind="run">agent active</Badge>}
+              {view === "chat" && activeConv && (
+                <div className="ml-auto flex items-center gap-1">
+                  <button
+                    className={`flex h-7 items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors ${
+                      panel === "changes"
+                        ? "border-[var(--accent)] bg-[var(--hover-bg)] text-[var(--text-main)]"
+                        : "border-[var(--border)] text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                    }`}
+                    onClick={() => setPanel((p) => (p === "changes" ? "none" : "changes"))}
+                    title="Show file changes in this conversation"
+                  >
+                    <FileDiff size={13} />
+                    Changes
+                    {changeCount > 0 && (
+                      <span className="rounded-full bg-[var(--accent)]/15 px-1.5 font-mono text-[10px] text-[var(--accent)]">
+                        {changeCount}
+                      </span>
+                    )}
+                  </button>
+                  <button
+                    className={`flex h-7 items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors ${
+                      panel === "commands"
+                        ? "border-[var(--accent)] bg-[var(--hover-bg)] text-[var(--text-main)]"
+                        : "border-[var(--border)] text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                    }`}
+                    onClick={() => setPanel((p) => (p === "commands" ? "none" : "commands"))}
+                    title="Show executed commands in this conversation"
+                  >
+                    <Terminal size={13} />
+                    Commands
+                    {commandCount > 0 && (
+                      <span className="rounded-full bg-[var(--accent)]/15 px-1.5 font-mono text-[10px] text-[var(--accent)]">
+                        {commandCount}
+                      </span>
+                    )}
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
@@ -3056,7 +3447,8 @@ export default function App() {
           )}
 
           {view === "chat" && (
-            <>
+            <div className="flex min-h-0 flex-1">
+              <div className="flex min-w-0 flex-1 flex-col">
               <ScrollArea className="flex-1" innerClassName="py-4" scrollRef={chatRef}>
                 <div className="px-6">
                   <div
@@ -3107,7 +3499,11 @@ export default function App() {
                         className="shrink-0 rounded-lg bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-white transition-opacity hover:opacity-90"
                         onClick={() => {
                           const req = confirmReq;
-                          setConfirmReq(null);
+                          setConfirmReqs((prev) => {
+                            const next = { ...prev };
+                            delete next[req.run_id];
+                            return next;
+                          });
                           void db.confirmCommand(req.run_id, true);
                         }}
                       >
@@ -3117,7 +3513,11 @@ export default function App() {
                         className="shrink-0 rounded-lg border border-[var(--border)] px-3 py-1.5 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
                         onClick={() => {
                           const req = confirmReq;
-                          setConfirmReq(null);
+                          setConfirmReqs((prev) => {
+                            const next = { ...prev };
+                            delete next[req.run_id];
+                            return next;
+                          });
                           void db.confirmCommand(req.run_id, false);
                         }}
                       >
@@ -3150,8 +3550,25 @@ export default function App() {
                 project={activeConv?.project ?? NO_PROJECT}
                 onSelectProject={() => {}}
                 gateways={gateways}
+                busy={streaming}
+                onStop={() => {
+                  const run = activeConv ? activeRuns[activeConv.id] : undefined;
+                  if (run) void db.stopGeneration(run);
+                }}
               />
-            </>
+              </div>
+
+              {/* Right inspection panel — file changes and command history. */}
+              <AnimatePresence>
+                {panel !== "none" && activeConv && (
+                  <InspectionPanel
+                    mode={panel}
+                    msgs={draftMsgs}
+                    onClose={() => setPanel("none")}
+                  />
+                )}
+              </AnimatePresence>
+            </div>
           )}
         </div>
 

@@ -8,7 +8,7 @@ import { useDictation } from "../hooks/useDictation.h";
 import { useOverlayThumb } from "../hooks/useOverlayThumb.h";
 import { CHIP_CTX } from "../ui/tokens.s";
 import { Thumb } from "../ui/Thumb.c";
-import { AuroraGlow, type AuroraMood } from "../ui/AuroraGlow.c";
+
 import { ModelSelector } from "./ModelSelector.c";
 import { ProjectPicker } from "./ProjectPicker.c";
 import { EffortChip } from "./EffortChip.c";
@@ -22,7 +22,6 @@ export function PromptBox({
   centered,
   busy,
   onStop,
-  mood = "idle",
   pickedModel,
   onPickModel,
 }: {
@@ -39,11 +38,6 @@ export function PromptBox({
   /** True while this conversation's generation is running — Send becomes Stop. */
   busy?: boolean;
   onStop?: () => void;
-  /**
-   * Drives the aurora glow palette: idle (mint) → thinking (indigo) →
-   * streaming (amber/coral) → error (ruby). Cross-fades are in the glow.
-   */
-  mood?: AuroraMood;
   /** Model chosen earlier — restored so the chat remembers its model. */
   pickedModel?: { gatewayId: string; modelId: string } | null;
   /** Reports the model the user picked, so it can be persisted. */
@@ -200,11 +194,7 @@ export function PromptBox({
             <ProjectPicker projects={projects} project={project} onSelect={onSelectProject} />
           </div>
         )}
-        <div className="relative">
-          {/* The living aurora behind the glass input — its palette tracks the
-              agent's state (idle/thinking/streaming/error). */}
-          <AuroraGlow mood={mood} />
-        {/* Glassmorphism container: the aurora glows through the blur. */}
+        {/* Glassmorphism container: the chat-column aurora glows through the blur. */}
         <div
           className={`prompt-glass relative flex min-h-[108px] w-full flex-col justify-between rounded-2xl transition-colors ${
             dragging ? "border-[var(--accent)]" : ""
@@ -393,7 +383,6 @@ export function PromptBox({
               )}
             </div>
           </div>
-        </div>
         </div>
       </div>
     </div>

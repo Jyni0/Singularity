@@ -209,38 +209,89 @@
 }
 .panel-resizer:hover { background: color-mix(in srgb, var(--accent) 35%, transparent); }
 
-/* ---------- Aurora Glow (prompt box) ----------
-   Soft plasma blobs drifting behind the glass prompt container. Only
-   transform/opacity are animated, so the whole thing stays on the compositor
-   and never competes with streaming text. Mood palettes live in
-   AuroraGlow.c.tsx and cross-fade via opacity transitions. */
+/* ---------- Aurora Borealis (prompt box) ----------
+   Flowing light curtains under the prompt: three colored blobs drift
+   sideways, each carrying two inner textures — leaning vertical "rays"
+   (::before) and boiling fractal noise (::after) — melted into one organic
+   aurora by the band's blur. Only transform/opacity are animated, so the
+   whole thing stays on the compositor. Palettes live in AuroraGlow.c.tsx. */
 .aurora-blob {
   position: absolute;
-  /* Bottom-anchored band: each blob is a wide, low ellipse sliding sideways
-     along the lower edge of the prompt box (Gemini-mobile aurora feel). */
-  top: 30%;
-  bottom: -30%;
-  width: 46%;
+  /* The bright core of each curtain (the gradient focus) sits on the blob's
+     bottom edge — which must stay INSIDE the band, or overflow-hidden clips
+     the brightest light away. The band's own blur then smears the core a few
+     px past the band's edge, making it glow out from under the glass. */
+  top: -14%;
+  bottom: 0;
+  width: 62%;
   border-radius: 9999px;
-  mix-blend-mode: screen;
+  overflow: hidden;
   will-change: transform;
 }
-.aurora-blob--a { left: 4%;  animation: aurora-a 13s ease-in-out infinite; }
-.aurora-blob--b { left: 27%; animation: aurora-b 17s ease-in-out infinite; }
-.aurora-blob--c { left: 50%; animation: aurora-c 21s ease-in-out infinite; }
+.aurora-blob::before,
+.aurora-blob::after {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+}
+/* Curtain rays — thin leaning light streaks sliding across the blob. The
+   repeating gradient has a 30px period, so a -60px drift loops seamlessly. */
+.aurora-blob::before {
+  top: -30%;
+  bottom: -30%;
+  left: -60%;
+  right: -60%;
+  background: repeating-linear-gradient(
+    90deg,
+    transparent 0 9px,
+    rgba(255, 255, 255, 0.14) 16px,
+    transparent 23px 30px
+  );
+}
+@keyframes aurora-rays {
+  from { transform: skewX(var(--skew, -10deg)) translateX(0); }
+  to   { transform: skewX(var(--skew, -10deg)) translateX(-60px); }
+}
+/* Boiling grain — a self-contained SVG fractal-noise tile (no external
+   asset) jumping between eight offsets: discrete steps read as the
+   shimmering texture of a real aurora. */
+.aurora-blob::after {
+  inset: -120px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.7' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 200px 200px;
+  opacity: 0.3;
+  animation: aurora-grain 1.6s steps(1, end) infinite;
+}
+@keyframes aurora-grain {
+  0%     { transform: translate3d(0, 0, 0); }
+  12.5%  { transform: translate3d(-40px, -22px, 0); }
+  25%    { transform: translate3d(28px, -38px, 0); }
+  37.5%  { transform: translate3d(-18px, 30px, 0); }
+  50%    { transform: translate3d(42px, 16px, 0); }
+  62.5%  { transform: translate3d(-34px, -12px, 0); }
+  75%    { transform: translate3d(14px, 36px, 0); }
+  87.5%  { transform: translate3d(-46px, 8px, 0); }
+}
+.aurora-blob--a { left: -4%;  --skew: -9deg;  animation: aurora-a 13s ease-in-out infinite; }
+.aurora-blob--b { left: 20%;  --skew: -13deg; animation: aurora-b 17s ease-in-out infinite; }
+.aurora-blob--c { left: 44%;  --skew: -7deg;  animation: aurora-c 21s ease-in-out infinite; }
+/* Opposite ray drift per curtain gives the layers parallax depth. */
+.aurora-blob--a::before { animation: aurora-rays 11s linear infinite; }
+.aurora-blob--b::before { animation: aurora-rays 15s linear infinite reverse; }
+.aurora-blob--c::before { animation: aurora-rays 19s linear infinite; }
 @keyframes aurora-a {
   0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
-  33%      { transform: translate3d(14%, 3%, 0) scale(1.1, 0.92); }
-  66%      { transform: translate3d(-8%, -2%, 0) scale(0.94, 1.06); }
+  33%      { transform: translate3d(14%, 0, 0) scale(1.1, 0.92); }
+  66%      { transform: translate3d(-8%, 0, 0) scale(0.94, 1.06); }
 }
 @keyframes aurora-b {
   0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
-  40%      { transform: translate3d(-16%, 4%, 0) scale(1.14, 0.9); }
-  75%      { transform: translate3d(12%, -3%, 0) scale(0.9, 1.08); }
+  40%      { transform: translate3d(-16%, 0, 0) scale(1.14, 0.9); }
+  75%      { transform: translate3d(12%, 0, 0) scale(0.9, 1.08); }
 }
 @keyframes aurora-c {
   0%, 100% { transform: translate3d(0, 0, 0) scale(1.02); }
-  50%      { transform: translate3d(-20%, 2%, 0) scale(1.18, 0.88); }
+  50%      { transform: translate3d(-20%, 0, 0) scale(1.18, 0.88); }
 }
 
 /* Glassmorphism container for the prompt: semi-transparent surface, heavy

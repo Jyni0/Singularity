@@ -8,6 +8,7 @@ import { composePrompt } from "../utils/attachments.u";
 import { toGateways } from "../utils/gateways.u";
 import { useBlockContextMenu } from "../hooks/useBlockContextMenu.h";
 import { ScrollArea } from "../ui/ScrollArea.c";
+import { AuroraGlow } from "../ui/AuroraGlow.c";
 
 import type { Msg, PanelState, PanelTabSpec } from "../chat/message.i";
 import { storedToMsg, fileLabel, toolLabel } from "../chat/message.u";
@@ -969,9 +970,15 @@ export default function App() {
           )}
 
           {view === "chat" && (
-            <div className="flex min-h-0 flex-1 flex-col">
+            <div className="relative flex min-h-0 flex-1 flex-col">
+              {/* Aurora Borealis — spans the whole chat column (behind
+                  everything), visible only while generating. z-0 keeps it
+                  under the content; the prompt glass then shines it through. */}
+              <div className="absolute inset-0 z-0 overflow-hidden">
+                <AuroraGlow mood={promptMood} />
+              </div>
               {/* Wrapper hosts the floating "jump to latest" button over the list. */}
-              <div className="relative flex min-h-0 flex-1 flex-col">
+              <div className="relative z-10 flex min-h-0 flex-1 flex-col">
               <ScrollArea className="flex-1" innerClassName="py-4" scrollRef={chatRef}>
                 <div className="px-6">
                   <div
@@ -1111,13 +1118,12 @@ export default function App() {
                 )}
               </AnimatePresence>
 
-              {/* The aurora behind the prompt IS the running indicator: its
-                  palette shifts mint → indigo → amber → red with the run. */}
+              {/* The column-wide aurora above IS the running indicator: its
+                  palette shifts indigo → amber with the run phase. */}
               <PromptBox
                 onSend={(text, selection, attachments) => sendMessage(text, activeConv, selection, attachments)}
                 projects={projects}
                 project={activeConv?.project ?? NO_PROJECT}
-                mood={promptMood}
                 onSelectProject={() => {}}
                 gateways={gateways}
                 pickedModel={pickedModel}

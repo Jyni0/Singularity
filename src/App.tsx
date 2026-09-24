@@ -68,6 +68,7 @@ import {
   FileDiff,
   Terminal,
   Image as ImageIcon,
+  ArrowUp,
 } from "lucide-react";
 import { computeDiff, diffStats } from "./diff";
 
@@ -274,17 +275,28 @@ interface Msg {
   images?: db.StoredImage[];
 }
 
+/** Which tab of the inspection panel is open. */
+type PanelTab = "changes" | "commands" | "image";
+
 /**
- * What the right inspection panel shows:
- * `changes` — the diff of one file (or the list when no focus),
- * `commands` — one command's full output (or the list),
- * `image` — a photo attached to a message, full size.
+ * What the right inspection panel shows — one panel with tabs:
+ * `changes` — file diffs (the list, or a single file when `file` is set),
+ * `commands` — command outputs (the list, or one when `stepIndex` is set),
+ * `image` — the photo attachment opened most recently.
+ * Focus and the last image survive tab switches, like real tabs.
  */
 type PanelState =
   | { kind: "none" }
-  | { kind: "changes"; file?: string }
-  | { kind: "commands"; stepIndex?: number }
-  | { kind: "image"; image: db.StoredImage };
+  | {
+      kind: "panel";
+      tab: PanelTab;
+      file?: string;
+      stepIndex?: number;
+      image?: db.StoredImage;
+    };
+
+/** PanelState once the panel is open — what InspectionPanel receives. */
+type PanelOpen = Extract<PanelState, { kind: "panel" }>;
 
 /* ---------- Fallback data (used by the in-memory store outside Tauri) ---------- */
 
@@ -1150,15 +1162,6 @@ function ChatMessage({
   if (segments && segments.length > 0) {
     return (
       <div className="flex flex-col gap-2">
-        <div className="flex items-center gap-2 text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
-          Agent
-          {/* How long this turn took — visible once the generation finished. */}
-          {!streaming && !!durationMs && durationMs > 0 && (
-            <span className="rounded-full bg-[var(--hover-bg)] px-1.5 py-0.5 font-mono text-[10px] normal-case tracking-normal text-[var(--text-dim)]" title="Generation time">
-              {formatDuration(durationMs)}
-            </span>
-          )}
-        </div>
         {segments.map((seg, i) => {
           const isLast = i === segments.length - 1;
           if (seg.kind === "step") {
@@ -1195,22 +1198,42 @@ function ChatMessage({
           }
           return seg.text.trim() ? <Markdown key={`t${i}`} text={seg.text} /> : null;
         })}
+        {/* Generation time — shown at the END of the finished turn. */}
+        <DurationFooter streaming={streaming} durationMs={durationMs} />
       </div>
     );
   }
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-center gap-2 text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
-        Agent
-        {!streaming && !!durationMs && durationMs > 0 && (
-          <span className="rounded-full bg-[var(--hover-bg)] px-1.5 py-0.5 font-mono text-[10px] normal-case tracking-normal text-[var(--text-dim)]" title="Generation time">
-            {formatDuration(durationMs)}
-          </span>
-        )}
-      </div>
       {/* Model output is markdown: headings, lists, tables and fenced code. */}
       <Markdown text={text} />
+      {/* Generation time — shown at the END of the finished turn. */}
+      <DurationFooter streaming={streaming} durationMs={durationMs} />
+    </div>
+  );
+}
+
+/**
+ * Generation time badge at the bottom-right of a finished agent turn.
+ * Hidden while streaming and for turns without a measured duration.
+ */
+function DurationFooter({
+  streaming,
+  durationMs,
+}: {
+  streaming?: boolean;
+  durationMs?: number;
+}) {
+  if (streaming || !durationMs || durationMs <= 0) return null;
+  return (
+    <div className="flex justify-end">
+      <span
+        className="rounded-full bg-[var(--hover-bg)] flex flex-row items-center px-1.5 py-0.5 font-mono text-[10px] text-[var(--text-dim)]"
+        title="Generation time"
+      >
+        Ran for {formatDuration(durationMs)} <ArrowUp className="ml-1 size-3" />
+      </span>
     </div>
   );
 }
@@ -1643,6 +1666,7 @@ function PromptBox({
   projects,
   project,
   onSelectProject,
+  onOpenProjectSettings,
   gateways,
   centered,
   busy,
@@ -1659,6 +1683,8 @@ function PromptBox({
   projects: Project[];
   project: string;
   onSelectProject: (name: string) => void;
+  /** Opens settings of the picked project — rendered only when provided. */
+  onOpenProjectSettings?: () => void;
   gateways: Gateway[];
   centered?: boolean;
   /** True while this conversation's generation is running — Send becomes Stop. */
@@ -1806,8 +1832,18 @@ function PromptBox({
     <div className={`flex w-full justify-center ${centered ? "" : "px-6 pb-4"}`}>
       <div className="flex w-full max-w-[760px] flex-col">
         {centered && (
-          <div className="mb-4 flex justify-center">
+          <div className="mb-4 flex items-center justify-center gap-1">
             <ProjectPicker projects={projects} project={project} onSelect={onSelectProject} />
+            {/* Project settings — hidden when no real project is picked. */}
+            {onOpenProjectSettings && (
+              <button
+                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                onClick={onOpenProjectSettings}
+                title={`Settings of "${project}"`}
+              >
+                <FolderCog size={15} strokeWidth={1.8} />
+              </button>
+            )}
           </div>
         )}
         {/* min-h 108px, radius 16, theme surface + border */}
@@ -2926,55 +2962,26 @@ function FileDiffBody({ step }: { step: db.AgentStepEvent }) {
 function InspectionPanel({
   panel,
   msgs,
+  width,
+  onResizeStart,
   onNavigate,
   onClose,
 }: {
-  panel: PanelState;
+  panel: PanelOpen;
   msgs: Msg[];
-  /** Switch the panel to another file/command without closing it. */
+  /** Current panel width in px — dragged by the handle on its left edge. */
+  width: number;
+  /** Starts a drag-resize of the panel's left edge. */
+  onResizeStart: (e: React.MouseEvent) => void;
+  /** Switch the panel to another tab/file/command without closing it. */
   onNavigate: (next: PanelState) => void;
   onClose: () => void;
 }) {
   const steps = collectSteps(msgs);
-  // Hooks must run unconditionally, so the list-view state lives above the
-  // image early-return even though only the list views use it.
+  // Inline-expanded rows of the list views (which accordion item is open).
   const [openFile, setOpenFile] = useState<string | null>(null);
   const [openCmd, setOpenCmd] = useState<number | null>(null);
 
-  if (panel.kind === "image") {
-    return (
-      <motion.aside
-        className="flex h-full w-[340px] shrink-0 flex-col border-l border-[var(--border)] bg-[var(--bg-main)]"
-        initial={{ opacity: 0, x: 24 }}
-        animate={{ opacity: 1, x: 0 }}
-        exit={{ opacity: 0, x: 24 }}
-        transition={{ duration: 0.18, ease: "easeOut" }}
-      >
-        <div className="flex items-center gap-2 border-b border-[var(--border)] px-4 py-3">
-          <ImageIcon size={15} className="text-[var(--text-dim)]" />
-          <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-[var(--text-main)]">
-            {panel.image.name}
-          </span>
-          <button
-            className="ml-auto rounded-md p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-            onClick={onClose}
-            title="Close panel"
-          >
-            <X size={15} />
-          </button>
-        </div>
-        <div className="flex min-h-0 flex-1 items-start justify-center overflow-auto p-3">
-          <img
-            src={panel.image.data_url}
-            alt={panel.image.name}
-            className="max-w-full rounded-lg border border-[var(--border)] object-contain"
-          />
-        </div>
-      </motion.aside>
-    );
-  }
-
-  const mode = panel.kind;
   const changes = steps.filter((s) => s.done && s.ok && s.path && s.new_text !== undefined);
   // Latest change per file wins — the panel shows the net result of the run.
   const byFile = new Map<string, db.AgentStepEvent>();
@@ -2982,167 +2989,214 @@ function InspectionPanel({
   const files = [...byFile.entries()];
   const commands = steps.filter((s) => s.name === "run_command");
 
-  // Focused views: one file's diff, or one command's output.
-  const focusFile = panel.kind === "changes" && panel.file ? byFile.get(panel.file) : undefined;
+  // Focused views: one file's diff, or one command's output. Each tab keeps
+  // its own focus, so switching tabs and back restores what was open.
+  const focusFile = panel.file ? byFile.get(panel.file) : undefined;
   const focusCmd =
-    panel.kind === "commands" && panel.stepIndex !== undefined
+    panel.stepIndex !== undefined
       ? commands.find((c) => c.index === panel.stepIndex)
       : undefined;
 
-  const header = (
-    <div className="flex items-center gap-2 border-b border-[var(--border)] px-4 py-3">
-      {mode === "changes" ? <FileDiff size={15} className="text-[var(--text-dim)]" /> : <Terminal size={15} className="text-[var(--text-dim)]" />}
-      <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-[var(--text-main)]">
-        {mode === "changes"
-          ? focusFile
-            ? focusFile.path!.split(/[\\/]/).pop()
-            : "Changes"
-          : focusCmd
-            ? "Command"
-            : "Commands"}
-      </span>
-      {(focusFile || focusCmd) && (
-        <button
-          className="rounded-md p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-          onClick={() => onNavigate({ kind: mode })}
-          title="Back to the list"
-        >
-          <ChevronRight size={15} className="rotate-180" />
-        </button>
-      )}
-      <button
-        className="rounded-md p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-        onClick={onClose}
-        title="Close panel"
-      >
-        <X size={15} />
-      </button>
-    </div>
-  );
+  // The image tab needs an opened photo; without one it falls back to Changes.
+  const tab: PanelTab = panel.tab === "image" && !panel.image ? "changes" : panel.tab;
+
+  /** Tabs across the top; Image joins them once a photo has been opened. */
+  const tabs: Array<{ id: PanelTab; label: string; icon: React.ReactNode }> = [
+    { id: "changes", label: "Changes", icon: <FileDiff size={13} strokeWidth={1.8} /> },
+    { id: "commands", label: "Commands", icon: <Terminal size={13} strokeWidth={1.8} /> },
+    ...(panel.image
+      ? [
+          {
+            id: "image" as PanelTab,
+            label: panel.image.name,
+            icon: <ImageIcon size={13} strokeWidth={1.8} />,
+          },
+        ]
+      : []),
+  ];
+
+  /** Small icon button used in panel headers (back / close). */
+  const iconBtn =
+    "shrink-0 rounded-md p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
 
   return (
     <motion.aside
-      className="flex h-full w-[340px] shrink-0 flex-col border-l border-[var(--border)] bg-[var(--bg-main)]"
+      className="relative flex h-full shrink-0 flex-col border-l border-[var(--border)] bg-[var(--bg-main)]"
+      style={{ width }}
       initial={{ opacity: 0, x: 24 }}
       animate={{ opacity: 1, x: 0 }}
       exit={{ opacity: 0, x: 24 }}
       transition={{ duration: 0.18, ease: "easeOut" }}
     >
-      {header}
+      {/* Drag handle on the left edge — resizes the panel. */}
+      <div className="panel-resizer" onMouseDown={onResizeStart} />
 
-      {/* Focused diff of a single file. */}
-      {mode === "changes" && focusFile && (
-        <div className="min-h-0 flex-1 overflow-hidden">
-          <div className="truncate border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 py-1.5 font-mono text-[10px] text-[var(--text-dim)]">
-            {focusFile.path}
+      {/* Tab bar */}
+      <div className="flex shrink-0 items-center gap-1 border-b border-[var(--border)] px-2 py-1.5">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            className={`flex h-7 max-w-[150px] min-w-0 items-center gap-1.5 rounded-md px-2 text-[12px] transition-colors ${
+              tab === t.id
+                ? "bg-[var(--hover-bg)] font-medium text-[var(--text-main)]"
+                : "text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+            }`}
+            onClick={() => onNavigate({ ...panel, tab: t.id })}
+            title={t.label}
+          >
+            <span className="shrink-0">{t.icon}</span>
+            <span className="truncate">{t.label}</span>
+          </button>
+        ))}
+        <button className={`${iconBtn} ml-auto`} onClick={onClose} title="Close panel">
+          <X size={15} />
+        </button>
+      </div>
+
+      {/* ---------- Changes tab ---------- */}
+      {tab === "changes" && focusFile && (
+        /* Focused diff of a single file, with a way back to the list. */
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div className="flex shrink-0 items-center gap-1.5 border-b border-[var(--border)] bg-[var(--bg-surface)] px-2 py-1.5">
+            <button
+              className={iconBtn}
+              onClick={() => onNavigate({ ...panel, file: undefined })}
+              title="Back to the list"
+            >
+              <ChevronRight size={14} className="rotate-180" />
+            </button>
+            <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--text-main)]" title={focusFile.path}>
+              {focusFile.path}
+            </span>
           </div>
-          <div className="h-[calc(100%-25px)] overflow-auto">
+          <div className="min-h-0 flex-1 overflow-auto">
             <FileDiffBody step={focusFile} />
           </div>
         </div>
       )}
-
-      {/* Focused output of a single command. */}
-      {mode === "commands" && focusCmd && (
-        <div className="min-h-0 flex-1 overflow-hidden">
-          <code className="block truncate border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 py-1.5 font-mono text-[11px] text-[var(--text-main)]">
-            {focusCmd.input}
-          </code>
-          <pre className="h-[calc(100%-33px)] overflow-auto whitespace-pre-wrap break-all bg-[var(--bg-app)] px-3 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
-            {focusCmd.done ? focusCmd.result : "running…"}
-          </pre>
-        </div>
-      )}
-
-      {/* List views (panel opened without a focus). */}
-      {((mode === "changes" && !focusFile) || (mode === "commands" && !focusCmd)) && (
+      {tab === "changes" && !focusFile && (
         <div className="min-h-0 flex-1 overflow-y-auto p-2">
-          {mode === "changes" && files.length === 0 && (
+          {files.length === 0 && (
             <p className="px-2 py-6 text-center text-[12px] text-[var(--text-dim)]">
               No file changes in this conversation yet.
             </p>
           )}
-          {mode === "changes" &&
-            files.map(([path, step]) => {
-              const stats = diffStats(step.old_text ?? "", step.new_text ?? "");
-              const open = openFile === path;
-              return (
-                <div key={path} className="mb-1.5 overflow-hidden rounded-lg border border-[var(--border)]">
-                  <button
-                    className="flex w-full items-center gap-2 bg-[var(--bg-surface)] px-2.5 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
-                    onClick={() => setOpenFile(open ? null : path)}
-                    onDoubleClick={() => onNavigate({ kind: "changes", file: path })}
-                  >
-                    {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                    <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-[var(--text-main)]">
-                      {path.split(/[\\/]/).pop()}
-                    </span>
-                    <span className="shrink-0 font-mono text-[11px] text-[var(--diff-add)]">+{stats.added}</span>
-                    <span className="shrink-0 font-mono text-[11px] text-[var(--diff-del)]">-{stats.removed}</span>
-                  </button>
-                  <AnimatePresence initial={false}>
-                    {open && (
-                      <motion.div
-                        initial={{ height: 0, opacity: 0 }}
-                        animate={{ height: "auto", opacity: 1 }}
-                        exit={{ height: 0, opacity: 0 }}
-                        transition={{ duration: 0.15, ease: "easeOut" }}
-                        className="max-h-[320px] overflow-hidden"
-                      >
-                        <FileDiffBody step={step} />
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </div>
-              );
-            })}
+          {files.map(([path, step]) => {
+            const stats = diffStats(step.old_text ?? "", step.new_text ?? "");
+            const open = openFile === path;
+            return (
+              <div key={path} className="mb-1.5 overflow-hidden rounded-lg border border-[var(--border)]">
+                <button
+                  className="flex w-full items-center gap-2 bg-[var(--bg-surface)] px-2.5 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
+                  onClick={() => setOpenFile(open ? null : path)}
+                  onDoubleClick={() => onNavigate({ ...panel, file: path })}
+                >
+                  {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                  <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-[var(--text-main)]">
+                    {path.split(/[\\/]/).pop()}
+                  </span>
+                  <span className="shrink-0 font-mono text-[11px] text-[var(--diff-add)]">+{stats.added}</span>
+                  <span className="shrink-0 font-mono text-[11px] text-[var(--diff-del)]">-{stats.removed}</span>
+                </button>
+                <AnimatePresence initial={false}>
+                  {open && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.15, ease: "easeOut" }}
+                      className="max-h-[320px] overflow-hidden"
+                    >
+                      <FileDiffBody step={step} />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
-          {mode === "commands" && commands.length === 0 && (
+      {/* ---------- Commands tab ---------- */}
+      {tab === "commands" && focusCmd && (
+        /* Focused output of a single command, with a way back to the list. */
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div className="flex shrink-0 items-center gap-1.5 border-b border-[var(--border)] bg-[var(--bg-surface)] px-2 py-1.5">
+            <button
+              className={iconBtn}
+              onClick={() => onNavigate({ ...panel, stepIndex: undefined })}
+              title="Back to the list"
+            >
+              <ChevronRight size={14} className="rotate-180" />
+            </button>
+            <code className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--text-main)]" title={focusCmd.input}>
+              {focusCmd.input}
+            </code>
+          </div>
+          <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-all bg-[var(--bg-app)] px-3 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
+            {focusCmd.done ? focusCmd.result : "running…"}
+          </pre>
+        </div>
+      )}
+      {tab === "commands" && !focusCmd && (
+        <div className="min-h-0 flex-1 overflow-y-auto p-2">
+          {commands.length === 0 && (
             <p className="px-2 py-6 text-center text-[12px] text-[var(--text-dim)]">
               No commands have run in this conversation yet.
             </p>
           )}
-          {mode === "commands" &&
-            commands.map((c, i) => {
-              const open = openCmd === i;
-              return (
-                <div key={i} className="mb-1.5 overflow-hidden rounded-lg border border-[var(--border)]">
-                  <button
-                    className="flex w-full items-center gap-2 bg-[var(--bg-surface)] px-2.5 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
-                    onClick={() => setOpenCmd(open ? null : i)}
-                  >
-                    {c.done ? (
-                      c.ok ? (
-                        <Check size={13} className="shrink-0 text-[var(--diff-add)]" />
-                      ) : (
-                        <X size={13} className="shrink-0 text-[var(--diff-del)]" />
-                      )
+          {commands.map((c, i) => {
+            const open = openCmd === i;
+            return (
+              <div key={i} className="mb-1.5 overflow-hidden rounded-lg border border-[var(--border)]">
+                <button
+                  className="flex w-full items-center gap-2 bg-[var(--bg-surface)] px-2.5 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
+                  onClick={() => setOpenCmd(open ? null : i)}
+                  onDoubleClick={() => onNavigate({ ...panel, stepIndex: c.index })}
+                >
+                  {c.done ? (
+                    c.ok ? (
+                      <Check size={13} className="shrink-0 text-[var(--diff-add)]" />
                     ) : (
-                      <Loader2 size={13} className="shrink-0 animate-spin text-[var(--accent)]" />
-                    )}
-                    <code className="min-w-0 flex-1 truncate font-mono text-[12px] text-[var(--text-main)]">
-                      {c.input}
-                    </code>
-                    {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                  </button>
-                  <AnimatePresence initial={false}>
-                    {open && (
-                      <motion.div
-                        initial={{ height: 0, opacity: 0 }}
-                        animate={{ height: "auto", opacity: 1 }}
-                        exit={{ height: 0, opacity: 0 }}
-                        transition={{ duration: 0.15, ease: "easeOut" }}
-                        className="overflow-hidden"
-                      >
-                        <pre className="max-h-[280px] overflow-auto whitespace-pre-wrap break-all border-t border-[var(--border)] bg-[var(--bg-app)] px-2.5 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
-                          {c.done ? c.result : "running…"}
-                        </pre>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </div>
-              );
-            })}
+                      <X size={13} className="shrink-0 text-[var(--diff-del)]" />
+                    )
+                  ) : (
+                    <Loader2 size={13} className="shrink-0 animate-spin text-[var(--accent)]" />
+                  )}
+                  <code className="min-w-0 flex-1 truncate font-mono text-[12px] text-[var(--text-main)]">
+                    {c.input}
+                  </code>
+                  {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                </button>
+                <AnimatePresence initial={false}>
+                  {open && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.15, ease: "easeOut" }}
+                      className="overflow-hidden"
+                    >
+                      <pre className="max-h-[280px] overflow-auto whitespace-pre-wrap break-all border-t border-[var(--border)] bg-[var(--bg-app)] px-2.5 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
+                        {c.done ? c.result : "running…"}
+                      </pre>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ---------- Image tab (only mounted once a photo was opened) ---------- */}
+      {tab === "image" && panel.image && (
+        <div className="flex min-h-0 flex-1 items-start justify-center overflow-auto p-3">
+          <img
+            src={panel.image.data_url}
+            alt={panel.image.name}
+            className="max-w-full rounded-lg border border-[var(--border)] object-contain"
+          />
         </div>
       )}
     </motion.aside>
@@ -3153,6 +3207,10 @@ function InspectionPanel({
 
 /** Buffer key for the "new chat" view before a conversation exists. */
 const DRAFT_ID = "__new__";
+
+/** Inspection panel width bounds, px. */
+const PANEL_MIN_W = 260;
+const PANEL_MAX_W = 720;
 
 export default function App() {
   // No default browser context menu anywhere in the window.
@@ -3169,6 +3227,8 @@ export default function App() {
   const [activeRuns, setActiveRuns] = useState<Record<string, string>>({});
   /** Right inspection panel of the chat view. */
   const [panel, setPanel] = useState<PanelState>({ kind: "none" });
+  /** Panel width, drag-resizable and persisted like the sidebar's. */
+  const [panelWidth, setPanelWidth] = useState(340);
   const [sidebarWidth, setSidebarWidth] = useState(240);
   const [theme, setThemeState] = useState<Theme>("dark");
   /** Every settings edit is persisted, so edits survive a relaunch. */
@@ -3267,11 +3327,16 @@ export default function App() {
 
       // Restore user settings persisted in SQLite (falls back to localStorage
       // values from older versions, then to defaults).
-      const [globalAuto, picked, savedTheme] = await Promise.all([
+      const [globalAuto, picked, savedTheme, savedPanelW] = await Promise.all([
         db.getSetting("global_auto_run"),
         db.getSetting("picked_model"),
         db.getSetting("theme"),
+        db.getSetting("panel_width"),
       ]);
+      if (!cancelled && savedPanelW) {
+        const w = Number(savedPanelW);
+        if (Number.isFinite(w)) setPanelWidth(Math.min(Math.max(w, PANEL_MIN_W), PANEL_MAX_W));
+      }
       if (!cancelled && globalAuto !== null) setGlobalAutoRun(globalAuto === "1");
       if (!cancelled && savedTheme && THEMES.includes(savedTheme as Theme)) {
         setThemeState(savedTheme as Theme);
@@ -3319,10 +3384,51 @@ export default function App() {
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);
 
+  /**
+   * True when the chat is scrolled far enough from the bottom that new output
+   * is off-screen — drives the floating "jump to the latest message" button.
+   */
+  const [chatScrolledUp, setChatScrolledUp] = useState(false);
+  /**
+   * Auto-follow new output only while the user is already at the bottom.
+   * Scrolling up to re-read detaches it, so a streaming answer can never
+   * yank the viewport back down mid-read.
+   */
+  const chatStickRef = useRef(true);
+
   useEffect(() => {
     const el = chatRef.current;
+    if (el && chatStickRef.current) el.scrollTop = el.scrollHeight;
+  }, [draftMsgs]);
+
+  // Opening another chat (or view) always lands at the newest message.
+  useEffect(() => {
+    chatStickRef.current = true;
+    setChatScrolledUp(false);
+    const el = chatRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [draftMsgs, activeConv, view]);
+  }, [activeConv, view]);
+
+  useEffect(() => {
+    const el = chatRef.current;
+    if (!el || view !== "chat") return;
+    const onScroll = () => {
+      const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+      const away = distance > 160;
+      chatStickRef.current = !away;
+      setChatScrolledUp(away);
+    };
+    onScroll();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [view, activeConv]);
+
+  /** Smooth-scrolls the chat back to the newest message and re-attaches follow. */
+  const scrollToChatBottom = () => {
+    const el = chatRef.current;
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    chatStickRef.current = true;
+  };
 
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -3334,6 +3440,29 @@ export default function App() {
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  /**
+   * Drag-resize of the inspection panel. Its handle sits on the panel's LEFT
+   * edge, so dragging left grows it (width = start − dx). The width reached at
+   * mouse-up is persisted so the next launch reuses it.
+   */
+  const startPanelResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = panelWidth;
+    let latest = startW;
+    const onMove = (ev: MouseEvent) => {
+      latest = Math.min(Math.max(startW - (ev.clientX - startX), PANEL_MIN_W), PANEL_MAX_W);
+      setPanelWidth(latest);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      void db.setSetting("panel_width", String(latest));
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -3786,6 +3915,37 @@ export default function App() {
     }
   };
 
+  /** Opens the project settings modal for a named project. */
+  const openProjectSettings = (name: string) => {
+    setSettingsProject(name);
+    setModal("project-settings");
+  };
+
+  /**
+   * Opens (or switches) the inspection panel. The other tabs keep their focus,
+   * so flipping between Changes / Commands / Image restores where you were.
+   */
+  const showPanel = (patch: { tab: PanelTab; file?: string; stepIndex?: number; image?: db.StoredImage }) => {
+    setPanel((prev) => {
+      const base: PanelOpen =
+        prev.kind === "panel" ? prev : { kind: "panel", tab: patch.tab };
+      return { ...base, ...patch, kind: "panel" };
+    });
+  };
+
+  /**
+   * The project the current screen belongs to: an open chat inherits its
+   * project, the new-chat view uses the one picked above the prompt box.
+   * "No project" has nothing to configure, so the settings entry point is
+   * hidden entirely for it (null).
+   */
+  const currentProject =
+    view === "chat" && activeConv && activeConv.project !== NO_PROJECT
+      ? activeConv.project
+      : view === "new" && newChatProject !== NO_PROJECT
+        ? newChatProject
+        : null;
+
   return (
     <div className="flex h-full flex-col">
       <TitleBar />
@@ -3813,10 +3973,7 @@ export default function App() {
           }}
           onShowView={(v) => setView(v)}
           onOpenSettings={() => setModal("settings")}
-          onOpenProjectSettings={(name) => {
-            setSettingsProject(name);
-            setModal("project-settings");
-          }}
+          onOpenProjectSettings={openProjectSettings}
           onNewProject={() => setModal("new-project")}
           onRenameConversation={renameConversation}
           onDeleteConversation={deleteConversation}
@@ -3827,6 +3984,16 @@ export default function App() {
           {view !== "new" && (
             <div className="flex items-center gap-2 px-4 py-3 text-[16px] font-semibold text-[var(--text-main)]">
               {activeTitle}
+              {/* Project settings — only for a chat inside a real project. */}
+              {currentProject && (
+                <button
+                  className="rounded-md p-1.5 text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                  onClick={() => openProjectSettings(currentProject)}
+                  title={`Settings of "${currentProject}"`}
+                >
+                  <FolderCog size={16} strokeWidth={1.8} />
+                </button>
+              )}
             </div>
           )}
 
@@ -3859,6 +4026,11 @@ export default function App() {
                   projects={projects}
                   project={newChatProject}
                   onSelectProject={setNewChatProject}
+                  onOpenProjectSettings={
+                    newChatProject !== NO_PROJECT
+                      ? () => openProjectSettings(newChatProject)
+                      : undefined
+                  }
                   gateways={gateways}
                   pickedModel={pickedModel}
                   onPickModel={pickModel}
@@ -3872,6 +4044,8 @@ export default function App() {
           {view === "chat" && (
             <div className="flex min-h-0 flex-1">
               <div className="flex min-w-0 flex-1 flex-col">
+              {/* Wrapper hosts the floating "jump to latest" button over the list. */}
+              <div className="relative flex min-h-0 flex-1 flex-col">
               <ScrollArea className="flex-1" innerClassName="py-4" scrollRef={chatRef}>
                 <div className="px-6">
                   <div
@@ -3894,15 +4068,15 @@ export default function App() {
                             durationMs={m.durationMs}
                             images={m.images}
                             onInspectStep={(step) => {
-                              // A changed file opens the Changes panel focused on it;
-                              // a command opens its full output in the Commands panel.
+                              // A changed file opens the Changes tab focused on it;
+                              // a command opens its full output in the Commands tab.
                               if (step.path && step.new_text !== undefined) {
-                                setPanel({ kind: "changes", file: step.path });
+                                showPanel({ tab: "changes", file: step.path });
                               } else if (step.name === "run_command") {
-                                setPanel({ kind: "commands", stepIndex: step.index });
+                                showPanel({ tab: "commands", stepIndex: step.index });
                               }
                             }}
-                            onInspectImage={(img) => setPanel({ kind: "image", image: img })}
+                            onInspectImage={(img) => showPanel({ tab: "image", image: img })}
                           />
                         </motion.div>
                       ))}
@@ -3910,6 +4084,26 @@ export default function App() {
                   </div>
                 </div>
               </ScrollArea>
+
+              {/* Floating jump-to-bottom — visible only when the newest message
+                  is off-screen (scrolled up more than ~160px). */}
+              <AnimatePresence>
+                {chatScrolledUp && (
+                  <motion.button
+                    className="absolute bottom-3 left-1/2 z-20 flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--bg-surface)] px-3 text-[12px] text-[var(--text-muted)] shadow-[var(--shadow-popup)] transition-colors hover:text-[var(--text-main)]"
+                    initial={{ opacity: 0, y: 8, scale: 0.95 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 8, scale: 0.95 }}
+                    transition={{ duration: 0.15, ease: "easeOut" }}
+                    onClick={scrollToChatBottom}
+                    title="Jump to the latest message"
+                  >
+                    <ChevronDown size={14} />
+                    Latest
+                  </motion.button>
+                )}
+              </AnimatePresence>
+              </div>
 
               {/* The agent is paused on a command that needs permission. */}
               <AnimatePresence>
@@ -3998,10 +4192,12 @@ export default function App() {
 
               {/* Right inspection panel — opened by clicking a file/command/photo. */}
               <AnimatePresence>
-                {panel.kind !== "none" && activeConv && (
+                {panel.kind === "panel" && activeConv && (
                   <InspectionPanel
                     panel={panel}
                     msgs={draftMsgs}
+                    width={panelWidth}
+                    onResizeStart={startPanelResize}
                     onNavigate={setPanel}
                     onClose={() => setPanel({ kind: "none" })}
                   />

@@ -197,6 +197,18 @@
 }
 .sidebar-resizer:hover { background: color-mix(in srgb, var(--accent) 35%, transparent); }
 
+/* Inspection panel drag-resizer — same strip, mirrored to the left edge */
+.panel-resizer {
+  position: absolute;
+  top: 0;
+  left: -3px;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 10;
+}
+.panel-resizer:hover { background: color-mix(in srgb, var(--accent) 35%, transparent); }
+
 /* Diff syntax colors via tokens */
 .diff-line--add { background: color-mix(in srgb, var(--diff-add) 15%, transparent); }
 .diff-line--del { background: color-mix(in srgb, var(--diff-del) 15%, transparent); }

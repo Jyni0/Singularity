@@ -15,18 +15,18 @@ export interface Conversation {
   pinned?: boolean;
 }
 
-/** Humanizes an age in seconds as 41S / 5M / 2H / 3D / 1Y (UI caps style). */
+/** Humanizes an age in seconds as 41sec / 5min / 2h / 3d / 1y (UI caps style). */
 export function ageLabel(updatedAtUnix: number, nowUnix: number): string {
   if (!updatedAtUnix) return "";
   const s = Math.max(0, nowUnix - updatedAtUnix);
-  if (s < 60) return `${s}S`;
+  if (s < 60) return `${s}sec`;
   const m = Math.floor(s / 60);
-  if (m < 60) return `${m}M`;
+  if (m < 60) return `${m}min`;
   const h = Math.floor(m / 60);
-  if (h < 24) return `${h}H`;
+  if (h < 24) return `${h}h`;
   const d = Math.floor(h / 24);
-  if (d < 365) return `${d}D`;
-  return `${Math.floor(d / 365)}Y`;
+  if (d < 365) return `${d}d`;
+  return `${Math.floor(d / 365)}y`;
 }
 
 /**
@@ -115,19 +115,20 @@ export interface Model {
 /**
  * Humanizes a model id for display: `claude-fable-5` → `Claude Fable 5`.
  *
- * Dashes, slashes and dots become spaces, each word is capitalized, and lone
- * version digits stay as-is. Ids that already look human (they contain a
- * space) pass through untouched, so a user's custom display name survives.
+ * Dashes and slashes become spaces and each word is capitalized, but DOTS are
+ * kept so version numbers stay intact: `gpt-4.1` → `Gpt 4.1`, never
+ * `Gpt 4 1`. Ids that already look human (they contain a space) pass through
+ * untouched, so a user's custom display name survives.
  */
 export function prettyModelName(id: string): string {
   if (!id) return id;
   if (id.includes(" ")) return id;
   const words = id
     .replace(/[/:@]/g, " ")
-    .split(/[-_.]+/)
+    .split(/[-_]+/)
     .filter(Boolean);
   return words
-    .map((w) => (/^\d+$/.test(w) ? w : w.charAt(0).toUpperCase() + w.slice(1)))
+    .map((w) => (/^\d/.test(w) ? w : w.charAt(0).toUpperCase() + w.slice(1)))
     .join(" ");
 }
 

@@ -155,7 +155,43 @@ pub fn migrations() -> Vec<Migration> {
         clean_demo_migration(),
         finish_cleanup_migration(),
         activity_stamp_migration(),
+        message_meta_migration(),
+        project_permission_migration(),
     ]
+}
+
+/// Version 7 — messages carry generation time and attached images.
+///
+/// `duration_ms` is how long the agent spent producing this turn; `images` is
+/// a JSON array of `{name, mime, data_url}` so photo attachments survive a
+/// reload and can be re-opened from the chat.
+fn message_meta_migration() -> Migration {
+    Migration {
+        version: 7,
+        description: "message duration and images",
+        sql: "
+            ALTER TABLE messages ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE messages ADD COLUMN images TEXT NOT NULL DEFAULT '[]';
+        ",
+        kind: MigrationKind::Up,
+    }
+}
+
+/// Version 8 — per-project command permission mode.
+///
+/// `default` inherits the global setting, `bypass` runs commands without
+/// asking, `ask` always prompts. The older `auto_run` boolean is migrated
+/// across so existing projects keep their behavior.
+fn project_permission_migration() -> Migration {
+    Migration {
+        version: 8,
+        description: "project permission mode",
+        sql: "
+            ALTER TABLE projects ADD COLUMN perm_mode TEXT NOT NULL DEFAULT 'default';
+            UPDATE projects SET perm_mode = 'bypass' WHERE auto_run = 1;
+        ",
+        kind: MigrationKind::Up,
+    }
 }
 
 /// Version 6 — conversations track when they were last used.

@@ -9,15 +9,17 @@ import type {
   Conversation,
   Model,
   OAuthTokens,
+  PermMode,
   Project,
   Provider,
   ProviderKind,
   ProviderStatus,
+  StoredImage,
   StoredMessage,
 } from "./types";
 import { NO_PROJECT } from "./types";
 
-export type { Model, OAuthTokens, Provider, StoredMessage };
+export type { Model, OAuthTokens, Provider, StoredImage, StoredMessage };
 
 /** Shape returned by the in-memory fallback, mirroring the SQL rows. */
 interface MemoryStore {
@@ -78,6 +80,8 @@ interface ProjectRow {
   path: string;
   sort_order: number;
   auto_run: number;
+  /** `bypass` / `ask` / `default`; absent on databases predating migration 8. */
+  perm_mode?: string;
 }
 
 interface ConvRow {
@@ -96,17 +100,23 @@ export async function loadProjects(): Promise<Project[]> {
   const db = await getDb();
   if (!db) return memory.projects;
 
-  // `auto_run` arrived in migration 4. If the schema is somehow older, retry
-  // without the column instead of failing the whole sidebar load.
+  // `auto_run` arrived in migration 4, `perm_mode` in 8. If the schema is
+  // somehow older, retry with fewer columns instead of failing the sidebar.
   let rows: ProjectRow[];
   try {
     rows = await db.select<ProjectRow[]>(
-      "SELECT id, name, path, sort_order, auto_run FROM projects ORDER BY sort_order, name"
+      "SELECT id, name, path, sort_order, auto_run, perm_mode FROM projects ORDER BY sort_order, name"
     );
   } catch {
-    rows = await db.select<Omit<ProjectRow, "auto_run">[]>(
-      "SELECT id, name, path, sort_order FROM projects ORDER BY sort_order, name"
-    ).then((rs) => rs.map((r) => ({ ...r, auto_run: 0 })));
+    try {
+      rows = await db.select<Omit<ProjectRow, "perm_mode">[]>(
+        "SELECT id, name, path, sort_order, auto_run FROM projects ORDER BY sort_order, name"
+      ).then((rs) => rs.map((r) => ({ ...r, perm_mode: undefined })));
+    } catch {
+      rows = await db.select<Omit<ProjectRow, "auto_run" | "perm_mode">[]>(
+        "SELECT id, name, path, sort_order FROM projects ORDER BY sort_order, name"
+      ).then((rs) => rs.map((r) => ({ ...r, auto_run: 0, perm_mode: undefined })));
+    }
   }
 
   // `updated_at` arrived in migration 6; fall back to `created_at` on an
@@ -129,7 +139,11 @@ export async function loadProjects(): Promise<Project[]> {
   return rows.map((p) => ({
     name: p.name,
     path: p.path,
-    autoRun: p.auto_run === 1,
+    permMode: (["bypass", "ask", "default"].includes(p.perm_mode ?? "")
+      ? p.perm_mode
+      : p.auto_run === 1
+        ? "bypass"
+        : "default") as PermMode,
     conversations: convs
       .filter((c) => c.project_id === p.name)
       .map<Conversation>((c) => ({
@@ -148,9 +162,16 @@ export async function insertProject(project: Project, sortOrder: number): Promis
     return;
   }
   await db.execute(
-    `INSERT OR IGNORE INTO projects (id, name, path, sort_order, auto_run)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [project.name, project.name, project.path, sortOrder, project.autoRun ? 1 : 0]
+    `INSERT OR IGNORE INTO projects (id, name, path, sort_order, auto_run, perm_mode)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [
+      project.name,
+      project.name,
+      project.path,
+      sortOrder,
+      project.permMode === "bypass" ? 1 : 0,
+      project.permMode ?? "default",
+    ]
   );
 }
 
@@ -174,18 +195,27 @@ export async function deleteProject(name: string): Promise<void> {
   await db.execute("DELETE FROM projects WHERE name = $1", [name]);
 }
 
-/** Sets the per-project execution permission (run commands without asking). */
-export async function setProjectAutoRun(name: string, autoRun: boolean): Promise<void> {
+/** Sets the per-project command permission mode (bypass / default / ask). */
+export async function setProjectPermMode(name: string, mode: PermMode): Promise<void> {
   const db = await getDb();
   if (!db) {
     const p = memory.projects.find((x) => x.name === name);
-    if (p) p.autoRun = autoRun;
+    if (p) p.permMode = mode;
     return;
   }
-  await db.execute("UPDATE projects SET auto_run = $1 WHERE name = $2", [
-    autoRun ? 1 : 0,
-    name,
-  ]);
+  try {
+    await db.execute("UPDATE projects SET perm_mode = $1, auto_run = $2 WHERE name = $3", [
+      mode,
+      mode === "bypass" ? 1 : 0,
+      name,
+    ]);
+  } catch {
+    // Schema predating migration 8 — keep the old boolean working.
+    await db.execute("UPDATE projects SET auto_run = $1 WHERE name = $2", [
+      mode === "bypass" ? 1 : 0,
+      name,
+    ]);
+  }
 }
 
 /** Renames a project everywhere: the row itself and all chats that point at it. */
@@ -273,27 +303,49 @@ export async function loadMessages(conversationId: string): Promise<StoredMessag
   if (!db) {
     return memory.messages.filter((m) => m.conversation_id === conversationId);
   }
-  return db.select<StoredMessage[]>(
-    `SELECT conversation_id, role, text, created_at
-       FROM messages
-      WHERE conversation_id = $1
-      ORDER BY created_at, rowid`,
-    [conversationId]
-  );
+  // `duration_ms`/`images` arrived in migration 7; fall back on older schemas.
+  try {
+    return await db.select<StoredMessage[]>(
+      `SELECT conversation_id, role, text, created_at, duration_ms, images
+         FROM messages
+        WHERE conversation_id = $1
+        ORDER BY created_at, rowid`,
+      [conversationId]
+    );
+  } catch {
+    return db.select<StoredMessage[]>(
+      `SELECT conversation_id, role, text, created_at
+         FROM messages
+        WHERE conversation_id = $1
+        ORDER BY created_at, rowid`,
+      [conversationId]
+    );
+  }
+}
+
+export interface MessageMeta {
+  /** How long the model spent producing this turn (agent messages). */
+  durationMs?: number;
+  /** Image attachments carried with a user message. */
+  images?: StoredImage[];
 }
 
 export async function appendMessage(
   conversationId: string,
   role: "user" | "agent",
-  text: string
+  text: string,
+  meta: MessageMeta = {}
 ): Promise<void> {
   const db = await getDb();
   const now = Math.floor(Date.now() / 1000);
+  const imagesJson = JSON.stringify(meta.images ?? []);
   const row: StoredMessage = {
     conversation_id: conversationId,
     role,
     text,
     created_at: now,
+    duration_ms: meta.durationMs ?? 0,
+    images: imagesJson,
   };
   if (!db) {
     memory.messages.push(row);
@@ -303,11 +355,27 @@ export async function appendMessage(
     }
     return;
   }
-  await db.execute(
-    `INSERT INTO messages (id, conversation_id, role, text)
-     VALUES ($1, $2, $3, $4)`,
-    [memId(), conversationId, role, text]
-  );
+  try {
+    await db.execute(
+      `INSERT INTO messages (id, conversation_id, role, text, duration_ms, images)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        memId(),
+        conversationId,
+        role,
+        text,
+        meta.durationMs ?? 0,
+        imagesJson,
+      ]
+    );
+  } catch {
+    // Schema predating migration 7 — store the message without the new columns.
+    await db.execute(
+      `INSERT INTO messages (id, conversation_id, role, text)
+       VALUES ($1, $2, $3, $4)`,
+      [memId(), conversationId, role, text]
+    );
+  }
   // Bump the conversation's activity stamp so the sidebar shows a live age.
   // Guarded: on a database predating migration 6 the column does not exist.
   try {
@@ -758,6 +826,9 @@ export interface ChatTurn {
 
 /** An image attachment, carried as a data URL and converted per protocol. */
 export interface ImageAttachment {
+  /** Original filename — stored with the message for later viewing; the Rust
+   * side ignores it (serde skips unknown fields). */
+  name?: string;
   mime: string;
   data_url: string;
 }
@@ -873,6 +944,38 @@ export async function stopGeneration(runId: string): Promise<void> {
   if (!inTauri) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("stop_generation", { runId });
+}
+
+/**
+ * Dictation: transcribes recorded audio through an OpenAI-compatible
+ * `/audio/transcriptions` endpoint. WebView2 has no Web Speech API, so the
+ * frontend records the mic and hands the blob to Rust, which does the HTTP.
+ *
+ * `provider` supplies base_url + api_key. Falls back to a thrown error when the
+ * desktop shell or provider is missing so the caller can show a notice.
+ */
+export async function transcribeAudio(
+  provider: { base_url: string; api_key: string; model?: string },
+  audioBlob: Blob,
+  language?: string
+): Promise<string> {
+  if (!inTauri) throw new Error("Dictation needs the desktop shell (npm run tauri:dev)");
+  const { invoke } = await import("@tauri-apps/api/core");
+
+  // Encode the blob as base64 without FileReader (works in all webviews).
+  const buf = new Uint8Array(await audioBlob.arrayBuffer());
+  let binary = "";
+  for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
+  const audio_base64 = btoa(binary);
+
+  return invoke<string>("transcribe_audio", {
+    baseUrl: provider.base_url,
+    apiKey: provider.api_key,
+    model: provider.model ?? "whisper-1",
+    language: language ?? null,
+    audioBase64: audio_base64,
+    mime: audioBlob.type || "audio/webm",
+  });
 }
 
 /** A command waiting for the user's permission. */

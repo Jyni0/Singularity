@@ -13,6 +13,7 @@ import {
   Check,
   Copy,
   Eye,
+  FileDiff,
   FilePlus2,
   FolderOpen,
   Loader2,
@@ -392,6 +393,12 @@ export interface ToolCallView {
   result?: string;
   ok?: boolean;
   running?: boolean;
+  /** A write/edit step can be opened in the Changes panel. */
+  hasChange?: boolean;
+  /** A command step can be opened in the Commands panel. */
+  isCommand?: boolean;
+  /** Opens the matching inspection panel in the sidebar. */
+  onInspect?: () => void;
 }
 
 /** Each tool gets its own icon and verb, so the transcript reads at a glance. */
@@ -464,24 +471,39 @@ export function ToolCall({ call }: { call: ToolCallView }) {
   const ok = call.ok ?? true;
   const meta = TOOL_META[call.name] ?? { icon: Wrench, label: call.name };
   const Icon = meta.icon;
+  const inspectable = !!call.onInspect && (call.hasChange || call.isCommand);
 
   return (
     <div className="my-1 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-surface)]">
-      <button
-        className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
-        onClick={() => setOpen(!open)}
-      >
-        <ChevronRight
-          size={12}
-          className={`shrink-0 text-[var(--text-dim)] transition-transform ${open ? "rotate-90" : ""}`}
-        />
-        <Icon size={12} className="shrink-0 text-[var(--text-dim)]" />
-        <span className="shrink-0 text-[12px] font-medium text-[var(--text-main)]">
-          {meta.label}
-        </span>
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--text-dim)]">
-          {call.input}
-        </span>
+      <div className="flex w-full items-center gap-2 px-3 py-2 transition-colors hover:bg-[var(--hover-bg)]">
+        <button
+          className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          onClick={() => setOpen(!open)}
+        >
+          <ChevronRight
+            size={12}
+            className={`shrink-0 text-[var(--text-dim)] transition-transform ${open ? "rotate-90" : ""}`}
+          />
+          <Icon size={12} className="shrink-0 text-[var(--text-dim)]" />
+          <span className="shrink-0 text-[12px] font-medium text-[var(--text-main)]">
+            {meta.label}
+          </span>
+          <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--text-dim)]">
+            {call.input}
+          </span>
+        </button>
+        {/* Clicking the step name opens the matching sidebar panel: Changes
+            for a modified file, Commands for a shell call. */}
+        {inspectable && (
+          <button
+            className="flex shrink-0 items-center gap-1 rounded-md border border-[var(--border)] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[var(--text-dim)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+            onClick={call.onInspect}
+            title={call.hasChange ? "Open in Changes panel" : "Open in Commands panel"}
+          >
+            {call.hasChange ? <FileDiff size={11} /> : <Terminal size={11} />}
+            {call.hasChange ? "diff" : "output"}
+          </button>
+        )}
         {running ? (
           <>
             <Loader2
@@ -501,7 +523,7 @@ export function ToolCall({ call }: { call: ToolCallView }) {
             {ok ? "done" : "error"}
           </span>
         )}
-      </button>
+      </div>
 
       {open && call.result && (
         <pre className="max-h-[320px] overflow-auto border-t border-[var(--border)] bg-[var(--bg-input)] px-3 py-2 font-mono text-[11px] leading-[1.6] text-[var(--text-muted)]">

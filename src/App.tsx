@@ -15,8 +15,8 @@ import * as db from "./db";
 import { ModelsSettings } from "./ModelsSettings";
 import { Markdown, ToolCall, ThinkBlock } from "./Markdown";
 import { toAttachments, formatSize, composePrompt } from "./attachments";
-import type { Effort, Attachment } from "./types";
-import { EFFORTS, ageLabel } from "./types";
+import type { Effort, Attachment, PermMode } from "./types";
+import { EFFORTS, ageLabel, prettyModelName } from "./types";
 
 export type {
   Conversation,
@@ -67,6 +67,7 @@ import {
   FileText,
   FileDiff,
   Terminal,
+  Image as ImageIcon,
 } from "lucide-react";
 import { computeDiff, diffStats } from "./diff";
 
@@ -267,7 +268,23 @@ interface Msg {
   text: string;
   /** Interleaved prose and tool calls, newest last. Live turns only. */
   segments?: Segment[];
+  /** How long the agent spent producing this turn, in milliseconds. */
+  durationMs?: number;
+  /** Images attached to this message, rendered as clickable previews. */
+  images?: db.StoredImage[];
 }
+
+/**
+ * What the right inspection panel shows:
+ * `changes` — the diff of one file (or the list when no focus),
+ * `commands` — one command's full output (or the list),
+ * `image` — a photo attached to a message, full size.
+ */
+type PanelState =
+  | { kind: "none" }
+  | { kind: "changes"; file?: string }
+  | { kind: "commands"; stepIndex?: number }
+  | { kind: "image"; image: db.StoredImage };
 
 /* ---------- Fallback data (used by the in-memory store outside Tauri) ---------- */
 
@@ -288,7 +305,14 @@ function toGateways(providers: Provider[], models: Model[]): Gateway[] {
     enabled: p.enabled,
     models: models
       .filter((m) => m.provider_id === p.id && m.enabled)
-      .map((m) => ({ id: m.model_id, name: m.name, meta: m.meta })),
+      .map((m) => ({
+        id: m.model_id,
+        // Display names are humanized (`claude-fable-5` → `Claude Fable 5`)
+        // unless the user gave the model a custom name of their own.
+        name:
+          m.name && m.name !== m.model_id ? m.name : prettyModelName(m.model_id),
+        meta: m.meta,
+      })),
   }));
 }
 
@@ -813,21 +837,22 @@ function Sidebar({
           className="min-h-0 flex-1"
           innerClassName="flex flex-col gap-0.5 px-2.5 pt-2 [&>*]:shrink-0"
         >
-          {/* Projects header — click the label to collapse the whole section */}
-          <div className="mb-1 mt-3 flex h-6 shrink-0 items-center pl-1 pr-0.5">
+          {/* Projects header — the chevron sits after the label and only
+              appears while the row is hovered. */}
+          <div className="group mb-1 mt-3 flex h-6 shrink-0 items-center pl-1 pr-0.5">
             <button
               className="flex h-6 items-center gap-1 rounded text-[12px] font-medium text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
               onClick={() => setProjectsOpen(!projectsOpen)}
               title={projectsOpen ? "Collapse projects" : "Expand projects"}
             >
+              Projects
               <motion.span
                 animate={{ rotate: projectsOpen ? 90 : 0 }}
                 transition={{ duration: 0.15 }}
-                className="flex items-center"
+                className="flex items-center opacity-0 transition-opacity group-hover:opacity-100"
               >
                 <ChevronRight size={12} strokeWidth={2} />
               </motion.span>
-              Projects
             </button>
             <span className="ml-auto flex items-center gap-2">
               <button
@@ -968,20 +993,20 @@ function Sidebar({
           </AnimatePresence>
 
           {/* Conversations header — loose chats, mirroring the Projects section */}
-          <div className="mb-1 mt-3 flex h-6 shrink-0 items-center pl-1 pr-0.5">
+          <div className="group mb-1 mt-3 flex h-6 shrink-0 items-center pl-1 pr-0.5">
             <button
               className="flex h-6 items-center gap-1 rounded text-[12px] font-medium text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
               onClick={() => setConvsOpen(!convsOpen)}
               title={convsOpen ? "Collapse conversations" : "Expand conversations"}
             >
+              Conversations
               <motion.span
                 animate={{ rotate: convsOpen ? 90 : 0 }}
                 transition={{ duration: 0.15 }}
-                className="flex items-center"
+                className="flex items-center opacity-0 transition-opacity group-hover:opacity-100"
               >
                 <ChevronRight size={12} strokeWidth={2} />
               </motion.span>
-              Conversations
             </button>
             <span className="ml-auto flex items-center gap-2">
               <button
@@ -1072,17 +1097,48 @@ function ChatMessage({
   text,
   segments,
   streaming,
+  durationMs,
+  images,
+  onInspectStep,
+  onInspectImage,
 }: {
   role: "user" | "agent";
   text: string;
   segments?: Segment[];
   /** True while this turn is still being produced — shows a "thinking…" marker. */
   streaming?: boolean;
+  /** How long the agent worked on this answer. */
+  durationMs?: number;
+  /** Photos attached to the message — clickable, open in the side panel. */
+  images?: db.StoredImage[];
+  /** Opens the inspection panel for a write/edit or run_command step. */
+  onInspectStep?: (step: db.AgentStepEvent) => void;
+  /** Opens the photo viewer panel. */
+  onInspectImage?: (image: db.StoredImage) => void;
 }) {
   if (role === "user") {
     return (
-      <div className="flex flex-col items-end">
-        <div className="max-w-[85%] rounded-xl border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2 text-left">
+      <div className="flex flex-col items-end gap-1.5">
+        {/* Attached photos render as thumbnails; a click opens the viewer. */}
+        {images && images.length > 0 && (
+          <div className="flex max-w-[85%] flex-wrap justify-end gap-2">
+            {images.map((img, i) => (
+              <button
+                key={i}
+                className="overflow-hidden rounded-lg border border-[var(--border)] transition-transform hover:scale-[1.02]"
+                onClick={() => onInspectImage?.(img)}
+                title={`View ${img.name}`}
+              >
+                <img
+                  src={img.data_url}
+                  alt={img.name}
+                  className="h-24 w-auto max-w-[180px] object-cover"
+                />
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="w-full rounded-xl border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2 text-left">
           <MessageBody text={text} />
         </div>
       </div>
@@ -1094,19 +1150,36 @@ function ChatMessage({
   if (segments && segments.length > 0) {
     return (
       <div className="flex flex-col gap-2">
-        <div className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">Agent</div>
+        <div className="flex items-center gap-2 text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
+          Agent
+          {/* How long this turn took — visible once the generation finished. */}
+          {!streaming && !!durationMs && durationMs > 0 && (
+            <span className="rounded-full bg-[var(--hover-bg)] px-1.5 py-0.5 font-mono text-[10px] normal-case tracking-normal text-[var(--text-dim)]" title="Generation time">
+              {formatDuration(durationMs)}
+            </span>
+          )}
+        </div>
         {segments.map((seg, i) => {
           const isLast = i === segments.length - 1;
           if (seg.kind === "step") {
+            const st = seg.step;
+            const hasChange = !!(st.path && st.new_text !== undefined && st.ok);
+            const isCommand = st.name === "run_command";
             return (
               <ToolCall
-                key={`s${seg.step.index}-${i}`}
+                key={`s${st.index}-${i}`}
                 call={{
-                  name: seg.step.name,
-                  input: seg.step.input,
-                  result: seg.step.result,
-                  ok: seg.step.ok,
-                  running: !seg.step.done,
+                  name: st.name,
+                  input: st.input,
+                  result: st.result,
+                  ok: st.ok,
+                  running: !st.done,
+                  hasChange,
+                  isCommand,
+                  onInspect:
+                    hasChange || isCommand
+                      ? () => onInspectStep?.(st)
+                      : undefined,
                 }}
               />
             );
@@ -1128,11 +1201,27 @@ function ChatMessage({
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">Agent</div>
+      <div className="flex items-center gap-2 text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
+        Agent
+        {!streaming && !!durationMs && durationMs > 0 && (
+          <span className="rounded-full bg-[var(--hover-bg)] px-1.5 py-0.5 font-mono text-[10px] normal-case tracking-normal text-[var(--text-dim)]" title="Generation time">
+            {formatDuration(durationMs)}
+          </span>
+        )}
+      </div>
       {/* Model output is markdown: headings, lists, tables and fenced code. */}
       <Markdown text={text} />
     </div>
   );
+}
+
+/** Compact generation time: 842ms / 12.4s / 2m 5s. */
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const m = Math.floor(ms / 60_000);
+  const s = Math.round((ms % 60_000) / 1000);
+  return `${m}m ${s}s`;
 }
 
 /* ---------- Shared menu bits ---------- */
@@ -1234,7 +1323,6 @@ function ModelSelector({
                           }}
                         >
                           <span className="font-mono">{m.name}</span>
-                          <span className="ml-auto text-[11px] text-[var(--text-dim)]">{m.meta}</span>
                         </button>
                       ))}
                     </motion.div>
@@ -1335,91 +1423,141 @@ function ProjectPicker({
   );
 }
 
-/* ---------- Speech-to-text (Web Speech API, provided by WebView2/Edge) ---------- */
-
-type SpeechRec = {
-  start: () => void;
-  stop: () => void;
-  abort: () => void;
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onresult: ((e: any) => void) | null;
-  onerror: ((e: any) => void) | null;
-  onend: (() => void) | null;
-};
-
-function getSpeechRecognition(): (new () => SpeechRec) | null {
-  const w = window as any;
-  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
-}
+/* ---------- Speech-to-text (MediaRecorder → Whisper endpoint) ---------- */
 
 /**
- * Microphone → text. Streams recognized speech into the caller via onText
- * (interim results are shown live, final results are appended).
+ * Microphone → text.
  *
- * Uses the Web Speech API, which is available in the WebView2 runtime. The
- * language follows the browser locale, with a sane default when it cannot be
- * detected.
+ * WebView2 (Tauri's Windows webview) has no Web Speech API, so `SpeechRecognition`
+ * is always undefined there and the old implementation silently did nothing.
+ * This records the mic with `MediaRecorder`, then hands the finished blob to the
+ * caller's `submit`, which posts it to an OpenAI-compatible
+ * `/audio/transcriptions` endpoint through Rust (`db.transcribeAudio`).
+ *
+ * `state`: `idle` → `recording` → `transcribing` → `idle`. `error` carries a
+ * short message when recording or transcription fails.
  */
-function useSpeechToText(onText: (chunk: string, isFinal: boolean) => void) {
-  const [listening, setListening] = useState(false);
-  const [supported] = useState(() => getSpeechRecognition() !== null);
-  const recRef = useRef<SpeechRec | null>(null);
-  const finalRef = useRef("");
-  const cbRef = useRef(onText);
-  cbRef.current = onText;
+function useDictation(submit: (blob: Blob) => Promise<string>) {
+  const [state, setState] = useState<"idle" | "recording" | "transcribing">("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [supported] = useState(
+    () => typeof navigator !== "undefined" && !!navigator.mediaDevices?.getUserMedia && typeof MediaRecorder !== "undefined"
+  );
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const chunksRef = useRef<BlobPart[]>([]);
+
+  const cleanup = () => {
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    recorderRef.current = null;
+    chunksRef.current = [];
+  };
 
   const stop = () => {
+    // Stopping the recorder fires `onstop`, which does the transcription.
     try {
-      recRef.current?.stop();
+      recorderRef.current?.stop();
     } catch {
       /* already stopped */
     }
-    setListening(false);
   };
 
-  const start = () => {
-    const Ctor = getSpeechRecognition();
-    if (!Ctor) return;
+  /** Drops the current recording without transcribing it. */
+  const cancel = () => {
+    const recorder = recorderRef.current;
+    if (recorder) recorder.onstop = null;
     try {
-      const rec = new Ctor();
-      rec.continuous = true;
-      rec.interimResults = true;
-      // Match the user's language, falling back to English.
-      rec.lang = navigator.language || "en-US";
-      finalRef.current = "";
-
-      rec.onresult = (e: any) => {
-        let interim = "";
-        for (let i = e.resultIndex; i < e.results.length; i++) {
-          const res = e.results[i];
-          const txt = res[0]?.transcript ?? "";
-          if (res.isFinal) {
-            finalRef.current += txt;
-            cbRef.current(txt.trim() ? txt : "", true);
-          } else {
-            interim += txt;
-          }
-        }
-        if (interim) cbRef.current(interim, false);
-      };
-      rec.onerror = () => {
-        setListening(false);
-      };
-      rec.onend = () => setListening(false);
-
-      rec.start();
-      recRef.current = rec;
-      setListening(true);
+      recorder?.stop();
     } catch {
-      setListening(false);
+      /* already stopped */
+    }
+    cleanup();
+    setState("idle");
+  };
+
+  const start = async () => {
+    if (!supported) {
+      setError("Microphone is unavailable in this environment");
+      return;
+    }
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      // Pick a codec the platform actually records with; WebView2 supports webm/opus.
+      const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find(
+        (m) => MediaRecorder.isTypeSupported?.(m)
+      );
+      const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      recorderRef.current = recorder;
+      chunksRef.current = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data);
+      };
+      recorder.onerror = () => {
+        setError("Recording failed");
+        setState("idle");
+        cleanup();
+      };
+      recorder.onstop = async () => {
+        const blob = new Blob(chunksRef.current, { type: mime || "audio/webm" });
+        cleanup();
+        if (blob.size === 0) {
+          setState("idle");
+          setError("Nothing was recorded");
+          return;
+        }
+        setState("transcribing");
+        try {
+          const text = await submit(blob);
+          if (text.trim()) {
+            dictationResultRef.current?.(text.trim());
+          }
+          setError(null);
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+        } finally {
+          setState("idle");
+        }
+      };
+
+      recorder.start();
+      setState("recording");
+    } catch (e) {
+      cleanup();
+      setState("idle");
+      setError(
+        e instanceof DOMException && e.name === "NotAllowedError"
+          ? "Microphone permission denied"
+          : e instanceof Error
+            ? e.message
+            : String(e)
+      );
     }
   };
 
-  useEffect(() => () => recRef.current?.abort?.(), []);
+  // Lets the caller feed the final text into the prompt without re-rendering
+  // the hook on every keystroke.
+  const dictationResultRef = useRef<((text: string) => void) | null>(null);
 
-  return { listening, supported, start, stop, toggle: () => (listening ? stop() : start()) };
+  useEffect(() => () => cleanup(), []);
+
+  return {
+    state,
+    listening: state === "recording",
+    transcribing: state === "transcribing",
+    supported,
+    error,
+    start,
+    stop,
+    cancel,
+    toggle: () => (state === "recording" ? stop() : void start()),
+    setOnResult: (fn: (text: string) => void) => {
+      dictationResultRef.current = fn;
+    },
+  };
 }
 
 /* ---------- Effort selector ---------- */
@@ -1509,6 +1647,9 @@ function PromptBox({
   centered,
   busy,
   onStop,
+  onTranscribe,
+  pickedModel,
+  onPickModel,
 }: {
   onSend: (
     text: string,
@@ -1523,6 +1664,12 @@ function PromptBox({
   /** True while this conversation's generation is running — Send becomes Stop. */
   busy?: boolean;
   onStop?: () => void;
+  /** Transcribes a recorded mic blob using the selected provider's endpoint. */
+  onTranscribe?: (gatewayId: string, blob: Blob) => Promise<string>;
+  /** Model chosen earlier — restored so the chat remembers its model. */
+  pickedModel?: { gatewayId: string; modelId: string } | null;
+  /** Reports the model the user picked, so it can be persisted. */
+  onPickModel?: (next: { gatewayId: string; modelId: string }) => void;
 }) {
   const [text, setText] = useState("");
   const [gatewayId, setGatewayId] = useState("");
@@ -1540,18 +1687,33 @@ function PromptBox({
 
   // Keep the selection pointed at a model that actually exists: the provider
   // list is loaded from the database and changes as providers are connected.
+  // The model picked in an earlier session wins when it is still available.
   useEffect(() => {
     const usable = gateways.filter((g) => g.models.length > 0);
     const current = usable.find(
       (g) => g.id === gatewayId && g.models.some((m) => m.id === modelId)
     );
     if (current) return;
+
+    const saved = pickedModel
+      ? usable.find(
+          (g) =>
+            g.id === pickedModel.gatewayId &&
+            g.models.some((m) => m.id === pickedModel.modelId)
+        )
+      : undefined;
+    if (saved) {
+      setGatewayId(saved.id);
+      setModelId(pickedModel!.modelId);
+      return;
+    }
+
     const first = usable[0];
     if (first) {
       setGatewayId(first.id);
       setModelId(first.models[0].id);
     }
-  }, [gateways, gatewayId, modelId]);
+  }, [gateways, gatewayId, modelId, pickedModel]);
 
   const autoGrow = () => {
     const el = ref.current;
@@ -1560,11 +1722,19 @@ function PromptBox({
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   };
 
-  const speech = useSpeechToText((chunk, isFinal) => {
-    if (!isFinal) return; // interim text is handled below via preview
-    setText((prev) => `${prev}${prev && !prev.endsWith(" ") ? " " : ""}${chunk.trim()}`);
-    requestAnimationFrame(autoGrow);
+  // Dictation: record the mic, transcribe through the selected provider's
+  // Whisper-compatible endpoint, and append the text to the prompt.
+  const speech = useDictation(async (blob) => {
+    if (!onTranscribe) throw new Error("Dictation needs a connected provider");
+    return onTranscribe(gatewayId, blob);
   });
+
+  useEffect(() => {
+    speech.setOnResult((text) => {
+      setText((prev) => `${prev}${prev && !prev.endsWith(" ") ? " " : ""}${text}`);
+      requestAnimationFrame(autoGrow);
+    });
+  }, [gatewayId]);
 
   const toggleMic = () => {
     if (speech.listening) speech.stop();
@@ -1623,7 +1793,8 @@ function PromptBox({
   const send = () => {
     // A prompt can be just attachments — that is a legitimate request.
     if (!text.trim() && attachments.length === 0) return;
-    speech.stop();
+    // Sending cancels an in-flight recording instead of transcribing it.
+    speech.cancel();
     onSend(text.trim(), { gatewayId, modelId, effort }, attachments);
     setText("");
     setAttachments([]);
@@ -1690,8 +1861,10 @@ function PromptBox({
             </div>
           )}
 
-          {notice && (
-            <div className="px-4 pt-2 text-[11px] text-[var(--diff-del)]">{notice}</div>
+          {(notice || speech.error) && (
+            <div className="px-4 pt-2 text-[11px] text-[var(--diff-del)]">
+              {notice || speech.error}
+            </div>
           )}
           {dragging && (
             <div className="px-4 pt-2 text-[12px] text-[var(--accent)]">
@@ -1731,6 +1904,8 @@ function PromptBox({
                 onSelect={(g, m) => {
                   setGatewayId(g);
                   setModelId(m);
+                  // Remember the choice so the next launch restores it.
+                  onPickModel?.({ gatewayId: g, modelId: m });
                 }}
               />
               <span
@@ -1764,24 +1939,32 @@ function PromptBox({
               >
                 <Paperclip size={14} strokeWidth={1.5} />
               </button>
-              {/* Mic: 28×28, icon 15 — live speech-to-text while active */}
+              {/* Mic: records audio, then transcribes it via the provider. */}
               <button
                 className={`relative flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
                   speech.listening
                     ? "bg-[var(--diff-del)]/15 text-[var(--diff-del)]"
-                    : "text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                    : speech.transcribing
+                      ? "bg-[var(--accent)]/15 text-[var(--accent)]"
+                      : "text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
                 } ${speech.supported ? "" : "cursor-not-allowed opacity-40"}`}
                 onClick={toggleMic}
-                disabled={!speech.supported}
+                disabled={!speech.supported || speech.transcribing}
                 title={
-                  speech.supported
-                    ? speech.listening
-                      ? "Stop dictation"
-                      : "Dictate with microphone"
-                    : "Speech recognition is unavailable"
+                  !speech.supported
+                    ? "Microphone is unavailable"
+                    : speech.transcribing
+                      ? "Transcribing…"
+                      : speech.listening
+                        ? "Stop recording"
+                        : "Dictate with microphone"
                 }
               >
-                <Mic size={15} strokeWidth={1.5} />
+                {speech.transcribing ? (
+                  <Loader2 size={15} strokeWidth={1.5} className="animate-spin" />
+                ) : (
+                  <Mic size={15} strokeWidth={1.5} />
+                )}
                 {speech.listening && (
                   <motion.span
                     className="absolute inset-0 rounded-md border border-[var(--diff-del)]"
@@ -2065,17 +2248,24 @@ function NewProjectModal({
   );
 }
 
+/** Per-project command permission choices. */
+const PERM_MODES: Array<{ id: PermMode; label: string; hint: string }> = [
+  { id: "bypass", label: "Bypass all", hint: "Run commands right away, never ask" },
+  { id: "default", label: "As default", hint: "Use the global setting" },
+  { id: "ask", label: "Always ask", hint: "Ask before every command" },
+];
+
 /** Per-project settings: rename, execution permission, delete. */
 function ProjectSettingsModal({
   project,
   onRename,
-  onToggleAutoRun,
+  onPermMode,
   onDelete,
   onClose,
 }: {
   project: Project | null;
   onRename: (oldName: string, newName: string) => Promise<void>;
-  onToggleAutoRun: (name: string, autoRun: boolean) => Promise<void>;
+  onPermMode: (name: string, mode: PermMode) => Promise<void>;
   onDelete: (name: string) => Promise<void>;
   onClose: () => void;
 }) {
@@ -2129,29 +2319,48 @@ function ProjectSettingsModal({
           </div>
         )}
 
-        <div className="flex items-start gap-3 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2.5">
-          <Shield size={16} className="mt-0.5 shrink-0 text-[var(--text-muted)]" />
-          <div className="flex flex-1 flex-col gap-0.5">
-            <span className="text-[12px] font-medium text-[var(--text-main)]">
-              Run commands without asking
-            </span>
-            <span className="text-[11px] text-[var(--text-dim)]">
-              Off: the agent asks before every command. On: it executes right away.
-            </span>
+        {/* Command permission: three explicit modes instead of a boolean. */}
+        <div className="flex flex-col gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2.5">
+          <div className="flex items-start gap-2">
+            <Shield size={16} className="mt-0.5 shrink-0 text-[var(--text-muted)]" />
+            <div className="flex flex-1 flex-col gap-0.5">
+              <span className="text-[12px] font-medium text-[var(--text-main)]">
+                Command permission
+              </span>
+              <span className="text-[11px] text-[var(--text-dim)]">
+                Who decides whether the agent may run shell commands in this project.
+              </span>
+            </div>
           </div>
-          <button
-            className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
-              project.autoRun ? "bg-[var(--accent)]" : "bg-[var(--bg-elevated)]"
-            }`}
-            onClick={() => void onToggleAutoRun(project.name, !project.autoRun)}
-            title="Toggle auto-run"
-          >
-            <span
-              className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
-                project.autoRun ? "left-[18px]" : "left-0.5"
-              }`}
-            />
-          </button>
+          <div className="flex flex-col gap-1.5 pl-6">
+            {PERM_MODES.map((m) => (
+              <button
+                key={m.id}
+                className={`flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-left transition-colors ${
+                  (project.permMode ?? "default") === m.id
+                    ? "border-[var(--accent)] bg-[var(--accent)]/10"
+                    : "border-[var(--border)] hover:bg-[var(--hover-bg)]"
+                }`}
+                onClick={() => void onPermMode(project.name, m.id)}
+              >
+                <span
+                  className={`flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border ${
+                    (project.permMode ?? "default") === m.id
+                      ? "border-[var(--accent)]"
+                      : "border-[var(--text-dim)]"
+                  }`}
+                >
+                  {(project.permMode ?? "default") === m.id && (
+                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
+                  )}
+                </span>
+                <span className="flex flex-col">
+                  <span className="text-[12px] font-medium text-[var(--text-main)]">{m.label}</span>
+                  <span className="text-[10px] text-[var(--text-dim)]">{m.hint}</span>
+                </span>
+              </button>
+            ))}
+          </div>
         </div>
 
         {confirming ? (
@@ -2263,6 +2472,8 @@ function SettingsModal({
   persistent,
   onProvidersChanged,
   onModelsChanged,
+  globalAutoRun,
+  onGlobalAutoRun,
   onClose,
 }: {
   theme: Theme;
@@ -2274,6 +2485,8 @@ function SettingsModal({
   persistent: boolean;
   onProvidersChanged: (next: Provider[]) => void;
   onModelsChanged: (next: Model[]) => void;
+  globalAutoRun: boolean;
+  onGlobalAutoRun: (next: boolean) => void;
   onClose: () => void;
 }) {
   const [section, setSection] = useState<SettingsSection>("general");
@@ -2283,6 +2496,33 @@ function SettingsModal({
   const [autonomy, setAutonomy] = useState("Medium");
   const [stopOnError, setStopOnError] = useState(true);
   const [name, setName] = useState("");
+
+  /** Every settings value is persisted to SQLite on edit and restored on open,
+   * so nothing the user configures here is lost between launches. */
+  const persistSetting = (key: string, value: string) => {
+    void db.setSetting(key, value);
+  };
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const entries = await Promise.all([
+        db.getSetting("send_mode"),
+        db.getSetting("turbo_mode"),
+        db.getSetting("review_policy"),
+        db.getSetting("autonomy"),
+        db.getSetting("stop_on_error"),
+      ]);
+      if (cancelled) return;
+      if (entries[0]) setSendMode(entries[0]);
+      if (entries[1]) setTurboMode(entries[1]);
+      if (entries[2]) setReviewPolicy(entries[2]);
+      if (entries[3]) setAutonomy(entries[3]);
+      if (entries[4] !== null) setStopOnError(entries[4] === "1");
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -2393,7 +2633,14 @@ function SettingsModal({
               </SettingRow>
               <Sep />
               <SettingRow title="Send Behavior" hint="How submitted prompts are handled">
-                <Segmented options={["Queue", "Send Immediately"]} value={sendMode} onChange={setSendMode} />
+                <Segmented
+                  options={["Queue", "Send Immediately"]}
+                  value={sendMode}
+                  onChange={(v) => {
+                    setSendMode(v);
+                    persistSetting("send_mode", v);
+                  }}
+                />
               </SettingRow>
             </SettingsCard>
           )}
@@ -2411,7 +2658,14 @@ function SettingsModal({
           {section === "execution" && (
             <SettingsCard>
               <SettingRow title="Run Mode" hint="Auto-pilot vs supervised execution">
-                <select className={SSELECT} value={turboMode} onChange={(e) => setTurboMode(e.target.value)}>
+                <select
+                  className={SSELECT}
+                  value={turboMode}
+                  onChange={(e) => {
+                    setTurboMode(e.target.value);
+                    persistSetting("turbo_mode", e.target.value);
+                  }}
+                >
                   <option>Turbo Mode</option>
                   <option>Safe Mode</option>
                 </select>
@@ -2421,7 +2675,10 @@ function SettingsModal({
                 <select
                   className={SSELECT}
                   value={reviewPolicy}
-                  onChange={(e) => setReviewPolicy(e.target.value)}
+                  onChange={(e) => {
+                    setReviewPolicy(e.target.value);
+                    persistSetting("review_policy", e.target.value);
+                  }}
                 >
                   <option>Always Ask</option>
                   <option>Auto-accept</option>
@@ -2438,7 +2695,14 @@ function SettingsModal({
           {section === "behavior" && (
             <SettingsCard>
               <SettingRow title="Autonomy Level" hint="How much freedom agents get">
-                <Segmented options={["Low", "Medium", "High"]} value={autonomy} onChange={setAutonomy} />
+                <Segmented
+                  options={["Low", "Medium", "High"]}
+                  value={autonomy}
+                  onChange={(v) => {
+                    setAutonomy(v);
+                    persistSetting("autonomy", v);
+                  }}
+                />
               </SettingRow>
               <Sep />
               <SettingRow title="Stop on Error" hint="Halt the pipeline when a step fails">
@@ -2446,12 +2710,17 @@ function SettingsModal({
                   className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
                     stopOnError ? "bg-[var(--accent)]" : "bg-[var(--bg-elevated)]"
                   }`}
-                  onClick={() => setStopOnError(!stopOnError)}
+                  onClick={() => {
+                    const next = !stopOnError;
+                    setStopOnError(next);
+                    persistSetting("stop_on_error", next ? "1" : "0");
+                  }}
                   aria-label="toggle"
                 >
+                  {/* The knob is anchored left so it never overflows the track. */}
                   <span
-                    className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform ${
-                      stopOnError ? "translate-x-[18px]" : "translate-x-0.5"
+                    className={`absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
+                      stopOnError ? "translate-x-[16px]" : "translate-x-0"
                     }`}
                   />
                 </button>
@@ -2461,11 +2730,23 @@ function SettingsModal({
 
           {section === "permissions" && (
             <SettingsCard>
-              <SettingRow title="Tool Permissions">
-                <span className="inline-flex h-[18px] items-center rounded-full bg-[var(--bg-elevated)] px-1.5 text-[11px] text-[var(--text-muted)]">
-                  59
-                </span>
-                <button className={`${SBUTTON} ml-2`}>Manage</button>
+              <SettingRow
+                title="Run Commands Without Asking"
+                hint="Global default for projects set to “As default”"
+              >
+                <button
+                  className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
+                    globalAutoRun ? "bg-[var(--accent)]" : "bg-[var(--bg-elevated)]"
+                  }`}
+                  onClick={() => onGlobalAutoRun(!globalAutoRun)}
+                  aria-label="toggle global auto-run"
+                >
+                  <span
+                    className={`absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
+                      globalAutoRun ? "translate-x-[16px]" : "translate-x-0"
+                    }`}
+                  />
+                </button>
               </SettingRow>
               <Sep />
               <SettingRow title="Filesystem Access" hint="Scope of writable paths">
@@ -2586,26 +2867,158 @@ function collectSteps(msgs: Msg[]): db.AgentStepEvent[] {
   return out;
 }
 
+/** Turns a stored row back into a renderable message (duration + photos). */
+function storedToMsg(m: db.StoredMessage): Msg {
+  let images: db.StoredImage[] | undefined;
+  if (m.images && m.images !== "[]") {
+    try {
+      const parsed = JSON.parse(m.images);
+      if (Array.isArray(parsed) && parsed.length) images = parsed as db.StoredImage[];
+    } catch {
+      /* stored before images existed — ignore */
+    }
+  }
+  return {
+    role: m.role,
+    text: m.text,
+    durationMs: m.duration_ms ?? undefined,
+    images,
+  };
+}
+
+/** Renders a file's diff, reused by the list and the focused view. */
+function FileDiffBody({ step }: { step: db.AgentStepEvent }) {
+  const lines = computeDiff(step.old_text ?? "", step.new_text ?? "");
+  return (
+    <div className="overflow-auto bg-[var(--bg-app)] font-mono text-[11px] leading-[1.55]">
+      {lines.map((l, i) => (
+        <div
+          key={i}
+          className={`flex whitespace-pre-wrap break-all px-1.5 ${
+            l.kind === "add"
+              ? "diff-line--add"
+              : l.kind === "del"
+                ? "diff-line--del"
+                : l.kind === "hunk"
+                  ? "bg-[var(--bg-surface)] py-0.5 text-[var(--text-dim)]"
+                  : "text-[var(--text-muted)]"
+          }`}
+        >
+          <span className="w-4 shrink-0 select-none text-center text-[var(--text-dim)]">
+            {l.kind === "add" ? "+" : l.kind === "del" ? "−" : l.kind === "hunk" ? "⋯" : ""}
+          </span>
+          <span className="w-8 shrink-0 select-none text-right text-[var(--text-dim)]">
+            {l.kind === "add"
+              ? l.newNo
+              : l.kind === "del"
+                ? l.oldNo
+                : l.kind === "ctx"
+                  ? l.newNo
+                  : ""}
+          </span>
+          <span className="ml-1.5 min-w-0">{l.text || " "}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function InspectionPanel({
-  mode,
+  panel,
   msgs,
+  onNavigate,
   onClose,
 }: {
-  mode: "changes" | "commands";
+  panel: PanelState;
   msgs: Msg[];
+  /** Switch the panel to another file/command without closing it. */
+  onNavigate: (next: PanelState) => void;
   onClose: () => void;
 }) {
   const steps = collectSteps(msgs);
+  // Hooks must run unconditionally, so the list-view state lives above the
+  // image early-return even though only the list views use it.
   const [openFile, setOpenFile] = useState<string | null>(null);
   const [openCmd, setOpenCmd] = useState<number | null>(null);
 
+  if (panel.kind === "image") {
+    return (
+      <motion.aside
+        className="flex h-full w-[340px] shrink-0 flex-col border-l border-[var(--border)] bg-[var(--bg-main)]"
+        initial={{ opacity: 0, x: 24 }}
+        animate={{ opacity: 1, x: 0 }}
+        exit={{ opacity: 0, x: 24 }}
+        transition={{ duration: 0.18, ease: "easeOut" }}
+      >
+        <div className="flex items-center gap-2 border-b border-[var(--border)] px-4 py-3">
+          <ImageIcon size={15} className="text-[var(--text-dim)]" />
+          <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-[var(--text-main)]">
+            {panel.image.name}
+          </span>
+          <button
+            className="ml-auto rounded-md p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+            onClick={onClose}
+            title="Close panel"
+          >
+            <X size={15} />
+          </button>
+        </div>
+        <div className="flex min-h-0 flex-1 items-start justify-center overflow-auto p-3">
+          <img
+            src={panel.image.data_url}
+            alt={panel.image.name}
+            className="max-w-full rounded-lg border border-[var(--border)] object-contain"
+          />
+        </div>
+      </motion.aside>
+    );
+  }
+
+  const mode = panel.kind;
   const changes = steps.filter((s) => s.done && s.ok && s.path && s.new_text !== undefined);
   // Latest change per file wins — the panel shows the net result of the run.
   const byFile = new Map<string, db.AgentStepEvent>();
   for (const c of changes) byFile.set(c.path!, c);
   const files = [...byFile.entries()];
-
   const commands = steps.filter((s) => s.name === "run_command");
+
+  // Focused views: one file's diff, or one command's output.
+  const focusFile = panel.kind === "changes" && panel.file ? byFile.get(panel.file) : undefined;
+  const focusCmd =
+    panel.kind === "commands" && panel.stepIndex !== undefined
+      ? commands.find((c) => c.index === panel.stepIndex)
+      : undefined;
+
+  const header = (
+    <div className="flex items-center gap-2 border-b border-[var(--border)] px-4 py-3">
+      {mode === "changes" ? <FileDiff size={15} className="text-[var(--text-dim)]" /> : <Terminal size={15} className="text-[var(--text-dim)]" />}
+      <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-[var(--text-main)]">
+        {mode === "changes"
+          ? focusFile
+            ? focusFile.path!.split(/[\\/]/).pop()
+            : "Changes"
+          : focusCmd
+            ? "Command"
+            : "Commands"}
+      </span>
+      {(focusFile || focusCmd) && (
+        <button
+          className="rounded-md p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+          onClick={() => onNavigate({ kind: mode })}
+          title="Back to the list"
+        >
+          <ChevronRight size={15} className="rotate-180" />
+        </button>
+      )}
+      <button
+        className="rounded-md p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+        onClick={onClose}
+        title="Close panel"
+      >
+        <X size={15} />
+      </button>
+    </div>
+  );
 
   return (
     <motion.aside
@@ -2615,148 +3028,123 @@ function InspectionPanel({
       exit={{ opacity: 0, x: 24 }}
       transition={{ duration: 0.18, ease: "easeOut" }}
     >
-      <div className="flex items-center gap-2 border-b border-[var(--border)] px-4 py-3">
-        {mode === "changes" ? <FileDiff size={15} /> : <Terminal size={15} />}
-        <span className="text-[13px] font-semibold text-[var(--text-main)]">
-          {mode === "changes" ? "Changes" : "Commands"}
-        </span>
-        <span className="rounded-full bg-[var(--hover-bg)] px-2 py-0.5 font-mono text-[11px] text-[var(--text-dim)]">
-          {mode === "changes" ? files.length : commands.length}
-        </span>
-        <button
-          className="ml-auto rounded-md p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-          onClick={onClose}
-          title="Close panel"
-        >
-          <X size={15} />
-        </button>
-      </div>
+      {header}
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-2">
-        {mode === "changes" && files.length === 0 && (
-          <p className="px-2 py-6 text-center text-[12px] text-[var(--text-dim)]">
-            No file changes in this conversation yet.
-          </p>
-        )}
-        {mode === "changes" &&
-          files.map(([path, step]) => {
-            const stats = diffStats(step.old_text ?? "", step.new_text ?? "");
-            const open = openFile === path;
-            const lines = open ? computeDiff(step.old_text ?? "", step.new_text ?? "") : [];
-            return (
-              <div key={path} className="mb-1.5 overflow-hidden rounded-lg border border-[var(--border)]">
-                <button
-                  className="flex w-full items-center gap-2 bg-[var(--bg-surface)] px-2.5 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
-                  onClick={() => setOpenFile(open ? null : path)}
-                >
-                  {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                  <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-[var(--text-main)]">
-                    {path.split(/[\\/]/).pop()}
-                  </span>
-                  <span className="shrink-0 font-mono text-[11px] text-[var(--diff-add)]">+{stats.added}</span>
-                  <span className="shrink-0 font-mono text-[11px] text-[var(--diff-del)]">-{stats.removed}</span>
-                </button>
-                {!open && (
-                  <div className="truncate border-t border-[var(--border)] px-2.5 py-1 font-mono text-[10px] text-[var(--text-dim)]">
-                    {path}
-                  </div>
-                )}
-                <AnimatePresence initial={false}>
-                  {open && (
-                    <motion.div
-                      initial={{ height: 0, opacity: 0 }}
-                      animate={{ height: "auto", opacity: 1 }}
-                      exit={{ height: 0, opacity: 0 }}
-                      transition={{ duration: 0.15, ease: "easeOut" }}
-                      className="overflow-hidden"
-                    >
-                      <div className="truncate border-b border-[var(--border)] bg-[var(--bg-surface)] px-2.5 py-1 font-mono text-[10px] text-[var(--text-dim)]">
-                        {path}
-                      </div>
-                      <div className="max-h-[320px] overflow-auto bg-[var(--bg-app)] font-mono text-[11px] leading-[1.55]">
-                        {lines.map((l, i) => (
-                          <div
-                            key={i}
-                            className={`flex whitespace-pre-wrap break-all px-1.5 ${
-                              l.kind === "add"
-                                ? "diff-line--add"
-                                : l.kind === "del"
-                                  ? "diff-line--del"
-                                  : l.kind === "hunk"
-                                    ? "bg-[var(--bg-surface)] py-0.5 text-[var(--text-dim)]"
-                                    : "text-[var(--text-muted)]"
-                            }`}
-                          >
-                            <span className="w-4 shrink-0 select-none text-center text-[var(--text-dim)]">
-                              {l.kind === "add" ? "+" : l.kind === "del" ? "−" : l.kind === "hunk" ? "⋯" : ""}
-                            </span>
-                            <span className="w-8 shrink-0 select-none text-right text-[var(--text-dim)]">
-                              {l.kind === "add"
-                                ? l.newNo
-                                : l.kind === "del"
-                                  ? l.oldNo
-                                  : l.kind === "ctx"
-                                    ? l.newNo
-                                    : ""}
-                            </span>
-                            <span className="ml-1.5 min-w-0">{l.text || " "}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </div>
-            );
-          })}
+      {/* Focused diff of a single file. */}
+      {mode === "changes" && focusFile && (
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <div className="truncate border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 py-1.5 font-mono text-[10px] text-[var(--text-dim)]">
+            {focusFile.path}
+          </div>
+          <div className="h-[calc(100%-25px)] overflow-auto">
+            <FileDiffBody step={focusFile} />
+          </div>
+        </div>
+      )}
 
-        {mode === "commands" && commands.length === 0 && (
-          <p className="px-2 py-6 text-center text-[12px] text-[var(--text-dim)]">
-            No commands have run in this conversation yet.
-          </p>
-        )}
-        {mode === "commands" &&
-          commands.map((c, i) => {
-            const open = openCmd === i;
-            return (
-              <div key={i} className="mb-1.5 overflow-hidden rounded-lg border border-[var(--border)]">
-                <button
-                  className="flex w-full items-center gap-2 bg-[var(--bg-surface)] px-2.5 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
-                  onClick={() => setOpenCmd(open ? null : i)}
-                >
-                  {c.done ? (
-                    c.ok ? (
-                      <Check size={13} className="shrink-0 text-[var(--diff-add)]" />
+      {/* Focused output of a single command. */}
+      {mode === "commands" && focusCmd && (
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <code className="block truncate border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 py-1.5 font-mono text-[11px] text-[var(--text-main)]">
+            {focusCmd.input}
+          </code>
+          <pre className="h-[calc(100%-33px)] overflow-auto whitespace-pre-wrap break-all bg-[var(--bg-app)] px-3 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
+            {focusCmd.done ? focusCmd.result : "running…"}
+          </pre>
+        </div>
+      )}
+
+      {/* List views (panel opened without a focus). */}
+      {((mode === "changes" && !focusFile) || (mode === "commands" && !focusCmd)) && (
+        <div className="min-h-0 flex-1 overflow-y-auto p-2">
+          {mode === "changes" && files.length === 0 && (
+            <p className="px-2 py-6 text-center text-[12px] text-[var(--text-dim)]">
+              No file changes in this conversation yet.
+            </p>
+          )}
+          {mode === "changes" &&
+            files.map(([path, step]) => {
+              const stats = diffStats(step.old_text ?? "", step.new_text ?? "");
+              const open = openFile === path;
+              return (
+                <div key={path} className="mb-1.5 overflow-hidden rounded-lg border border-[var(--border)]">
+                  <button
+                    className="flex w-full items-center gap-2 bg-[var(--bg-surface)] px-2.5 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
+                    onClick={() => setOpenFile(open ? null : path)}
+                    onDoubleClick={() => onNavigate({ kind: "changes", file: path })}
+                  >
+                    {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                    <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-[var(--text-main)]">
+                      {path.split(/[\\/]/).pop()}
+                    </span>
+                    <span className="shrink-0 font-mono text-[11px] text-[var(--diff-add)]">+{stats.added}</span>
+                    <span className="shrink-0 font-mono text-[11px] text-[var(--diff-del)]">-{stats.removed}</span>
+                  </button>
+                  <AnimatePresence initial={false}>
+                    {open && (
+                      <motion.div
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: "auto", opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={{ duration: 0.15, ease: "easeOut" }}
+                        className="max-h-[320px] overflow-hidden"
+                      >
+                        <FileDiffBody step={step} />
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              );
+            })}
+
+          {mode === "commands" && commands.length === 0 && (
+            <p className="px-2 py-6 text-center text-[12px] text-[var(--text-dim)]">
+              No commands have run in this conversation yet.
+            </p>
+          )}
+          {mode === "commands" &&
+            commands.map((c, i) => {
+              const open = openCmd === i;
+              return (
+                <div key={i} className="mb-1.5 overflow-hidden rounded-lg border border-[var(--border)]">
+                  <button
+                    className="flex w-full items-center gap-2 bg-[var(--bg-surface)] px-2.5 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
+                    onClick={() => setOpenCmd(open ? null : i)}
+                  >
+                    {c.done ? (
+                      c.ok ? (
+                        <Check size={13} className="shrink-0 text-[var(--diff-add)]" />
+                      ) : (
+                        <X size={13} className="shrink-0 text-[var(--diff-del)]" />
+                      )
                     ) : (
-                      <X size={13} className="shrink-0 text-[var(--diff-del)]" />
-                    )
-                  ) : (
-                    <Loader2 size={13} className="shrink-0 animate-spin text-[var(--accent)]" />
-                  )}
-                  <code className="min-w-0 flex-1 truncate font-mono text-[12px] text-[var(--text-main)]">
-                    {c.input}
-                  </code>
-                  {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                </button>
-                <AnimatePresence initial={false}>
-                  {open && (
-                    <motion.div
-                      initial={{ height: 0, opacity: 0 }}
-                      animate={{ height: "auto", opacity: 1 }}
-                      exit={{ height: 0, opacity: 0 }}
-                      transition={{ duration: 0.15, ease: "easeOut" }}
-                      className="overflow-hidden"
-                    >
-                      <pre className="max-h-[280px] overflow-auto whitespace-pre-wrap break-all border-t border-[var(--border)] bg-[var(--bg-app)] px-2.5 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
-                        {c.done ? c.result : "running…"}
-                      </pre>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </div>
-            );
-          })}
-      </div>
+                      <Loader2 size={13} className="shrink-0 animate-spin text-[var(--accent)]" />
+                    )}
+                    <code className="min-w-0 flex-1 truncate font-mono text-[12px] text-[var(--text-main)]">
+                      {c.input}
+                    </code>
+                    {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                  </button>
+                  <AnimatePresence initial={false}>
+                    {open && (
+                      <motion.div
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: "auto", opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={{ duration: 0.15, ease: "easeOut" }}
+                        className="overflow-hidden"
+                      >
+                        <pre className="max-h-[280px] overflow-auto whitespace-pre-wrap break-all border-t border-[var(--border)] bg-[var(--bg-app)] px-2.5 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
+                          {c.done ? c.result : "running…"}
+                        </pre>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              );
+            })}
+        </div>
+      )}
     </motion.aside>
   );
 }
@@ -2780,9 +3168,14 @@ export default function App() {
   /** convId → requestId of the generation currently running for it. */
   const [activeRuns, setActiveRuns] = useState<Record<string, string>>({});
   /** Right inspection panel of the chat view. */
-  const [panel, setPanel] = useState<"none" | "changes" | "commands">("none");
+  const [panel, setPanel] = useState<PanelState>({ kind: "none" });
   const [sidebarWidth, setSidebarWidth] = useState(240);
-  const [theme, setTheme] = useState<Theme>("dark");
+  const [theme, setThemeState] = useState<Theme>("dark");
+  /** Every settings edit is persisted, so edits survive a relaunch. */
+  const setTheme = useCallback((t: Theme) => {
+    setThemeState(t);
+    void db.setSetting("theme", t);
+  }, []);
   /** Workspace tree — hydrated from SQLite on mount. */
   const [projects, setProjects] = useState<Project[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
@@ -2802,6 +3195,12 @@ export default function App() {
   );
   /** When off, prompts are answered by plain chat with no tool access. */
   const [agentMode] = useState(() => localStorage.getItem("agent_mode") !== "off");
+  /** Global command permission — the default for projects set to "As default". */
+  const [globalAutoRun, setGlobalAutoRun] = useState(false);
+  /** Last picked model, restored on launch so the chat remembers its choice. */
+  const [pickedModel, setPickedModel] = useState<{ gatewayId: string; modelId: string } | null>(
+    null
+  );
   /** Commands waiting for Allow/Deny, keyed by run id — a background run's
    * request survives navigation and shows again when the chat is opened. */
   const [confirmReqs, setConfirmReqs] = useState<Record<string, db.ConfirmRequest>>({});
@@ -2817,18 +3216,6 @@ export default function App() {
   const confirmReq = streaming ? confirmReqs[activeRuns[activeConv!.id]] ?? null : null;
   /** Ids of conversations with a live run — drives the sidebar pulse. */
   const runningConvIds = Object.keys(activeRuns);
-
-  /** Counts for the header badges: distinct files changed / commands run. */
-  const { changeCount, commandCount } = useMemo(() => {
-    const steps = collectSteps(draftMsgs);
-    const files = new Set<string>();
-    let cmds = 0;
-    for (const s of steps) {
-      if (s.done && s.ok && s.path && s.new_text !== undefined) files.add(s.path);
-      if (s.name === "run_command") cmds++;
-    }
-    return { changeCount: files.size, commandCount: cmds };
-  }, [draftMsgs]);
 
   /** Writes to a specific conversation's buffer; safe for background runs. */
   const updateConvMsgs = useCallback((key: string, updater: (prev: Msg[]) => Msg[]) => {
@@ -2878,6 +3265,25 @@ export default function App() {
       ]);
       if (cancelled) return;
 
+      // Restore user settings persisted in SQLite (falls back to localStorage
+      // values from older versions, then to defaults).
+      const [globalAuto, picked, savedTheme] = await Promise.all([
+        db.getSetting("global_auto_run"),
+        db.getSetting("picked_model"),
+        db.getSetting("theme"),
+      ]);
+      if (!cancelled && globalAuto !== null) setGlobalAutoRun(globalAuto === "1");
+      if (!cancelled && savedTheme && THEMES.includes(savedTheme as Theme)) {
+        setThemeState(savedTheme as Theme);
+      }
+      if (!cancelled && picked) {
+        try {
+          setPickedModel(JSON.parse(picked));
+        } catch {
+          /* malformed — keep null and let the picker choose */
+        }
+      }
+
       // Outside Tauri the DB is unavailable; start clean — only the bucket for
       // loose chats, no demo projects, providers or models.
       const nextProjects = loadedProjects.length ? loadedProjects : [NO_PROJECT_ENTRY];
@@ -2899,7 +3305,7 @@ export default function App() {
         if (!cancelled && stored.length) {
           setConvMsgs((prev) => ({
             ...prev,
-            [conv.id]: stored.map((m) => ({ role: m.role, text: m.text })),
+            [conv.id]: stored.map(storedToMsg),
           }));
         }
       }
@@ -2947,7 +3353,7 @@ export default function App() {
   const openConversation = async (project: string, id: string) => {
     setActiveConv({ project, id });
     setView("chat");
-    setPanel("none");
+    setPanel({ kind: "none" });
     // A live run owns its buffer — loading over it would wipe the streaming
     // turn. Stored messages already arrived before the run started.
     if (activeRuns[id]) return;
@@ -2955,17 +3361,46 @@ export default function App() {
     const stored = await db.loadMessages(id);
     setConvMsgs((prev) => ({
       ...prev,
-      [id]: stored.map((m) => ({ role: m.role, text: m.text })),
+      [id]: stored.map(storedToMsg),
     }));
   };
 
   /** Providers grouped with their models — feeds the model picker. */
   const gateways = useMemo(() => toGateways(providers, models), [providers, models]);
 
+  /** Remembers the model the user picked, so the next launch restores it. */
+  const pickModel = useCallback((next: { gatewayId: string; modelId: string }) => {
+    setPickedModel(next);
+    void db.setSetting("picked_model", JSON.stringify(next));
+  }, []);
+
+  /**
+   * Dictation: posts a recorded blob to the chosen provider's
+   * `/audio/transcriptions` endpoint (OpenAI-compatible) via Rust.
+   */
+  const transcribeForProvider = useCallback(
+    async (gatewayId: string, blob: Blob): Promise<string> => {
+      const provider = providers.find((p) => p.id === gatewayId);
+      if (!provider) throw new Error("Connect a provider to use dictation");
+      const oauth = {
+        clientId: localStorage.getItem("google_client_id") ?? "",
+        clientSecret: localStorage.getItem("google_client_secret") ?? "",
+      };
+      const cred = await db.credentialFor(provider, oauth);
+      if (cred.error) throw new Error(cred.error);
+      return db.transcribeAudio(
+        { base_url: provider.base_url, api_key: cred.apiKey },
+        blob,
+        (navigator.language || "en").split("-")[0]
+      );
+    },
+    [providers]
+  );
+
   /** Creates a project. `path` is optional — a project can be just a folder
    * for chats with no directory on disk behind it. */
   const addProject = async (name: string, path: string = "") => {
-    const project: Project = { name, path, conversations: [], autoRun: false };
+    const project: Project = { name, path, conversations: [], permMode: "default" };
     setProjects((prev) => [...prev, project]);
     await db.insertProject(project, projects.length);
   };
@@ -3096,7 +3531,13 @@ export default function App() {
     const promptText = composePrompt(text, attachments);
     const images = attachments
       .filter((a) => a.kind === "image")
-      .map((a) => ({ mime: a.mime, data_url: a.data }));
+      .map((a) => ({ name: a.name, mime: a.mime, data_url: a.data }));
+    /** The user message as shown in the chat, with photo previews. */
+    const userMsg: Msg = {
+      role: "user",
+      text: promptText,
+      images: images.length ? images : undefined,
+    };
 
     // Resolve (or create) the conversation this turn belongs to.
     let convId: string;
@@ -3108,8 +3549,8 @@ export default function App() {
       if (activeRuns[target.id]) return;
       convId = target.id;
       projectName = target.project;
-      history = [...(convMsgsRef.current[convId] ?? []), { role: "user", text: promptText }];
-      updateConvMsgs(convId, (prev) => [...prev, { role: "user", text: promptText }]);
+      history = [...(convMsgsRef.current[convId] ?? []), userMsg];
+      updateConvMsgs(convId, (prev) => [...prev, userMsg]);
     } else {
       convId = `c-${Date.now()}`;
       projectName = newChatProject;
@@ -3125,7 +3566,7 @@ export default function App() {
         )
       );
       await db.insertConversation(projectName, conv);
-      history = [{ role: "user", text: promptText }];
+      history = [userMsg];
       setActiveConv({ project: projectName, id: convId });
       // The new-chat draft becomes this conversation's buffer.
       setConvMsgs((prev) => {
@@ -3136,7 +3577,9 @@ export default function App() {
       });
       setView("chat");
     }
-    await db.appendMessage(convId, "user", promptText);
+    await db.appendMessage(convId, "user", promptText, {
+      images: images.length ? images : undefined,
+    });
     bumpConversationActivity(convId);
 
     // Find the provider/model the user picked in the prompt box.
@@ -3179,6 +3622,7 @@ export default function App() {
     // Placeholder that grows as deltas arrive — always into THIS conversation,
     // whatever the user is looking at while the run streams.
     const requestId = `req-${Date.now()}`;
+    const startedAt = Date.now();
     updateConvMsgs(convId, (prev) => [...prev, { role: "agent", text: "", segments: [] }]);
     setActiveRuns((prev) => ({ ...prev, [convId]: requestId }));
 
@@ -3251,8 +3695,11 @@ export default function App() {
       // With a workspace set, run the full agent loop so the model can read,
       // write and execute — otherwise it is a plain streaming chat.
       const useAgent = !!workspace.trim() && agentMode;
-      // Per-project permission: run commands without asking.
+      // Per-project permission: bypass runs everything, ask prompts for every
+      // command, default inherits the global "Run commands without asking".
       const runProject = projects.find((p) => p.name === projectName);
+      const permMode = runProject?.permMode ?? "default";
+      const autoRun = permMode === "bypass" ? true : permMode === "ask" ? false : globalAutoRun;
 
       const answer = useAgent
         ? await db.runAgent(
@@ -3266,7 +3713,7 @@ export default function App() {
               system: "",
               workspace,
               effort: selection.effort,
-              auto_run: !!runProject?.autoRun,
+              auto_run: autoRun,
               images,
             },
             historyTurns,
@@ -3298,19 +3745,30 @@ export default function App() {
             appendDelta
           );
 
+      const elapsed = Date.now() - startedAt;
       if (answer.trim()) {
-        await db.appendMessage(convId, "agent", answer);
+        await db.appendMessage(convId, "agent", answer, { durationMs: elapsed });
         bumpConversationActivity(convId);
       }
+      // Show the elapsed time on the live message right away.
+      updateConvMsgs(convId, (prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last && last.role === "agent") {
+          next[next.length - 1] = { ...last, durationMs: elapsed };
+        }
+        return next;
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      const elapsed = Date.now() - startedAt;
       updateConvMsgs(convId, (prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
         if (last && last.role === "agent" && last.text === "") {
-          next[next.length - 1] = { role: "agent", text: `⚠️ ${msg}` };
+          next[next.length - 1] = { role: "agent", text: `⚠️ ${msg}`, durationMs: elapsed };
         } else {
-          next.push({ role: "agent", text: `⚠️ ${msg}` });
+          next.push({ role: "agent", text: `⚠️ ${msg}`, durationMs: elapsed });
         }
         return next;
       });
@@ -3369,44 +3827,6 @@ export default function App() {
           {view !== "new" && (
             <div className="flex items-center gap-2 px-4 py-3 text-[16px] font-semibold text-[var(--text-main)]">
               {activeTitle}
-              {view === "chat" && activeConv && (
-                <div className="ml-auto flex items-center gap-1">
-                  <button
-                    className={`flex h-7 items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors ${
-                      panel === "changes"
-                        ? "border-[var(--accent)] bg-[var(--hover-bg)] text-[var(--text-main)]"
-                        : "border-[var(--border)] text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-                    }`}
-                    onClick={() => setPanel((p) => (p === "changes" ? "none" : "changes"))}
-                    title="Show file changes in this conversation"
-                  >
-                    <FileDiff size={13} />
-                    Changes
-                    {changeCount > 0 && (
-                      <span className="rounded-full bg-[var(--accent)]/15 px-1.5 font-mono text-[10px] text-[var(--accent)]">
-                        {changeCount}
-                      </span>
-                    )}
-                  </button>
-                  <button
-                    className={`flex h-7 items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors ${
-                      panel === "commands"
-                        ? "border-[var(--accent)] bg-[var(--hover-bg)] text-[var(--text-main)]"
-                        : "border-[var(--border)] text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-                    }`}
-                    onClick={() => setPanel((p) => (p === "commands" ? "none" : "commands"))}
-                    title="Show executed commands in this conversation"
-                  >
-                    <Terminal size={13} />
-                    Commands
-                    {commandCount > 0 && (
-                      <span className="rounded-full bg-[var(--accent)]/15 px-1.5 font-mono text-[10px] text-[var(--accent)]">
-                        {commandCount}
-                      </span>
-                    )}
-                  </button>
-                </div>
-              )}
             </div>
           )}
 
@@ -3440,7 +3860,10 @@ export default function App() {
                   project={newChatProject}
                   onSelectProject={setNewChatProject}
                   gateways={gateways}
-                  onSend={(text, selection) => sendMessage(text, null, selection)}
+                  pickedModel={pickedModel}
+                  onPickModel={pickModel}
+                  onTranscribe={transcribeForProvider}
+                  onSend={(text, selection, attachments) => sendMessage(text, null, selection, attachments)}
                 />
               </motion.div>
             </div>
@@ -3468,6 +3891,18 @@ export default function App() {
                             text={m.text}
                             segments={m.segments}
                             streaming={streaming && i === draftMsgs.length - 1}
+                            durationMs={m.durationMs}
+                            images={m.images}
+                            onInspectStep={(step) => {
+                              // A changed file opens the Changes panel focused on it;
+                              // a command opens its full output in the Commands panel.
+                              if (step.path && step.new_text !== undefined) {
+                                setPanel({ kind: "changes", file: step.path });
+                              } else if (step.name === "run_command") {
+                                setPanel({ kind: "commands", stepIndex: step.index });
+                              }
+                            }}
+                            onInspectImage={(img) => setPanel({ kind: "image", image: img })}
                           />
                         </motion.div>
                       ))}
@@ -3545,11 +3980,14 @@ export default function App() {
                 )}
               </AnimatePresence>
               <PromptBox
-                onSend={(text, selection) => sendMessage(text, activeConv, selection)}
+                onSend={(text, selection, attachments) => sendMessage(text, activeConv, selection, attachments)}
                 projects={projects}
                 project={activeConv?.project ?? NO_PROJECT}
                 onSelectProject={() => {}}
                 gateways={gateways}
+                pickedModel={pickedModel}
+                onPickModel={pickModel}
+                onTranscribe={transcribeForProvider}
                 busy={streaming}
                 onStop={() => {
                   const run = activeConv ? activeRuns[activeConv.id] : undefined;
@@ -3558,13 +3996,14 @@ export default function App() {
               />
               </div>
 
-              {/* Right inspection panel — file changes and command history. */}
+              {/* Right inspection panel — opened by clicking a file/command/photo. */}
               <AnimatePresence>
-                {panel !== "none" && activeConv && (
+                {panel.kind !== "none" && activeConv && (
                   <InspectionPanel
-                    mode={panel}
+                    panel={panel}
                     msgs={draftMsgs}
-                    onClose={() => setPanel("none")}
+                    onNavigate={setPanel}
+                    onClose={() => setPanel({ kind: "none" })}
                   />
                 )}
               </AnimatePresence>
@@ -3584,6 +4023,11 @@ export default function App() {
               persistent={persistent}
               onProvidersChanged={setProviders}
               onModelsChanged={setModels}
+              globalAutoRun={globalAutoRun}
+              onGlobalAutoRun={(next) => {
+                setGlobalAutoRun(next);
+                void db.setSetting("global_auto_run", next ? "1" : "0");
+              }}
               onClose={() => setModal("none")}
             />
           )}
@@ -3609,11 +4053,11 @@ export default function App() {
                 await renameProject(oldName, newName);
                 setSettingsProject(newName);
               }}
-              onToggleAutoRun={async (name, autoRun) => {
+              onPermMode={async (name, mode) => {
                 setProjects((prev) =>
-                  prev.map((p) => (p.name === name ? { ...p, autoRun } : p))
+                  prev.map((p) => (p.name === name ? { ...p, permMode: mode } : p))
                 );
-                await db.setProjectAutoRun(name, autoRun);
+                await db.setProjectPermMode(name, mode);
               }}
               onDelete={async (name) => {
                 await removeProject(name);

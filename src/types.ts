@@ -15,7 +15,7 @@ export interface Conversation {
   pinned?: boolean;
 }
 
-/** Humanizes an age in seconds as 41S / 5M / 2H / 3D (matches the UI's caps style). */
+/** Humanizes an age in seconds as 41S / 5M / 2H / 3D / 1Y (UI caps style). */
 export function ageLabel(updatedAtUnix: number, nowUnix: number): string {
   if (!updatedAtUnix) return "";
   const s = Math.max(0, nowUnix - updatedAtUnix);
@@ -25,15 +25,23 @@ export function ageLabel(updatedAtUnix: number, nowUnix: number): string {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}H`;
   const d = Math.floor(h / 24);
-  return `${d}D`;
+  if (d < 365) return `${d}D`;
+  return `${Math.floor(d / 365)}Y`;
 }
+
+/**
+ * Per-project command permission:
+ * `bypass` runs commands without asking, `ask` always prompts,
+ * `default` inherits the global setting.
+ */
+export type PermMode = "bypass" | "default" | "ask";
 
 export interface Project {
   name: string;
   path: string;
   conversations: Conversation[];
-  /** When true the agent runs commands without asking; false = confirm first. */
-  autoRun?: boolean;
+  /** Command permission mode; absent on older data means `default`. */
+  permMode?: PermMode;
 }
 
 export type ViewKind = "chat" | "new" | "history" | "tasks";
@@ -104,6 +112,25 @@ export interface Model {
   enabled: boolean;
 }
 
+/**
+ * Humanizes a model id for display: `claude-fable-5` → `Claude Fable 5`.
+ *
+ * Dashes, slashes and dots become spaces, each word is capitalized, and lone
+ * version digits stay as-is. Ids that already look human (they contain a
+ * space) pass through untouched, so a user's custom display name survives.
+ */
+export function prettyModelName(id: string): string {
+  if (!id) return id;
+  if (id.includes(" ")) return id;
+  const words = id
+    .replace(/[/:@]/g, " ")
+    .split(/[-_.]+/)
+    .filter(Boolean);
+  return words
+    .map((w) => (/^\d+$/.test(w) ? w : w.charAt(0).toUpperCase() + w.slice(1)))
+    .join(" ");
+}
+
 /** Provider plus its models, in the shape the picker needs. */
 export interface Gateway {
   id: string;
@@ -125,6 +152,17 @@ export interface StoredMessage {
   role: "user" | "agent";
   text: string;
   created_at: number;
+  /** How long the model spent producing this turn (agent messages only). */
+  duration_ms?: number;
+  /** JSON array of `{name, mime, data_url}` image attachments. */
+  images?: string;
+}
+
+/** An image stored with a message, ready to render again after a reload. */
+export interface StoredImage {
+  name: string;
+  mime: string;
+  data_url: string;
 }
 
 /** Pseudo-project holding chats that belong to no folder. */

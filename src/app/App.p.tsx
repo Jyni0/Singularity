@@ -1041,7 +1041,10 @@ export default function App() {
               <AnimatePresence>
                 {chatScrolledUp && (
                   <motion.button
-                    className="absolute bottom-3 left-1/2 z-20 flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--bg-surface)] px-3 text-[12px] text-[var(--text-muted)] shadow-[var(--shadow-popup)] transition-colors hover:text-[var(--text-main)]"
+                    /* Same glass recipe as the prompt container: translucent
+                       surface + backdrop blur, so scrolled content shimmers
+                       through the pill instead of hiding behind a solid chip. */
+                    className="prompt-glass absolute bottom-3 left-1/2 z-20 flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full px-3 text-[12px] text-[var(--text-muted)] transition-colors hover:text-[var(--text-main)]"
                     initial={{ opacity: 0, y: 8, scale: 0.95 }}
                     animate={{ opacity: 1, y: 0, scale: 1 }}
                     exit={{ opacity: 0, y: 8, scale: 0.95 }}

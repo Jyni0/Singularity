@@ -10,6 +10,8 @@
 //! * right click — toggle the custom menu (version, live agents, Show, Quit);
 //! * the menu hides itself when it loses focus.
 
+use std::sync::Mutex;
+
 use crate::runs;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -17,9 +19,23 @@ use tauri::{AppHandle, Emitter, LogicalSize, Manager, WebviewUrl, WebviewWindowB
 pub const TRAY_ID: &str = "main-tray";
 pub const MENU_WINDOW: &str = "tray-menu";
 
-/// Logical size of the popup — must match the layout in `TrayMenu.c.tsx`.
-const MENU_W: f64 = 300.0;
-const MENU_H: f64 = 340.0;
+/// Compact popup width — card (220) + 6px margin each side for the shadow.
+const MENU_W: f64 = 232.0;
+/// Vertical shadow margin included in every measured height.
+const MARGIN_Y: f64 = 12.0;
+/// Height used until the popup measures its own card (first open per launch).
+const MENU_H_FALLBACK: f64 = 150.0;
+/// Clamps for the measured height (many runs scroll inside the card instead).
+const MENU_H_MIN: f64 = 90.0;
+const MENU_H_MAX: f64 = 480.0;
+
+/// Live popup geometry: the tray click point (physical px), the screen scale
+/// and the height the card last measured — so `tray_resize` can keep the menu
+/// visually pinned to the icon while agents start/finish with the menu open.
+static ANCHOR_X: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static ANCHOR_Y: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static SCALE_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_H: Mutex<f64> = Mutex::new(MENU_H_FALLBACK);
 
 /// When the popup was last hidden (ms since epoch). Clicking the tray icon
 /// while the popup is open blurs it first — the blur hides the popup, then the
@@ -105,23 +121,58 @@ fn toggle_menu(app: &AppHandle, anchor: tauri::PhysicalPosition<f64>) {
         return;
     }
     let scale = win.scale_factor().unwrap_or(1.0);
+    let h = *LAST_H.lock().unwrap_or_else(|e| e.into_inner());
+    place(&win, anchor.x, anchor.y, scale, h);
+
+    ANCHOR_X.store(anchor.x as i64, std::sync::atomic::Ordering::Relaxed);
+    ANCHOR_Y.store(anchor.y as i64, std::sync::atomic::Ordering::Relaxed);
+    SCALE_BITS.store(scale.to_bits(), std::sync::atomic::Ordering::Relaxed);
+
+    refresh(app); // the popup reads state on mount, this covers re-opens
+    let _ = win.show();
+    let _ = win.set_focus();
+}
+
+/// Sizes the popup and pins it to the tray anchor: right-aligned to the click,
+/// opening upwards (the taskbar sits at the bottom), flipping down when there
+/// is no room above.
+fn place(win: &tauri::WebviewWindow, ax: f64, ay: f64, scale: f64, h_logical: f64) {
+    let h = (h_logical + MARGIN_Y).clamp(MENU_H_MIN, MENU_H_MAX);
     let w = MENU_W * scale;
-    let h = MENU_H * scale;
-    // Right-align to the click and open upwards (taskbar sits at the bottom);
-    // flip down when there is no room above.
-    let mut x = anchor.x - w + 24.0 * scale;
-    let mut y = anchor.y - h - 8.0 * scale;
+    let hp = h * scale;
+    let mut x = ax - w + 24.0 * scale;
+    let mut y = ay - hp - 2.0 * scale;
     if y < 0.0 {
-        y = anchor.y + 8.0 * scale;
+        y = ay + 8.0 * scale;
     }
     if x < 0.0 {
         x = 0.0;
     }
-    let _ = win.set_size(LogicalSize::new(MENU_W, MENU_H));
+    let _ = win.set_size(LogicalSize::new(MENU_W, h));
     let _ = win.set_position(tauri::PhysicalPosition::new(x.round() as i32, y.round() as i32));
-    refresh(app); // the popup reads state on mount, this covers re-opens
-    let _ = win.show();
-    let _ = win.set_focus();
+}
+
+/// The popup measured its own card and wants to be exactly this tall. Keeps
+/// the menu pinned to the tray icon across the resize (important: with the
+/// menu open, an agent finishing must shrink it without it drifting away).
+#[tauri::command]
+pub fn tray_resize(app: AppHandle, height: f64) {
+    let h = height.clamp(MENU_H_MIN, MENU_H_MAX);
+    {
+        let mut last = LAST_H.lock().unwrap_or_else(|e| e.into_inner());
+        *last = h;
+    }
+    if let Some(win) = app.get_webview_window(MENU_WINDOW) {
+        let ax = ANCHOR_X.load(std::sync::atomic::Ordering::Relaxed) as f64;
+        let ay = ANCHOR_Y.load(std::sync::atomic::Ordering::Relaxed) as f64;
+        let scale = f64::from_bits(SCALE_BITS.load(std::sync::atomic::Ordering::Relaxed));
+        let scale = if scale > 0.0 { scale } else { win.scale_factor().unwrap_or(1.0) };
+        if ax > 0.0 && ay > 0.0 {
+            place(&win, ax, ay, scale, h);
+        } else {
+            let _ = win.set_size(LogicalSize::new(MENU_W, h));
+        }
+    }
 }
 
 /// The popup's own commands.

@@ -301,6 +301,13 @@ pub fn run() {
             // The tray keeps the app alive after the window closes: runs keep
             // streaming, and the menu shows them plus version and Quit.
             tray::init(app.handle())?;
+            // Warm up local dictation in the background (download + load the
+            // Whisper model) so the first mic press is instant. Never blocks
+            // startup and swallows its own errors — dictation just retries on use.
+            let stt_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                stt::preload(stt_handle).await;
+            });
             match db::db_path(app.handle()) {
                 Ok(p) => println!("[singularity] database: {p}"),
                 Err(e) => eprintln!("[singularity] database path unavailable: {e}"),
@@ -332,6 +339,7 @@ pub fn run() {
             transcribe_audio,
             tray::tray_state,
             tray::tray_action,
+            tray::tray_resize,
             chat_stream
         ])
         .run(tauri::generate_context!())

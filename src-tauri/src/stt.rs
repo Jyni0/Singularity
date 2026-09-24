@@ -2,8 +2,10 @@
 //!
 //! The frontend records the microphone, encodes a 16 kHz mono WAV and sends
 //! the bytes here; nothing ever leaves the machine. The GGML model lives in
-//! the app data directory (`models/ggml-small.bin`) and is downloaded once on
+//! the app data directory (`models/ggml-base.bin`) and is downloaded once on
 //! first use, with progress streamed to the UI as `stt://progress` events.
+//! The base model is the speed/quality sweet spot for dictation: roughly 3x
+//! faster than small on CPU while staying solidly multilingual (ru/uk/en…).
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -11,9 +13,9 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-const MODEL_FILE: &str = "ggml-small.bin";
+const MODEL_FILE: &str = "ggml-base.bin";
 const MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin";
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin";
 /// Whisper expects exactly this sample rate.
 const TARGET_RATE: u32 = 16_000;
 
@@ -94,9 +96,9 @@ async fn ensure_model(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// The small model is ~465 MB; anything far smaller is a truncated download.
+/// The base model is ~148 MB; anything far smaller is a truncated download.
 fn is_complete(path: &Path) -> bool {
-    std::fs::metadata(path).map(|m| m.len() > 400_000_000).unwrap_or(false)
+    std::fs::metadata(path).map(|m| m.len() > 140_000_000).unwrap_or(false)
 }
 
 /* ---------- Audio decoding (WAV → mono f32 @ 16 kHz) ---------- */
@@ -220,6 +222,29 @@ fn run_whisper(model: &Path, samples: &[f32], language: Option<String>) -> Resul
         }
     }
     Ok(text.trim().to_string())
+}
+
+/// Warms dictation up at application start: makes sure the model file is on
+/// disk (downloading it if not) and loads it into memory, so the first mic
+/// press transcribes immediately instead of paying the multi-second load.
+pub async fn preload(app: AppHandle) {
+    let model = match ensure_model(&app).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("[stt] model unavailable, skipping preload: {e}");
+            return;
+        }
+    };
+    let _ = tokio::task::spawn_blocking(move || {
+        let Ok(mut guard) = CTX.lock() else { return };
+        if guard.is_none() {
+            match WhisperContext::new_with_params(&model, WhisperContextParameters::default()) {
+                Ok(ctx) => *guard = Some(ctx),
+                Err(e) => eprintln!("[stt] cannot preload model: {e}"),
+            }
+        }
+    })
+    .await;
 }
 
 /// Transcribes a recorded WAV (16 kHz mono preferred) entirely offline.

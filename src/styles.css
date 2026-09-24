@@ -216,26 +216,31 @@
    AuroraGlow.c.tsx and cross-fade via opacity transitions. */
 .aurora-blob {
   position: absolute;
+  /* Bottom-anchored band: each blob is a wide, low ellipse sliding sideways
+     along the lower edge of the prompt box (Gemini-mobile aurora feel). */
+  top: 30%;
+  bottom: -30%;
+  width: 46%;
   border-radius: 9999px;
   mix-blend-mode: screen;
   will-change: transform;
 }
-.aurora-blob--a { inset: -18% -8%; animation: aurora-a 15s ease-in-out infinite; }
-.aurora-blob--b { inset: -6% 6%;  animation: aurora-b 19s ease-in-out infinite; }
-.aurora-blob--c { inset: 4% -14%; animation: aurora-c 24s ease-in-out infinite; }
+.aurora-blob--a { left: 4%;  animation: aurora-a 13s ease-in-out infinite; }
+.aurora-blob--b { left: 27%; animation: aurora-b 17s ease-in-out infinite; }
+.aurora-blob--c { left: 50%; animation: aurora-c 21s ease-in-out infinite; }
 @keyframes aurora-a {
   0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
-  33%      { transform: translate3d(7%, -5%, 0) scale(1.16); }
-  66%      { transform: translate3d(-6%, 4%, 0) scale(0.94); }
+  33%      { transform: translate3d(14%, 3%, 0) scale(1.1, 0.92); }
+  66%      { transform: translate3d(-8%, -2%, 0) scale(0.94, 1.06); }
 }
 @keyframes aurora-b {
-  0%, 100% { transform: translate3d(0, 0, 0) scale(1.05) rotate(0deg); }
-  40%      { transform: translate3d(-9%, 5%, 0) scale(0.92) rotate(-8deg); }
-  75%      { transform: translate3d(6%, -6%, 0) scale(1.14) rotate(6deg); }
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+  40%      { transform: translate3d(-16%, 4%, 0) scale(1.14, 0.9); }
+  75%      { transform: translate3d(12%, -3%, 0) scale(0.9, 1.08); }
 }
 @keyframes aurora-c {
-  0%, 100% { transform: translate3d(0, 0, 0) scale(0.98); }
-  50%      { transform: translate3d(10%, 6%, 0) scale(1.2); }
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1.02); }
+  50%      { transform: translate3d(-20%, 2%, 0) scale(1.18, 0.88); }
 }
 
 /* Glassmorphism container for the prompt: semi-transparent surface, heavy

@@ -102,9 +102,9 @@ export function PromptBox({
 
   // Dictation: record the mic, transcribe fully on-device (Whisper.cpp in
   // Rust), and append the text to the prompt. No provider involved.
-  const speech = useDictation((blob) =>
-    db.transcribeAudio(blob, (navigator.language || "en").split("-")[0])
-  );
+  // No language hint on purpose: whisper auto-detects per utterance, so the
+  // user can freely mix Russian, Ukrainian and English in one conversation.
+  const speech = useDictation((blob) => db.transcribeAudio(blob));
 
   /** One-time local voice model download progress (0–100), null when idle. */
   const [modelProgress, setModelProgress] = useState<number | null>(null);

@@ -6,20 +6,11 @@ mod chat;
 mod db;
 mod discovery;
 mod oauth;
+mod runs;
 mod tools;
+mod tray;
 
 use tauri::Manager;
-
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Singularity ready. Hello, {name}!")
-}
-
-/// Placeholder: probe a local Ollama gateway (localhost:11434).
-#[tauri::command]
-async fn probe_ollama() -> Result<String, String> {
-    Ok("http://localhost:11434".into())
-}
 
 /// Absolute path of the SQLite file, so the UI can show users where data lives.
 #[tauri::command]
@@ -212,7 +203,20 @@ async fn chat_stream(
     provider: chat::ProviderConfig,
     turns: Vec<chat::ChatTurn>,
 ) -> Result<(), String> {
-    chat::stream_chat(app, request_id, provider, turns).await
+    // Live runs feed the tray menu ("agents running right now"). Title
+    // generation ("title-*") is plumbing, not an agent the user started,
+    // so it stays out of the tray.
+    let is_agent_run = !request_id.starts_with("title-");
+    if is_agent_run {
+        runs::start(&request_id, &format!("chat · {}", provider.model));
+        tray::refresh(&app);
+    }
+    let out = chat::stream_chat(app.clone(), request_id.clone(), provider, turns).await;
+    if is_agent_run {
+        runs::stop(&request_id);
+        tray::refresh(&app);
+    }
+    out
 }
 
 /// Runs the agent loop: the model can read, write and run commands, and its
@@ -224,7 +228,13 @@ async fn agent_run(
     request: agent::AgentRequest,
     turns: Vec<chat::ChatTurn>,
 ) -> Result<(), String> {
-    agent::run_agent(app, run_id, request, turns).await
+    // Live runs feed the tray menu ("agents running right now").
+    runs::start(&run_id, &format!("agent · {}", request.model));
+    tray::refresh(&app);
+    let out = agent::run_agent(app.clone(), run_id.clone(), request, turns).await;
+    runs::stop(&run_id);
+    tray::refresh(&app);
+    out
 }
 
 /// The user's answer to an `agent://confirm` request (allow/deny a command).
@@ -324,15 +334,26 @@ pub fn run() {
                     let _ = window.set_icon(icon.clone());
                 }
             }
+            // The tray keeps the app alive after the window closes: runs keep
+            // streaming, and the menu shows them plus version and Quit.
+            tray::init(app.handle())?;
             match db::db_path(app.handle()) {
                 Ok(p) => println!("[singularity] database: {p}"),
                 Err(e) => eprintln!("[singularity] database path unavailable: {e}"),
             }
             Ok(())
         })
+        // Closing the window hides it instead of exiting; the process lives on
+        // in the tray until the user picks "Quit Singularity" there.
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
-            greet,
-            probe_ollama,
             database_path,
             agent_workspace,
             set_agent_workspace,

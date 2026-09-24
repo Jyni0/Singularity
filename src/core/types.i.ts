@@ -1,9 +1,16 @@
 /**
  * Shared domain types.
  *
- * Kept in its own module so both the UI (`App.tsx`) and the persistence layer
- * (`db.ts`) can import them without creating a circular dependency.
+ * Kept in its own module so both the UI and the persistence layer can import
+ * them without creating a circular dependency.
  */
+
+/**
+ * Single source of truth for the displayed version: injected at build time
+ * from package.json (see vite.config.ts), so the About tab can never drift
+ * from the shipped manifests.
+ */
+export const APP_VERSION: string = import.meta.env.VITE_APP_VERSION ?? "0.0.0";
 
 export type Theme = "dark" | "light" | "slate" | "amoled" | "vibe";
 
@@ -237,3 +244,6 @@ export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
  * Cloud Console, created as a "Desktop app" in a project where the Generative
  * Language API is enabled.
  */
+
+/** Every theme the app ships with — Settings → General lists these. */
+export const THEMES: Theme[] = ["dark", "light", "slate", "amoled", "vibe"];

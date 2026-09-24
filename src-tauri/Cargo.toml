@@ -1,6 +1,6 @@
 [package]
 name = "singularity"
-version = "0.1.0"
+version = "0.2.0"
 description = "Next-Gen Agentic Desktop — orchestration workspace for autonomous AI agents"
 authors = ["Singularity"]
 edition = "2021"
@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-sql = { version = "2", features = ["sqlite"] }
 tauri-plugin-opener = "2"

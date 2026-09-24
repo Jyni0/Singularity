@@ -1,76 +1,30 @@
 /// Singularity — persistence layer.
 ///
 /// The workspace lives in a SQLite database (`sqlite:singularity.db`) managed by
-/// `tauri-plugin-sql`. Migrations run on every start and are idempotent, so the
-/// schema is created on first launch and the demo workspace is seeded once.
+/// `tauri-plugin-sql`. Migrations run on every start and are idempotent.
+/// The demo seed of the first versions is gone from the source; migration 2
+/// survives only as a frozen byte-identical literal (see below) because sqlx
+/// validates its checksum, and migrations 4/5 delete all of its rows anyway —
+/// so a fresh install ends up with an empty workspace.
 use tauri::Manager;
 use tauri_plugin_sql::{Migration, MigrationKind};
 
 /// Path of the app database, relative to the app data directory.
 pub const DB_URL: &str = "sqlite:singularity.db";
 
-/// Demo workspace inserted on first run, mirroring the original mock data.
-const SEED_PROJECTS: &[(&str, &str, i64)] = &[
-    ("Singularity", r"C:\Users\nezuss\Documents\GitHub\Singularity", 0),
-    ("accounting", r"C:\Users\nezuss\Documents\GitHub\accounting", 1),
-    ("Auth", r"C:\Users\nezuss\Documents\GitHub\Auth", 2),
-    ("CourcesPlatform", r"C:\Users\nezuss\Documents\GitHub\CourcesPlatform", 3),
-    (
-        "DataVisualizationMatplotlib",
-        r"C:\Users\nezuss\Documents\GitHub\DataVisualizationMatplotlib",
-        4,
-    ),
-    ("Education-Website", r"C:\Users\nezuss\Documents\GitHub\Education-Website", 5),
-    ("Frontend_Booking", r"C:\Users\nezuss\Documents\GitHub\Frontend_Booking", 6),
-    ("hosty", r"C:\Users\nezuss\Documents\GitHub\hosty", 7),
-    ("landing", r"C:\Users\nezuss\Documents\GitHub\landing", 8),
-    ("TermosClient", r"C:\Users\nezuss\Documents\GitHub\TermosClient", 9),
-    ("TSKS_1gg7sgds", r"C:\Users\nezuss\Documents\GitHub\TSKS_1gg7sgds", 10),
-    // Pseudo-project that holds chats belonging to no folder.
-    ("No project", "", 999),
-];
-
-/// (project, conversation id, title, age label, pinned)
-const SEED_CONVERSATIONS: &[(&str, &str, &str, &str, i64)] = &[
-    ("Singularity", "fix-terminal-tests", "Fix flaky terminal tests", "1d", 1),
-    ("Singularity", "model-router-fallback", "Add Model Router fallback", "2d", 0),
-    ("Singularity", "git-sync", "Branchless git sync redesign", "3d", 0),
-    ("Singularity", "sidebar-v2", "Sidebar v2 layout pass", "4d", 0),
-    ("Singularity", "theme-tokens", "Theme tokens refactor", "6d", 0),
-    ("Singularity", "cmd-palette", "Command palette wiring", "8d", 0),
-    ("Singularity", "voice-input", "Voice input prototype", "11d", 0),
-    ("Singularity", "tool-diff", "Tool diff review panel", "15d", 0),
-    ("accounting", "acc-invoices", "Invoice parser refactor", "7d", 0),
-    ("Auth", "auth-jwt", "JWT refresh flow", "12d", 0),
-    ("Auth", "auth-oauth", "OAuth device flow", "14d", 0),
-    ("Auth", "auth-sessions", "Session storage hardening", "18d", 0),
-    ("Auth", "auth-mfa", "MFA enrollment", "21d", 0),
-    ("Auth", "auth-keys", "Key rotation job", "25d", 0),
-    ("Auth", "auth-audit", "Audit log table", "28d", 0),
-    ("Auth", "auth-lockout", "Lockout policy", "31d", 0),
-    ("Auth", "auth-passkeys", "Passkeys spike", "34d", 0),
-    ("Education-Website", "edu-landing", "Landing page rewrite", "5d", 0),
-    ("No project", "loose-scratch", "Scratch notes", "3h", 0),
-    ("No project", "loose-quick", "Quick question about regex", "9h", 0),
-    ("No project", "loose-draft", "Draft commit message", "2d", 0),
-];
-
-/// (id, name, kind, base_url, enabled, status)
-const SEED_PROVIDERS: &[(&str, &str, &str, &str, i64, &str)] = &[
-    ("antigravity", "Google Antigravity", "google", "https://generativelanguage.googleapis.com", 0, "disconnected"),
-    ("dsh", "DeepSeek Harness", "openai-compatible", "http://127.0.0.1:8080", 1, "ready"),
-    ("openai", "OpenAI · BYOK", "openai", "https://api.openai.com/v1", 0, "disconnected"),
-];
-
-/// (id, provider, model id, display name, meta)
-const SEED_MODELS: &[(&str, &str, &str, &str, &str)] = &[
-    ("m-gemini-3-pro", "antigravity", "gemini-3-pro", "Gemini 3 Pro", "Artifacts"),
-    ("m-gemini-3-flash", "antigravity", "gemini-3-flash", "Gemini 3 Flash", "fast"),
-    ("m-deepseek-v4", "dsh", "deepseek-v4", "DeepSeek V4", "Reasoner"),
-    ("m-deepseek-r2", "dsh", "deepseek-r2", "DeepSeek Reasoner R2", "thinking"),
-    ("m-gpt-4o", "openai", "gpt-4o", "GPT-4o", "BYOK"),
-    ("m-o3-mini", "openai", "o3-mini", "o3-mini", "BYOK"),
-];
+/// Version 2 — frozen SQL text of the original demo seed.
+///
+/// This migration was already applied on existing databases and sqlx records
+/// a checksum per version, so the text must stay byte-identical forever —
+/// a mismatch makes sqlx refuse to run ANY migration. The generator and its
+/// SEED_* tables were removed from the source; this literal is their exact
+/// output. Migrations 4 and 5 delete every one of these rows, so both a
+/// fresh install and an upgraded one end up with no demo data.
+static SEED_SQL: &str = r#"INSERT OR IGNORE INTO providers (id, name, kind, base_url, enabled, status) VALUES ('antigravity', 'Google Antigravity', 'google', 'https://generativelanguage.googleapis.com', 0, 'disconnected'), ('dsh', 'DeepSeek Harness', 'openai-compatible', 'http://127.0.0.1:8080', 1, 'ready'), ('openai', 'OpenAI · BYOK', 'openai', 'https://api.openai.com/v1', 0, 'disconnected');
+INSERT OR IGNORE INTO models (id, provider_id, model_id, name, meta) VALUES ('m-gemini-3-pro', 'antigravity', 'gemini-3-pro', 'Gemini 3 Pro', 'Artifacts'), ('m-gemini-3-flash', 'antigravity', 'gemini-3-flash', 'Gemini 3 Flash', 'fast'), ('m-deepseek-v4', 'dsh', 'deepseek-v4', 'DeepSeek V4', 'Reasoner'), ('m-deepseek-r2', 'dsh', 'deepseek-r2', 'DeepSeek Reasoner R2', 'thinking'), ('m-gpt-4o', 'openai', 'gpt-4o', 'GPT-4o', 'BYOK'), ('m-o3-mini', 'openai', 'o3-mini', 'o3-mini', 'BYOK');
+INSERT OR IGNORE INTO projects (id, name, path, sort_order) VALUES ('Singularity', 'Singularity', 'C:\\Users\\nezuss\\Documents\\GitHub\\Singularity', 0), ('accounting', 'accounting', 'C:\\Users\\nezuss\\Documents\\GitHub\\accounting', 1), ('Auth', 'Auth', 'C:\\Users\\nezuss\\Documents\\GitHub\\Auth', 2), ('CourcesPlatform', 'CourcesPlatform', 'C:\\Users\\nezuss\\Documents\\GitHub\\CourcesPlatform', 3), ('DataVisualizationMatplotlib', 'DataVisualizationMatplotlib', 'C:\\Users\\nezuss\\Documents\\GitHub\\DataVisualizationMatplotlib', 4), ('Education-Website', 'Education-Website', 'C:\\Users\\nezuss\\Documents\\GitHub\\Education-Website', 5), ('Frontend_Booking', 'Frontend_Booking', 'C:\\Users\\nezuss\\Documents\\GitHub\\Frontend_Booking', 6), ('hosty', 'hosty', 'C:\\Users\\nezuss\\Documents\\GitHub\\hosty', 7), ('landing', 'landing', 'C:\\Users\\nezuss\\Documents\\GitHub\\landing', 8), ('TermosClient', 'TermosClient', 'C:\\Users\\nezuss\\Documents\\GitHub\\TermosClient', 9), ('TSKS_1gg7sgds', 'TSKS_1gg7sgds', 'C:\\Users\\nezuss\\Documents\\GitHub\\TSKS_1gg7sgds', 10), ('No project', 'No project', '', 999);
+INSERT OR IGNORE INTO conversations (id, project_id, title, age_label, pinned) VALUES ('fix-terminal-tests', 'Singularity', 'Fix flaky terminal tests', '1d', 1), ('model-router-fallback', 'Singularity', 'Add Model Router fallback', '2d', 0), ('git-sync', 'Singularity', 'Branchless git sync redesign', '3d', 0), ('sidebar-v2', 'Singularity', 'Sidebar v2 layout pass', '4d', 0), ('theme-tokens', 'Singularity', 'Theme tokens refactor', '6d', 0), ('cmd-palette', 'Singularity', 'Command palette wiring', '8d', 0), ('voice-input', 'Singularity', 'Voice input prototype', '11d', 0), ('tool-diff', 'Singularity', 'Tool diff review panel', '15d', 0), ('acc-invoices', 'accounting', 'Invoice parser refactor', '7d', 0), ('auth-jwt', 'Auth', 'JWT refresh flow', '12d', 0), ('auth-oauth', 'Auth', 'OAuth device flow', '14d', 0), ('auth-sessions', 'Auth', 'Session storage hardening', '18d', 0), ('auth-mfa', 'Auth', 'MFA enrollment', '21d', 0), ('auth-keys', 'Auth', 'Key rotation job', '25d', 0), ('auth-audit', 'Auth', 'Audit log table', '28d', 0), ('auth-lockout', 'Auth', 'Lockout policy', '31d', 0), ('auth-passkeys', 'Auth', 'Passkeys spike', '34d', 0), ('edu-landing', 'Education-Website', 'Landing page rewrite', '5d', 0), ('loose-scratch', 'No project', 'Scratch notes', '3h', 0), ('loose-quick', 'No project', 'Quick question about regex', '9h', 0), ('loose-draft', 'No project', 'Draft commit message', '2d', 0);
+"#;
 
 /// Builds the migration list handed to the SQL plugin.
 pub fn migrations() -> Vec<Migration> {
@@ -134,12 +88,10 @@ pub fn migrations() -> Vec<Migration> {
     };
 
     // Seed is a separate migration so it runs exactly once, after the schema.
-    // `Migration.sql` needs a `&'static str`, hence the leaked-once static.
-    static SEED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let seed = Migration {
         version: 2,
         description: "seed demo workspace",
-        sql: SEED.get_or_init(seed_sql).as_str(),
+        sql: SEED_SQL,
         kind: MigrationKind::Up,
     };
 
@@ -304,62 +256,6 @@ fn oauth_migration() -> Migration {
         ",
         kind: MigrationKind::Up,
     }
-}
-
-/// Renders the seed rows as one SQL script (skipped when data already exists).
-fn seed_sql() -> String {
-    let mut sql = String::new();
-
-    sql.push_str("INSERT OR IGNORE INTO providers (id, name, kind, base_url, enabled, status) VALUES ");
-    sql.push_str(
-        &SEED_PROVIDERS
-            .iter()
-            .map(|(id, name, kind, url, enabled, status)| {
-                format!("('{id}', '{name}', '{kind}', '{url}', {enabled}, '{status}')")
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
-    sql.push_str(";\n");
-
-    sql.push_str("INSERT OR IGNORE INTO models (id, provider_id, model_id, name, meta) VALUES ");
-    sql.push_str(
-        &SEED_MODELS
-            .iter()
-            .map(|(id, provider, model_id, name, meta)| {
-                format!("('{id}', '{provider}', '{model_id}', '{name}', '{meta}')")
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
-    sql.push_str(";\n");
-
-    sql.push_str("INSERT OR IGNORE INTO projects (id, name, path, sort_order) VALUES ");
-    sql.push_str(
-        &SEED_PROJECTS
-            .iter()
-            .map(|(name, path, order)| {
-                let escaped = path.replace('\\', "\\\\");
-                format!("('{name}', '{name}', '{escaped}', {order})")
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
-    sql.push_str(";\n");
-
-    sql.push_str("INSERT OR IGNORE INTO conversations (id, project_id, title, age_label, pinned) VALUES ");
-    sql.push_str(
-        &SEED_CONVERSATIONS
-            .iter()
-            .map(|(project, id, title, age, pinned)| {
-                format!("('{id}', '{project}', '{title}', '{age}', {pinned})")
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
-    sql.push_str(";\n");
-
-    sql
 }
 
 /// Absolute path of the database file, resolved from the app data directory.

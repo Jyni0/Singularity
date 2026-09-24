@@ -167,7 +167,7 @@ export function InspectionPanel({
 
   return (
     <motion.aside
-      className="relative flex h-full shrink-0 flex-col border-l border-[var(--border)] bg-[var(--bg-main)]"
+      className="selectable relative flex h-full shrink-0 flex-col border-l border-[var(--border)] bg-[var(--bg-app)]"
       style={{ width }}
       initial={{ opacity: 0, x: 24 }}
       animate={{ opacity: 1, x: 0 }}

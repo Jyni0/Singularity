@@ -1,6 +1,6 @@
 import { useState, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { Plus, Folder, FolderOpen, History, Timer, ListFilter, FolderPlus, ChevronRight, Settings, Copy, MoreHorizontal, Pin, Pencil, Trash2, FolderCog, CopyPlus, ChevronLast } from "lucide-react";
+import { Plus, Folder, FolderOpen, History, Timer, ListFilter, FolderPlus, ChevronRight, Settings, Copy, MoreHorizontal, Pin, Pencil, Trash2, FolderCog, CopyPlus, ChevronLast, LoaderCircle } from "lucide-react";
 import { Conversation, Project, ViewKind, CONV_LIMIT, NO_PROJECT, ageLabel } from "../core/types.i";
 import { useNow } from "../hooks/useNow.h";
 import { ROW, ROW_TEXT, ROW_HOVER, ROW_ACTIVE, SINPUT, ROW_ICON } from "../ui/tokens.s";
@@ -146,13 +146,13 @@ export function Sidebar({
                 className="shrink-0 text-[var(--text-muted)]"
               />
             )}
-            {/* A generation is running in this chat — pulsing accent dot. */}
+            {/* A generation is running in this chat — a plain loading spinner. */}
             {running && (
-              <motion.span
-                className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--accent)]"
-                animate={{ opacity: [1, 0.25, 1], scale: [1, 0.85, 1] }}
-                transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
-                title="Generating…"
+              <LoaderCircle
+                size={12}
+                strokeWidth={2}
+                className="shrink-0 animate-spin text-[var(--accent)]"
+                aria-label="Generating…"
               />
             )}
             <span className={`truncate ${running ? "text-[var(--text-main)]" : ""}`}>{c.title}</span>
@@ -247,7 +247,7 @@ export function Sidebar({
 
   return (
     <aside
-      className="relative flex shrink-0 flex-col bg-[var(--bg-sidebar)] text-[13px] leading-tight"
+      className="selectable relative flex shrink-0 flex-col bg-[var(--bg-sidebar)] text-[13px] leading-tight"
       style={{ width: `${width}px` }}
     >
       {/* Header block (fixed — scrollbar never overlaps it) */}

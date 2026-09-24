@@ -20,7 +20,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart", "rustls-tls"], default-features = false }
 futures-util = "0.3"
 rand = "0.8"
@@ -28,3 +28,7 @@ sha2 = "0.10"
 base64 = "0.22"
 urlencoding = "2"
 tiny_http = "0.12"
+# Local speech-to-text: whisper.cpp bindings + container/codec decoding.
+# Everything runs on-device; no cloud transcription service is ever called.
+whisper-rs = "0.16"
+symphonia = { version = "0.5", features = ["wav", "pcm"] }

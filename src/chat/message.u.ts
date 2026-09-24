@@ -2,7 +2,7 @@
  * Small pure helpers shared by the chat surface and the inspection panel.
  */
 import * as db from "../core/db.r";
-import type { Msg } from "./message.i";
+import type { Msg, Segment } from "./message.i";
 
 /** Collects every tool step from a conversation's messages, in order. */
 export function collectSteps(msgs: Msg[]): db.AgentStepEvent[] {
@@ -15,7 +15,7 @@ export function collectSteps(msgs: Msg[]): db.AgentStepEvent[] {
   return out;
 }
 
-/** Turns a stored row back into a renderable message (duration + photos). */
+/** Turns a stored row back into a renderable message (duration + photos + steps). */
 export function storedToMsg(m: db.StoredMessage): Msg {
   let images: db.StoredImage[] | undefined;
   if (m.images && m.images !== "[]") {
@@ -26,11 +26,29 @@ export function storedToMsg(m: db.StoredMessage): Msg {
       /* stored before images existed — ignore */
     }
   }
+  // Segments (migration 9) carry the tool steps and think blocks, so a
+  // restored turn renders exactly like the live one — cards, outputs and
+  // panel tabs included. Unmarked in-flight steps are re-flagged as done:
+  // nothing is running anymore once the row was stored.
+  let segments: Segment[] | undefined;
+  if (m.segments && m.segments !== "[]") {
+    try {
+      const parsed = JSON.parse(m.segments);
+      if (Array.isArray(parsed) && parsed.length) {
+        segments = (parsed as Segment[]).map((s) =>
+          s.kind === "step" && !s.step.done ? { kind: "step", step: { ...s.step, done: true } } : s
+        );
+      }
+    } catch {
+      /* stored before segments existed — fall back to plain text */
+    }
+  }
   return {
     role: m.role,
     text: m.text,
     durationMs: m.duration_ms ?? undefined,
     images,
+    segments,
   };
 }
 

@@ -5,9 +5,10 @@ import { useState, useEffect, useRef } from "react";
  *
  * WebView2 (Tauri's Windows webview) has no Web Speech API, so `SpeechRecognition`
  * is always undefined there and the old implementation silently did nothing.
- * This records the mic with `MediaRecorder`, then hands the finished blob to the
- * caller's `submit`, which posts it to an OpenAI-compatible
- * `/audio/transcriptions` endpoint through Rust (`db.transcribeAudio`).
+ * This records the mic with `MediaRecorder` and hands the finished blob to the
+ * caller's `submit` — in our case `db.transcribeAudio`, which transcribes fully
+ * on-device (Whisper.cpp in Rust). No provider, no network: dictation works
+ * offline after the one-time local model download.
  *
  * `state`: `idle` → `recording` → `transcribing` → `idle`. `error` carries a
  * short message when recording or transcription fails.

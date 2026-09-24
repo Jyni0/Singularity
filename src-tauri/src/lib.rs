@@ -7,6 +7,7 @@ mod db;
 mod discovery;
 mod oauth;
 mod runs;
+mod stt;
 mod tools;
 mod tray;
 
@@ -250,69 +251,32 @@ fn stop_generation(run_id: String) {
     cancel::request(&run_id);
 }
 
-/* ---------- Dictation ---------- */
+/* ---------- Dictation (fully local) ---------- */
 
-/// Transcribes recorded audio through an OpenAI-compatible
-/// `POST /audio/transcriptions` endpoint (Whisper-style).
+/// Transcribes recorded audio on-device with Whisper.cpp — no cloud service,
+/// no API key, nothing leaves the machine.
 ///
-/// WebView2 has no Web Speech API, so dictation records audio in the frontend
-/// and sends the blob here; the request goes through reqwest directly, which
-/// sidesteps any CORS or capability restrictions of the webview.
+/// WebView2 has no Web Speech API, so dictation records the mic in the
+/// frontend, encodes a 16 kHz mono WAV and hands the raw bytes here. The GGML
+/// model is downloaded once (into the app data dir) and reused.
 #[tauri::command]
 async fn transcribe_audio(
-    base_url: String,
-    api_key: String,
-    model: String,
-    language: Option<String>,
-    audio_base64: String,
-    mime: String,
+    app: tauri::AppHandle,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<String, String> {
-    use base64::Engine;
-
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(audio_base64)
-        .map_err(|e| format!("bad audio payload: {e}"))?;
-    if bytes.is_empty() {
-        return Err("empty audio".into());
-    }
-
-    let base = base_url.trim_end_matches('/');
-    let url = format!("{base}/audio/transcriptions");
-    let ext = match mime.as_str() {
-        "audio/ogg" => "ogg",
-        "audio/mp4" | "audio/m4a" => "m4a",
-        "audio/mp3" | "audio/mpeg" => "mp3",
-        _ => "webm",
+    // The audio arrives as the raw IPC body (Tauri v2 binary invoke); the
+    // language hint rides in a header set by the frontend.
+    let audio = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
+        _ => return Err("dictation expects a raw audio body".into()),
     };
-    let model = if model.trim().is_empty() { "whisper-1" } else { model.trim() };
-
-    let part = reqwest::multipart::Part::bytes(bytes)
-        .file_name(format!("dictation.{ext}"))
-        .mime_str(&mime)
-        .map_err(|e| format!("cannot attach audio: {e}"))?;
-
-    let mut form = reqwest::multipart::Form::new()
-        .part("file", part)
-        .text("model", model.to_string());
-    if let Some(lang) = language.filter(|l| !l.trim().is_empty()) {
-        form = form.text("language", lang.trim().to_string());
-    }
-
-    let mut req = reqwest::Client::new().post(&url).multipart(form);
-    if !api_key.trim().is_empty() {
-        req = req.bearer_auth(api_key.trim());
-    }
-
-    let res = req.send().await.map_err(|e| format!("request failed: {e}"))?;
-    let status = res.status();
-    let body = res.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(format!("transcription returned {status}: {body}"));
-    }
-    serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|t| t.to_string()))
-        .ok_or_else(|| format!("unexpected transcription response: {body}"))
+    let language = request
+        .headers()
+        .get("x-dictation-language")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    stt::transcribe(app, audio, language).await
 }
 
 pub fn run() {
@@ -366,6 +330,8 @@ pub fn run() {
             agent_confirm,
             stop_generation,
             transcribe_audio,
+            tray::tray_state,
+            tray::tray_action,
             chat_stream
         ])
         .run(tauri::generate_context!())

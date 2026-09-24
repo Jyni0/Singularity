@@ -303,23 +303,34 @@ export async function loadMessages(conversationId: string): Promise<StoredMessag
   if (!db) {
     return memory.messages.filter((m) => m.conversation_id === conversationId);
   }
-  // `duration_ms`/`images` arrived in migration 7; fall back on older schemas.
+  // duration_ms/images arrived in migration 7, segments in 9; fall back
+  // stepwise on older schemas instead of failing the chat.
   try {
     return await db.select<StoredMessage[]>(
-      `SELECT conversation_id, role, text, created_at, duration_ms, images
+      `SELECT conversation_id, role, text, created_at, duration_ms, images, segments
          FROM messages
         WHERE conversation_id = $1
         ORDER BY created_at, rowid`,
       [conversationId]
     );
   } catch {
-    return db.select<StoredMessage[]>(
-      `SELECT conversation_id, role, text, created_at
-         FROM messages
-        WHERE conversation_id = $1
-        ORDER BY created_at, rowid`,
-      [conversationId]
-    );
+    try {
+      return await db.select<StoredMessage[]>(
+        `SELECT conversation_id, role, text, created_at, duration_ms, images
+           FROM messages
+          WHERE conversation_id = $1
+          ORDER BY created_at, rowid`,
+        [conversationId]
+      );
+    } catch {
+      return db.select<StoredMessage[]>(
+        `SELECT conversation_id, role, text, created_at
+           FROM messages
+          WHERE conversation_id = $1
+          ORDER BY created_at, rowid`,
+        [conversationId]
+      );
+    }
   }
 }
 
@@ -328,6 +339,13 @@ export interface MessageMeta {
   durationMs?: number;
   /** Image attachments carried with a user message. */
   images?: StoredImage[];
+  /**
+   * Serialized interleaved segments of an agent turn (Segment[] from
+   * message.i) — the tool steps and their outputs the chat renders between
+   * prose blocks. Storing them keeps a conversation's "actions" visible
+   * after a restart, panel tabs included.
+   */
+  segmentsJson?: string;
 }
 
 export async function appendMessage(
@@ -339,6 +357,7 @@ export async function appendMessage(
   const db = await getDb();
   const now = Math.floor(Date.now() / 1000);
   const imagesJson = JSON.stringify(meta.images ?? []);
+  const segmentsJson = meta.segmentsJson ?? "[]";
   const row: StoredMessage = {
     conversation_id: conversationId,
     role,
@@ -346,6 +365,7 @@ export async function appendMessage(
     created_at: now,
     duration_ms: meta.durationMs ?? 0,
     images: imagesJson,
+    segments: segmentsJson,
   };
   if (!db) {
     memory.messages.push(row);
@@ -357,8 +377,8 @@ export async function appendMessage(
   }
   try {
     await db.execute(
-      `INSERT INTO messages (id, conversation_id, role, text, duration_ms, images)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+      `INSERT INTO messages (id, conversation_id, role, text, duration_ms, images, segments)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [
         memId(),
         conversationId,
@@ -366,15 +386,25 @@ export async function appendMessage(
         text,
         meta.durationMs ?? 0,
         imagesJson,
+        segmentsJson,
       ]
     );
   } catch {
-    // Schema predating migration 7 — store the message without the new columns.
-    await db.execute(
-      `INSERT INTO messages (id, conversation_id, role, text)
-       VALUES ($1, $2, $3, $4)`,
-      [memId(), conversationId, role, text]
-    );
+    try {
+      // Schema predating migration 9 — store without the segments column.
+      await db.execute(
+        `INSERT INTO messages (id, conversation_id, role, text, duration_ms, images)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [memId(), conversationId, role, text, meta.durationMs ?? 0, imagesJson]
+      );
+    } catch {
+      // Schema predating migration 7 — the bare minimum.
+      await db.execute(
+        `INSERT INTO messages (id, conversation_id, role, text)
+         VALUES ($1, $2, $3, $4)`,
+        [memId(), conversationId, role, text]
+      );
+    }
   }
   // Bump the conversation's activity stamp so the sidebar shows a live age.
   // Guarded: on a database predating migration 6 the column does not exist.
@@ -947,35 +977,95 @@ export async function stopGeneration(runId: string): Promise<void> {
 }
 
 /**
- * Dictation: transcribes recorded audio through an OpenAI-compatible
- * `/audio/transcriptions` endpoint. WebView2 has no Web Speech API, so the
- * frontend records the mic and hands the blob to Rust, which does the HTTP.
+ * Dictation — fully local. The recorded blob is decoded in the browser,
+ * downsampled to a 16 kHz mono WAV and handed to Rust, where Whisper.cpp
+ * transcribes it on-device. No provider, no API key, no network ever.
  *
- * `provider` supplies base_url + api_key. Falls back to a thrown error when the
- * desktop shell or provider is missing so the caller can show a notice.
+ * Throws when the desktop shell is missing so the caller can show a notice.
  */
 export async function transcribeAudio(
-  provider: { base_url: string; api_key: string; model?: string },
   audioBlob: Blob,
   language?: string
 ): Promise<string> {
   if (!inTauri) throw new Error("Dictation needs the desktop shell (npm run tauri:dev)");
   const { invoke } = await import("@tauri-apps/api/core");
-
-  // Encode the blob as base64 without FileReader (works in all webviews).
-  const buf = new Uint8Array(await audioBlob.arrayBuffer());
-  let binary = "";
-  for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
-  const audio_base64 = btoa(binary);
-
-  return invoke<string>("transcribe_audio", {
-    baseUrl: provider.base_url,
-    apiKey: provider.api_key,
-    model: provider.model ?? "whisper-1",
-    language: language ?? null,
-    audioBase64: audio_base64,
-    mime: audioBlob.type || "audio/webm",
+  const wav = await encodeWav16k(audioBlob);
+  // The WAV crosses as the RAW invoke body (Tauri v2 binary IPC — no JSON
+  // number-array detour); the language rides along in a request header.
+  return invoke<string>("transcribe_audio", wav, {
+    headers: { "x-dictation-language": language ?? "" },
   });
+}
+
+/**
+ * Progress of the one-time local voice model download (Rust → UI).
+ * Returns a disposer. Emissions: {percent, done} — percent < 100 while the
+ * model downloads, done=true once it is usable.
+ */
+export async function onSttProgress(
+  handler: (p: { percent: number; done: boolean }) => void
+): Promise<() => void> {
+  if (!inTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ percent: number; done: boolean }>("stt://progress", (e) => handler(e.payload));
+}
+
+/* ---------- WAV encoding (browser side) ---------- */
+
+/**
+ * Decodes any recorded blob (webm/opus, mp4…) with the browser's own decoder
+ * and re-renders it as a 16 kHz mono 16-bit WAV — the exact format the Rust
+ * side feeds to Whisper. Doing it here means Rust needs no container/codec
+ * support beyond plain WAV.
+ */
+async function encodeWav16k(blob: Blob): Promise<Uint8Array> {
+  const raw = await blob.arrayBuffer();
+  const Ctx =
+    window.AudioContext ??
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!Ctx) throw new Error("Audio decoding is unavailable in this environment");
+  const ctx = new Ctx();
+  try {
+    const decoded = await ctx.decodeAudioData(raw);
+    const rate = 16000;
+    const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * rate), rate);
+    const src = offline.createBufferSource();
+    src.buffer = decoded;
+    src.connect(offline.destination);
+    src.start();
+    const rendered = await offline.startRendering();
+    return floatToWav(rendered.getChannelData(0), rate);
+  } finally {
+    void ctx.close();
+  }
+}
+
+/** Packs mono f32 samples into a canonical 16-bit PCM WAV. */
+function floatToWav(samples: Float32Array, rate: number): Uint8Array {
+  const bytes = 44 + samples.length * 2;
+  const out = new Uint8Array(bytes);
+  const view = new DataView(out.buffer);
+  const ascii = (at: number, s: string) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(at + i, s.charCodeAt(i));
+  };
+  ascii(0, "RIFF");
+  view.setUint32(4, bytes - 8, true);
+  ascii(8, "WAVE");
+  ascii(12, "fmt ");
+  view.setUint32(16, 16, true); // fmt chunk size
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, rate, true);
+  view.setUint32(28, rate * 2, true); // byte rate
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  ascii(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return out;
 }
 
 /** A command waiting for the user's permission. */

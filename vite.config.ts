@@ -19,6 +19,13 @@ export default defineConfig({
   build: {
     target: "es2022",
     outDir: "dist",
+    rollupOptions: {
+      // Two webview surfaces: the main app and the custom tray-menu popup.
+      input: {
+        main: new URL("./index.html", import.meta.url).pathname,
+        tray: new URL("./tray.html", import.meta.url).pathname,
+      },
+    },
   },
   clearScreen: false,
   envPrefix: ["VITE_", "TAURI_"],

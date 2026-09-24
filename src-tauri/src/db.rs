@@ -109,7 +109,26 @@ pub fn migrations() -> Vec<Migration> {
         activity_stamp_migration(),
         message_meta_migration(),
         project_permission_migration(),
+        message_segments_migration(),
     ]
+}
+
+/// Version 9 — agent turns keep their tool steps ("actions").
+///
+/// Before this, only the final prose of a turn was stored: reopening a chat
+/// after a restart showed the answer text but every file edit, command run
+/// and their outputs were gone. The segments column stores the interleaved
+/// JSON the chat renders (text / think / step), so a restored conversation
+/// is indistinguishable from a live one — panel tabs included.
+fn message_segments_migration() -> Migration {
+    Migration {
+        version: 9,
+        description: "message segments for tool steps",
+        sql: "
+            ALTER TABLE messages ADD COLUMN segments TEXT NOT NULL DEFAULT '[]';
+        ",
+        kind: MigrationKind::Up,
+    }
 }
 
 /// Version 7 — messages carry generation time and attached images.

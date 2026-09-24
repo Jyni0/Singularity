@@ -8,7 +8,7 @@ import { composePrompt } from "../utils/attachments.u";
 import { toGateways } from "../utils/gateways.u";
 import { useBlockContextMenu } from "../hooks/useBlockContextMenu.h";
 import { ScrollArea } from "../ui/ScrollArea.c";
-import { GeneratingPill } from "../ui/GeneratingPill.c";
+
 import type { Msg, PanelState, PanelTabSpec } from "../chat/message.i";
 import { storedToMsg, fileLabel, toolLabel } from "../chat/message.u";
 import { ChatMessage } from "../chat/ChatMessage.c";
@@ -55,6 +55,13 @@ export default function App() {
   convMsgsRef.current = convMsgs;
   /** convId → requestId of the generation currently running for it. */
   const [activeRuns, setActiveRuns] = useState<Record<string, string>>({});
+  /**
+   * convId → phase of its live run: "thinking" until the first text delta,
+   * then "streaming". Drives the aurora palette behind the prompt box.
+   */
+  const [runPhase, setRunPhase] = useState<Record<string, "thinking" | "streaming">>({});
+  /** Conversation whose last run failed — the aurora glows red until the next send. */
+  const [erroredConv, setErroredConv] = useState<string | null>(null);
   /** Right inspection panel of the chat view. */
   const [panel, setPanel] = useState<PanelState>({ kind: "none" });
   /** Panel width, drag-resizable and persisted like the sidebar's. */
@@ -104,6 +111,20 @@ export default function App() {
     : convMsgs[DRAFT_ID] ?? [];
   /** True while THIS conversation has a generation running. */
   const streaming = !!activeConv && !!activeRuns[activeConv.id];
+  /**
+   * Aurora palette for the prompt box, derived from the on-screen chat's run:
+   * red after a failed turn, indigo while it thinks, amber once text streams,
+   * calm mint when idle.
+   */
+  const promptMood: "idle" | "thinking" | "streaming" | "error" = activeConv
+    ? erroredConv === activeConv.id
+      ? "error"
+      : activeRuns[activeConv.id]
+        ? runPhase[activeConv.id] === "streaming"
+          ? "streaming"
+          : "thinking"
+        : "idle"
+    : "idle";
   /** The pending Allow/Deny request of the conversation on screen, if any. */
   const confirmReq = streaming ? confirmReqs[activeRuns[activeConv!.id]] ?? null : null;
   /** Ids of conversations with a live run — drives the sidebar pulse. */
@@ -334,29 +355,6 @@ export default function App() {
     setPickedModel(next);
     void db.setSetting("picked_model", JSON.stringify(next));
   }, []);
-
-  /**
-   * Dictation: posts a recorded blob to the chosen provider's
-   * `/audio/transcriptions` endpoint (OpenAI-compatible) via Rust.
-   */
-  const transcribeForProvider = useCallback(
-    async (gatewayId: string, blob: Blob): Promise<string> => {
-      const provider = providers.find((p) => p.id === gatewayId);
-      if (!provider) throw new Error("Connect a provider to use dictation");
-      const oauth = {
-        clientId: localStorage.getItem("google_client_id") ?? "",
-        clientSecret: localStorage.getItem("google_client_secret") ?? "",
-      };
-      const cred = await db.credentialFor(provider, oauth);
-      if (cred.error) throw new Error(cred.error);
-      return db.transcribeAudio(
-        { base_url: provider.base_url, api_key: cred.apiKey },
-        blob,
-        (navigator.language || "en").split("-")[0]
-      );
-    },
-    [providers]
-  );
 
   /** Creates a project. `path` is optional — a project can be just a folder
    * for chats with no directory on disk behind it. */
@@ -589,9 +587,18 @@ export default function App() {
     const startedAt = Date.now();
     updateConvMsgs(convId, (prev) => [...prev, { role: "agent", text: "", segments: [] }]);
     setActiveRuns((prev) => ({ ...prev, [convId]: requestId }));
+    // The run starts out "thinking"; the first prose delta flips it to
+    // "streaming" (the aurora behind the prompt tracks this).
+    setRunPhase((prev) => ({ ...prev, [convId]: "thinking" }));
+    setErroredConv((prev) => (prev === convId ? null : prev));
+    let phase = "thinking";
 
     /** Appends streamed prose to the current text segment of the live turn. */
     const appendDelta = (delta: string) => {
+      if (phase === "thinking") {
+        phase = "streaming";
+        setRunPhase((prev) => ({ ...prev, [convId]: "streaming" }));
+      }
       updateConvMsgs(convId, (prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
@@ -710,8 +717,23 @@ export default function App() {
           );
 
       const elapsed = Date.now() - startedAt;
-      if (answer.trim()) {
-        await db.appendMessage(convId, "agent", answer, { durationMs: elapsed });
+      // Persist the whole turn: prose AND the interleaved tool steps. Before
+      // segments were stored, reopening a chat after a restart showed only
+      // the answer text — every "action" (file edit, command run, output)
+      // vanished. A turn with steps but no prose is still stored, so agent
+      // work that only touched files does not disappear either.
+      const finalSegments = (convMsgsRef.current[convId] ?? []).at(-1)?.segments;
+      const stepsCount = finalSegments?.filter((s) => s.kind === "step").length ?? 0;
+      if (answer.trim() || stepsCount > 0) {
+        // Reasoning blocks stay ephemeral (shown live, never stored) — same
+        // contract as the answer text, which has always excluded them.
+        const persisted = finalSegments?.filter((s) => s.kind !== "think");
+        await db.appendMessage(convId, "agent", answer, {
+          durationMs: elapsed,
+          segmentsJson: persisted && persisted.length
+            ? JSON.stringify(persisted)
+            : undefined,
+        });
         bumpConversationActivity(convId);
       }
       // A brand-new chat gets a real title: the model names it after the first
@@ -731,6 +753,8 @@ export default function App() {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       const elapsed = Date.now() - startedAt;
+      // The aurora behind the prompt turns red until the next send in this chat.
+      setErroredConv(convId);
       updateConvMsgs(convId, (prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
@@ -743,6 +767,11 @@ export default function App() {
       });
     } finally {
       setActiveRuns((prev) => {
+        const next = { ...prev };
+        delete next[convId];
+        return next;
+      });
+      setRunPhase((prev) => {
         const next = { ...prev };
         delete next[convId];
         return next;
@@ -933,7 +962,6 @@ export default function App() {
                   gateways={gateways}
                   pickedModel={pickedModel}
                   onPickModel={pickModel}
-                  onTranscribe={transcribeForProvider}
                   onSend={(text, selection, attachments) => sendMessage(text, null, selection, attachments)}
                 />
               </motion.div>
@@ -947,7 +975,7 @@ export default function App() {
               <ScrollArea className="flex-1" innerClassName="py-4" scrollRef={chatRef}>
                 <div className="px-6">
                   <div
-                    className="mx-auto flex w-full max-w-[760px] flex-col gap-4"
+                    className="selectable mx-auto flex w-full max-w-[760px] flex-col gap-4"
                     key={activeConv?.id ?? "new"}
                   >
                     <AnimatePresence initial={false}>
@@ -1080,28 +1108,17 @@ export default function App() {
                 )}
               </AnimatePresence>
 
-              {/* Streaming indicator sits above the prompt while the model answers */}
-              <AnimatePresence>
-                {streaming && (
-                  <motion.div
-                    className="flex justify-center px-6 pb-1.5"
-                    initial={{ opacity: 0, y: 4 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: 4 }}
-                  >
-                    <GeneratingPill />
-                  </motion.div>
-                )}
-              </AnimatePresence>
+              {/* The aurora behind the prompt IS the running indicator: its
+                  palette shifts mint → indigo → amber → red with the run. */}
               <PromptBox
                 onSend={(text, selection, attachments) => sendMessage(text, activeConv, selection, attachments)}
                 projects={projects}
                 project={activeConv?.project ?? NO_PROJECT}
+                mood={promptMood}
                 onSelectProject={() => {}}
                 gateways={gateways}
                 pickedModel={pickedModel}
                 onPickModel={pickModel}
-                onTranscribe={transcribeForProvider}
                 busy={streaming}
                 onStop={() => {
                   const run = activeConv ? activeRuns[activeConv.id] : undefined;

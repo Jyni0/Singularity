@@ -164,6 +164,12 @@ export interface StoredMessage {
   duration_ms?: number;
   /** JSON array of `{name, mime, data_url}` image attachments. */
   images?: string;
+  /**
+   * JSON array of the turn's interleaved segments (text / think / step) —
+   * migration 9. Restoring them is what keeps tool-call cards, their outputs
+   * and panel tabs alive after a restart.
+   */
+  segments?: string;
 }
 
 /** An image stored with a message, ready to render again after a reload. */

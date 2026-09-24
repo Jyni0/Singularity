@@ -1,12 +1,14 @@
 import { useState, useEffect, useRef } from "react";
 import { motion } from "motion/react";
 import { Zap, Shield, Send, X, Square, Mic, Loader2, Paperclip, FileText } from "lucide-react";
-import { Project, Gateway, Attachment, Effort } from "../core/types.i";
+import * as db from "../core/db.r";
+import type { Project, Gateway, Attachment, Effort } from "../core/types.i";
 import { toAttachments, formatSize } from "../utils/attachments.u";
 import { useDictation } from "../hooks/useDictation.h";
 import { useOverlayThumb } from "../hooks/useOverlayThumb.h";
 import { CHIP_CTX } from "../ui/tokens.s";
 import { Thumb } from "../ui/Thumb.c";
+import { AuroraGlow, type AuroraMood } from "../ui/AuroraGlow.c";
 import { ModelSelector } from "./ModelSelector.c";
 import { ProjectPicker } from "./ProjectPicker.c";
 import { EffortChip } from "./EffortChip.c";
@@ -20,7 +22,7 @@ export function PromptBox({
   centered,
   busy,
   onStop,
-  onTranscribe,
+  mood = "idle",
   pickedModel,
   onPickModel,
 }: {
@@ -37,8 +39,11 @@ export function PromptBox({
   /** True while this conversation's generation is running — Send becomes Stop. */
   busy?: boolean;
   onStop?: () => void;
-  /** Transcribes a recorded mic blob using the selected provider's endpoint. */
-  onTranscribe?: (gatewayId: string, blob: Blob) => Promise<string>;
+  /**
+   * Drives the aurora glow palette: idle (mint) → thinking (indigo) →
+   * streaming (amber/coral) → error (ruby). Cross-fades are in the glow.
+   */
+  mood?: AuroraMood;
   /** Model chosen earlier — restored so the chat remembers its model. */
   pickedModel?: { gatewayId: string; modelId: string } | null;
   /** Reports the model the user picked, so it can be persisted. */
@@ -95,19 +100,30 @@ export function PromptBox({
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   };
 
-  // Dictation: record the mic, transcribe through the selected provider's
-  // Whisper-compatible endpoint, and append the text to the prompt.
-  const speech = useDictation(async (blob) => {
-    if (!onTranscribe) throw new Error("Dictation needs a connected provider");
-    return onTranscribe(gatewayId, blob);
-  });
+  // Dictation: record the mic, transcribe fully on-device (Whisper.cpp in
+  // Rust), and append the text to the prompt. No provider involved.
+  const speech = useDictation((blob) =>
+    db.transcribeAudio(blob, (navigator.language || "en").split("-")[0])
+  );
+
+  /** One-time local voice model download progress (0–100), null when idle. */
+  const [modelProgress, setModelProgress] = useState<number | null>(null);
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void db.onSttProgress((p) => {
+      setModelProgress(p.done || p.percent >= 100 ? null : p.percent);
+    }).then((fn) => {
+      dispose = fn;
+    });
+    return () => dispose?.();
+  }, []);
 
   useEffect(() => {
     speech.setOnResult((text) => {
       setText((prev) => `${prev}${prev && !prev.endsWith(" ") ? " " : ""}${text}`);
       requestAnimationFrame(autoGrow);
     });
-  }, [gatewayId]);
+  }, []);
 
   const toggleMic = () => {
     if (speech.listening) speech.stop();
@@ -184,10 +200,14 @@ export function PromptBox({
             <ProjectPicker projects={projects} project={project} onSelect={onSelectProject} />
           </div>
         )}
-        {/* min-h 108px, radius 16, theme surface + border */}
+        <div className="relative">
+          {/* The living aurora behind the glass input — its palette tracks the
+              agent's state (idle/thinking/streaming/error). */}
+          <AuroraGlow mood={mood} />
+        {/* Glassmorphism container: the aurora glows through the blur. */}
         <div
-          className={`flex min-h-[108px] w-full flex-col justify-between rounded-2xl border bg-[var(--bg-surface)] transition-colors focus-within:border-[var(--accent)] ${
-            dragging ? "border-[var(--accent)] bg-[var(--hover-bg)]" : "border-[var(--border)]"
+          className={`prompt-glass relative flex min-h-[108px] w-full flex-col justify-between rounded-2xl transition-colors ${
+            dragging ? "border-[var(--accent)]" : ""
           }`}
           onDragOver={(e) => {
             e.preventDefault();
@@ -313,7 +333,8 @@ export function PromptBox({
               >
                 <Paperclip size={14} strokeWidth={1.5} />
               </button>
-              {/* Mic: records audio, then transcribes it via the provider. */}
+              {/* Mic: records audio, then transcribes it fully on-device
+                  (Whisper.cpp in Rust) — no provider, no network. */}
               <button
                 className={`relative flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
                   speech.listening
@@ -327,11 +348,13 @@ export function PromptBox({
                 title={
                   !speech.supported
                     ? "Microphone is unavailable"
-                    : speech.transcribing
-                      ? "Transcribing…"
-                      : speech.listening
-                        ? "Stop recording"
-                        : "Dictate with microphone"
+                    : modelProgress !== null
+                      ? "Preparing local voice model… " + modelProgress + "%"
+                      : speech.transcribing
+                        ? "Transcribing on-device…"
+                        : speech.listening
+                          ? "Stop recording"
+                          : "Dictate with microphone (local, offline)"
                 }
               >
                 {speech.transcribing ? (
@@ -370,6 +393,7 @@ export function PromptBox({
               )}
             </div>
           </div>
+        </div>
         </div>
       </div>
     </div>

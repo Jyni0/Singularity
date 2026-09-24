@@ -209,52 +209,57 @@
 }
 .panel-resizer:hover { background: color-mix(in srgb, var(--accent) 35%, transparent); }
 
-/* ---------- "Generating…" indicator ----------
-   A living gradient: the pill's border and its label both carry a slowly
-   flowing spectrum, so a running model is visible at a glance. Pure CSS —
-   background-position animation is compositor-friendly and never jitters. */
-.generating-pill {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 3px 12px;
-  border-radius: 999px;
-  border: 1px solid transparent;
-  background:
-    linear-gradient(var(--bg-surface), var(--bg-surface)) padding-box,
-    linear-gradient(90deg, #6366f1, #a855f7, #ec4899, #22d3ee, #6366f1) border-box;
-  background-size: 100% 100%, 300% 100%;
-  animation: generating-border 3s linear infinite;
+/* ---------- Aurora Glow (prompt box) ----------
+   Soft plasma blobs drifting behind the glass prompt container. Only
+   transform/opacity are animated, so the whole thing stays on the compositor
+   and never competes with streaming text. Mood palettes live in
+   AuroraGlow.c.tsx and cross-fade via opacity transitions. */
+.aurora-blob {
+  position: absolute;
+  border-radius: 9999px;
+  mix-blend-mode: screen;
+  will-change: transform;
 }
-@keyframes generating-border {
-  to { background-position: 0 0, -300% 0; }
+.aurora-blob--a { inset: -18% -8%; animation: aurora-a 15s ease-in-out infinite; }
+.aurora-blob--b { inset: -6% 6%;  animation: aurora-b 19s ease-in-out infinite; }
+.aurora-blob--c { inset: 4% -14%; animation: aurora-c 24s ease-in-out infinite; }
+@keyframes aurora-a {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+  33%      { transform: translate3d(7%, -5%, 0) scale(1.16); }
+  66%      { transform: translate3d(-6%, 4%, 0) scale(0.94); }
 }
-.generating-text {
-  font-size: 12px;
-  font-weight: 500;
-  background: linear-gradient(90deg, var(--text-dim), #a855f7, #22d3ee, #ec4899, var(--text-dim));
-  background-size: 300% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  animation: generating-text 3s linear infinite;
+@keyframes aurora-b {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1.05) rotate(0deg); }
+  40%      { transform: translate3d(-9%, 5%, 0) scale(0.92) rotate(-8deg); }
+  75%      { transform: translate3d(6%, -6%, 0) scale(1.14) rotate(6deg); }
 }
-@keyframes generating-text {
-  to { background-position: -300% 0; }
+@keyframes aurora-c {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(0.98); }
+  50%      { transform: translate3d(10%, 6%, 0) scale(1.2); }
 }
-/* The dot pulses in sync so the whole pill reads as one breathing thing. */
-.generating-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: linear-gradient(90deg, #a855f7, #22d3ee);
-  animation: generating-dot 1.2s ease-in-out infinite;
+
+/* Glassmorphism container for the prompt: semi-transparent surface, heavy
+   backdrop blur and a hairline rim so the aurora reads through it. */
+.prompt-glass {
+  background: color-mix(in srgb, var(--bg-surface) 62%, transparent);
+  backdrop-filter: blur(18px) saturate(1.25);
+  -webkit-backdrop-filter: blur(18px) saturate(1.25);
+  border: 1px solid color-mix(in srgb, var(--text-main) 12%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #ffffff 8%, transparent),
+    0 8px 32px rgba(0, 0, 0, 0.35);
 }
-@keyframes generating-dot {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: 0.35; transform: scale(0.8); }
-}
+
+/* ---------- Text selection policy ----------
+   Selection is OFF everywhere by default (desktop-app feel) and explicitly
+   re-enabled only where reading/copying text is the point: the chat thread,
+   the inspection panel ("chat sidebar"), the prompt textarea and any other
+   editable field. Chrome's UA sheet sets user-select:none on <button>, so the
+   override reaches inside buttons too — tool cards select like the prose
+   around them, with no holes mid-drag. */
+body { user-select: none; -webkit-user-select: none; }
+textarea, input, [contenteditable="true"] { user-select: text; -webkit-user-select: text; }
+.selectable, .selectable * { user-select: text !important; -webkit-user-select: text !important; }
 
 /* Diff syntax colors via tokens */
 .diff-line--add { background: color-mix(in srgb, var(--diff-add) 15%, transparent); }

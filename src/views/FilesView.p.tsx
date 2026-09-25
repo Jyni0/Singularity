@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import * as db from "../core/db.r";
 import type { SftpEntry, SshServer } from "../core/types.i";
+import { OsLogo } from "../ui/OsLogo.c";
 
 /**
  * Files page — SFTP browser over the same pooled SSH connection
@@ -132,8 +133,13 @@ export function FilesView({
       animate={{ opacity: 1 }}
       transition={{ duration: 0.15 }}
     >
-      {/* No navbar: one slim toolbar — breadcrumbs left, actions right. */}
+      {/* No navbar: one slim toolbar — OS logo + breadcrumbs left, actions right. */}
       <div className="flex h-9 shrink-0 items-center gap-1 border-b border-[var(--border)] px-3 text-[11.5px]">
+        {/* Detected-OS logo (same component as the sidebar / Units page) */}
+        <span className="mr-1 flex shrink-0 items-center gap-1.5">
+          <OsLogo os={server.os} seed={server.id} name={server.name} size={16} />
+          <span className="max-w-[120px] truncate font-medium text-[var(--text-muted)]">{server.name}</span>
+        </span>
         <button
           className="shrink-0 rounded px-1 py-0.5 text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
           onClick={() => void load("/")}

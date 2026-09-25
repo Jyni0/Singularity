@@ -35,6 +35,7 @@ import {
   PROVIDER_TEMPLATES,
 } from "../core/types.i";
 import * as db from "../core/db.r";
+import { Switch } from "../ui/Switch.c";
 
 const SBUTTON =
   "flex h-[30px] shrink-0 items-center justify-center gap-1.5 rounded-md bg-[var(--bg-elevated)] px-3 text-[12px] text-[var(--text-main)] transition-colors hover:bg-[var(--bg-input)] disabled:cursor-not-allowed disabled:opacity-50";
@@ -771,19 +772,11 @@ function ProviderCard({
                   <Plug size={13} />
                   Enabled for the model picker
                 </span>
-                <button
-                  className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
-                    provider.enabled ? "bg-[var(--accent)]" : "bg-[var(--border)]"
-                  }`}
-                  onClick={() => persist({ enabled: !provider.enabled })}
-                >
-                  {/* The knob is anchored left so it never overflows the track. */}
-                  <span
-                    className={`absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
-                      provider.enabled ? "translate-x-[16px]" : "translate-x-0"
-                    }`}
-                  />
-                </button>
+                <Switch
+                  on={provider.enabled}
+                  onChange={(next) => persist({ enabled: next })}
+                  ariaLabel="toggle provider"
+                />
               </div>
 
               {mine.length > 0 && (

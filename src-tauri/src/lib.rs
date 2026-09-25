@@ -381,6 +381,8 @@ pub fn run() {
             ssh::ssh_list_keys,
             ssh::ssh_save_key,
             ssh::ssh_delete_key,
+            ssh::ssh_generate_key,
+            ssh::ssh_detect_os,
             ssh::ssh_list_scripts,
             ssh::ssh_save_script,
             ssh::ssh_delete_script,

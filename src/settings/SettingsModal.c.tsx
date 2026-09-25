@@ -7,8 +7,10 @@ import { APP_VERSION, THEMES } from "../core/types.i";
 import { SBUTTON, SSELECT, SINPUT } from "../ui/tokens.s";
 import { ScrollArea, ScrollBox } from "../ui/ScrollArea.c";
 import { ModelsSettings } from "./ModelsSettings.c";
+import { TerminalSettings } from "./TerminalSettings.c";
 import { ProjectSelect, ProjectSettingsPanel } from "./ProjectSettings.c";
 import { Segmented, SettingRow, SettingsCard, Sep } from "./SettingsParts.c";
+import { Switch } from "../ui/Switch.c";
 
 export type SettingsSection =
   | "general"
@@ -18,6 +20,7 @@ export type SettingsSection =
   | "projects"
   | "project-settings"
   | "models"
+  | "terminal"
   | "about";
 
 export function SettingsModal({
@@ -37,6 +40,7 @@ export function SettingsModal({
   onGlobalAutoRun,
   initialProject,
   initialSection,
+  mode = "agent",
   onClose,
 }: {
   theme: Theme;
@@ -57,9 +61,20 @@ export function SettingsModal({
   initialProject?: string | null;
   /** Tab to land on — "Project Settings" opens it directly. */
   initialSection?: SettingsSection;
+  /**
+   * Which app mode opened the modal. The SAME modal serves both modes:
+   * General and About are always available; the agent sections (Models,
+   * Execution, Behavior, Projects…) show in agent mode, and SSH Client gets
+   * the Terminal section instead.
+   */
+  mode?: "agent" | "ssh";
   onClose: () => void;
 }) {
   const [section, setSection] = useState<SettingsSection>(initialSection ?? "general");
+  // A section that this mode does not offer (deep link / stale state) lands
+  // on General — General and About exist in EVERY mode.
+  const sshSections: SettingsSection[] = ["general", "terminal", "about"];
+  const effectiveSection = mode === "ssh" && !sshSections.includes(section) ? "general" : section;
   const [settingsProject, setSettingsProject] = useState<string | null>(initialProject ?? null);
   const [sendMode, setSendMode] = useState("Queue");
   const [turboMode, setTurboMode] = useState("Turbo Mode");
@@ -108,28 +123,38 @@ export function SettingsModal({
     setName("");
   };
 
-  const navItems: Array<{ group: string; items: Array<{ id: SettingsSection; label: string }> }> = [
-    {
-      group: "Settings",
-      items: [
-        { id: "general", label: "General" },
-        { id: "models", label: "Models" },
-        { id: "execution", label: "Execution" },
-        { id: "behavior", label: "Agent Behavior" },
-      ],
-    },
-    {
-      group: "Projects",
-      items: [
-        { id: "permissions", label: "Permissions" },
-        { id: "projects", label: "Manage Projects" },
-        { id: "project-settings", label: "Project Settings" },
-      ],
-    },
-    {
-      group: "App",
-      items: [{ id: "about", label: "About" }],
-    },
+  // Both modes share this modal. General/About (and their groups) are always
+  // available; agent-specific sections show in agent mode only, the SSH
+  // Terminal section in SSH Client mode only.
+  type NavItem = { id: SettingsSection; label: string };
+  type NavGroup = { group: string; items: NavItem[] };
+  const settingsItems: NavItem[] =
+    mode === "agent"
+      ? [
+          { id: "general", label: "General" },
+          { id: "models", label: "Models" },
+          { id: "execution", label: "Execution" },
+          { id: "behavior", label: "Agent Behavior" },
+        ]
+      : [
+          { id: "general", label: "General" },
+          { id: "terminal", label: "Terminal" },
+        ];
+  const navItems: NavGroup[] = [
+    { group: "Settings", items: settingsItems },
+    ...(mode === "agent"
+      ? ([
+          {
+            group: "Projects",
+            items: [
+              { id: "permissions", label: "Permissions" },
+              { id: "projects", label: "Manage Projects" },
+              { id: "project-settings", label: "Project Settings" },
+            ],
+          },
+        ] as NavGroup[])
+      : []),
+    { group: "App", items: [{ id: "about", label: "About" }] },
   ];
 
   const titles: Record<SettingsSection, [string, string]> = {
@@ -140,6 +165,7 @@ export function SettingsModal({
     permissions: ["Global Permissions", "Tool and filesystem access rules"],
     projects: ["Manage Projects", "Create and organize project folders"],
     "project-settings": ["Project Settings", "Rename, permissions and delete for one project"],
+    terminal: ["Terminal", "Theme and behaviour of the SSH console"],
     about: ["About", "Application information"],
   };
 
@@ -173,7 +199,7 @@ export function SettingsModal({
                 <button
                   key={it.id}
                   className={`flex h-8 w-full items-center rounded-lg px-2.5 text-left text-[13px] transition-colors ${
-                    section === it.id
+                    effectiveSection === it.id
                       ? "bg-[var(--bg-elevated)] text-[var(--text-main)]"
                       : "text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
                   }`}
@@ -204,26 +230,31 @@ export function SettingsModal({
             </button>
           </div>
 
-          {section === "general" && (
+          {effectiveSection === "general" && (
             <SettingsCard>
               <SettingRow title="Theme" hint="Application color scheme">
                 <Segmented options={THEMES} value={theme} onChange={(v) => onTheme(v as Theme)} />
               </SettingRow>
-              <Sep />
-              <SettingRow title="Send Behavior" hint="How submitted prompts are handled">
-                <Segmented
-                  options={["Queue", "Send Immediately"]}
-                  value={sendMode}
-                  onChange={(v) => {
-                    setSendMode(v);
-                    persistSetting("send_mode", v);
-                  }}
-                />
-              </SettingRow>
+              {/* Send Behavior is an agent-chat setting — agent mode only. */}
+              {mode === "agent" && (
+                <>
+                  <Sep />
+                  <SettingRow title="Send Behavior" hint="How submitted prompts are handled">
+                    <Segmented
+                      options={["Queue", "Send Immediately"]}
+                      value={sendMode}
+                      onChange={(v) => {
+                        setSendMode(v);
+                        persistSetting("send_mode", v);
+                      }}
+                    />
+                  </SettingRow>
+                </>
+              )}
             </SettingsCard>
           )}
 
-          {section === "models" && (
+          {effectiveSection === "models" && (
             <ModelsSettings
               providers={providers}
               models={models}
@@ -233,7 +264,9 @@ export function SettingsModal({
             />
           )}
 
-          {section === "execution" && (
+          {effectiveSection === "terminal" && <TerminalSettings />}
+
+          {effectiveSection === "execution" && (
             <SettingsCard>
               <SettingRow title="Run Mode" hint="Auto-pilot vs supervised execution">
                 <select
@@ -270,7 +303,7 @@ export function SettingsModal({
             </SettingsCard>
           )}
 
-          {section === "behavior" && (
+          {effectiveSection === "behavior" && (
             <SettingsCard>
               <SettingRow title="Autonomy Level" hint="How much freedom agents get">
                 <Segmented
@@ -284,47 +317,28 @@ export function SettingsModal({
               </SettingRow>
               <Sep />
               <SettingRow title="Stop on Error" hint="Halt the pipeline when a step fails">
-                <button
-                  className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
-                    stopOnError ? "bg-[var(--accent)]" : "bg-[var(--bg-elevated)]"
-                  }`}
-                  onClick={() => {
-                    const next = !stopOnError;
+                <Switch
+                  on={stopOnError}
+                  onChange={(next) => {
                     setStopOnError(next);
                     persistSetting("stop_on_error", next ? "1" : "0");
                   }}
-                  aria-label="toggle"
-                >
-                  {/* The knob is anchored left so it never overflows the track. */}
-                  <span
-                    className={`absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
-                      stopOnError ? "translate-x-[16px]" : "translate-x-0"
-                    }`}
-                  />
-                </button>
+                />
               </SettingRow>
             </SettingsCard>
           )}
 
-          {section === "permissions" && (
+          {effectiveSection === "permissions" && (
             <SettingsCard>
               <SettingRow
                 title="Run Commands Without Asking"
                 hint="Global default for projects set to “As default”"
               >
-                <button
-                  className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${
-                    globalAutoRun ? "bg-[var(--accent)]" : "bg-[var(--bg-elevated)]"
-                  }`}
-                  onClick={() => onGlobalAutoRun(!globalAutoRun)}
-                  aria-label="toggle global auto-run"
-                >
-                  <span
-                    className={`absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
-                      globalAutoRun ? "translate-x-[16px]" : "translate-x-0"
-                    }`}
-                  />
-                </button>
+                <Switch
+                  on={globalAutoRun}
+                  onChange={onGlobalAutoRun}
+                  ariaLabel="toggle global auto-run"
+                />
               </SettingRow>
               <Sep />
               <SettingRow title="Filesystem Access" hint="Scope of writable paths">
@@ -337,7 +351,7 @@ export function SettingsModal({
             </SettingsCard>
           )}
 
-          {section === "projects" && (
+          {effectiveSection === "projects" && (
             <div className="flex flex-col gap-3">
               <SettingsCard>
                 <ScrollBox className="flex max-h-[300px] flex-col gap-1 pr-2">
@@ -371,7 +385,7 @@ export function SettingsModal({
             </div>
           )}
 
-          {section === "project-settings" && (
+          {effectiveSection === "project-settings" && (
             <div className="flex flex-col gap-3">
               <SettingsCard>
                 <SettingRow title="Project" hint="Which project these settings apply to">
@@ -399,7 +413,7 @@ export function SettingsModal({
             </div>
           )}
 
-          {section === "about" && (
+          {effectiveSection === "about" && (
             <SettingsCard>
               <SettingRow title="Application" hint="Singularity — agentic desktop workspace">
                 <span className="font-mono text-[13px] text-[var(--text-main)]">

@@ -9,12 +9,11 @@ import {
   Trash2,
   ShieldCheck,
   RotateCcw,
-  TerminalSquare,
   Info,
+  Copy,
 } from "lucide-react";
 import * as db from "../core/db.r";
 import type { SshKey, SshScript, SshServer } from "../core/types.i";
-import { APP_VERSION } from "../core/types.i";
 import { ScrollArea } from "../ui/ScrollArea.c";
 
 /**
@@ -29,55 +28,13 @@ import { ScrollArea } from "../ui/ScrollArea.c";
 export type SshPanelTarget =
   | { kind: "server"; id?: string } // id undefined = create
   | { kind: "key"; id?: string }
-  | { kind: "script"; id?: string }
-  | { kind: "settings" };
-
-/** Terminal appearance/behaviour persisted as app settings. */
-export interface SshTerminalSettings {
-  fontSize: number;
-  fontFamily: string;
-  scrollback: number;
-  cursorBlink: boolean;
-  /** "xterm-256color" covers virtually every server. */
-  term: string;
-}
-
-export const DEFAULT_SSH_TERMINAL: SshTerminalSettings = {
-  fontSize: 13,
-  fontFamily: "Cascadia Mono, Consolas, 'Courier New', monospace",
-  scrollback: 5000,
-  cursorBlink: true,
-  term: "xterm-256color",
-};
+  | { kind: "script"; id?: string };
 
 const FIELD =
   "h-9 w-full rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 text-[12.5px] text-[var(--text-main)] outline-none transition-colors focus:border-[var(--accent)]";
 const LABEL = "mb-1.5 block text-[11px] font-medium text-[var(--text-muted)]";
 const AREA =
   "w-full resize-none rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 font-mono text-[11px] leading-[1.5] text-[var(--text-main)] outline-none transition-colors focus:border-[var(--accent)]";
-
-/** Termius-style toggle switch for boolean settings. */
-function Switch({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={on}
-      onClick={() => onChange(!on)}
-      className={
-        "relative h-5 w-9 shrink-0 rounded-full transition-colors duration-150 " +
-        (on ? "bg-[var(--accent)]" : "bg-[var(--hover-bg)]")
-      }
-    >
-      <span
-        className={
-          "absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-150 " +
-          (on ? "translate-x-[18px]" : "translate-x-0.5")
-        }
-      />
-    </button>
-  );
-}
 
 /** Termius-style section divider: small-caps label over a hairline. */
 function Section({ title, children }: { title: string; children?: React.ReactNode }) {
@@ -96,8 +53,6 @@ export function SshPanel({
   servers,
   keys,
   scripts,
-  connected,
-  vaultBacked,
   width,
   onResizeStart,
   onChanged,
@@ -107,8 +62,6 @@ export function SshPanel({
   servers: SshServer[];
   keys: SshKey[];
   scripts: SshScript[];
-  connected: string[];
-  vaultBacked: boolean;
   /** Current panel width in px — dragged by the handle on its left edge. */
   width: number;
   /** Starts a drag-resize (same mechanics as the chat inspection panel). */
@@ -136,31 +89,23 @@ export function SshPanel({
   }, [server, sshKey, script]);
 
   const title =
-    target.kind === "settings"
-      ? "Settings"
-      : target.kind === "server"
-        ? server
-          ? "Edit server"
-          : "New server"
-        : target.kind === "key"
-          ? sshKey
-            ? "Edit credential"
-            : "New credential"
-          : script
-            ? "Edit script"
-            : "New script";
+    target.kind === "server"
+      ? server
+        ? "Edit server"
+        : "New server"
+      : target.kind === "key"
+        ? sshKey
+          ? "Edit credential"
+          : "New credential"
+        : script
+          ? "Edit script"
+          : "New script";
 
   const TitleIcon =
-    target.kind === "settings"
-      ? TerminalSquare
-      : target.kind === "server"
-        ? Server
-        : target.kind === "key"
-          ? KeyRound
-          : FileCode2;
+    target.kind === "server" ? Server : target.kind === "key" ? KeyRound : FileCode2;
 
   // key=… forces a fresh form state when the panel switches rows.
-  const formKey = target.kind + ":" + (target.kind !== "settings" ? target.id ?? "new" : "app");
+  const formKey = target.kind + ":" + (target.id ?? "new");
 
   return (
     <motion.aside
@@ -197,9 +142,6 @@ export function SshPanel({
         )}
         {target.kind === "script" && (
           <ScriptForm key={formKey} value={script} onChanged={onChanged} onClose={onClose} />
-        )}
-        {target.kind === "settings" && (
-          <SettingsForm key={formKey} servers={servers} keys={keys} scripts={scripts} connected={connected} vaultBacked={vaultBacked} />
         )}
       </ScrollArea>
     </motion.aside>
@@ -275,12 +217,14 @@ function ServerForm({
   const [host, setHost] = useState(server?.host ?? "");
   const [port, setPort] = useState(String(server?.port ?? 22));
   const [username, setUsername] = useState(server?.username ?? "root");
-  const [auth, setAuth] = useState<SshServer["auth"]>(server?.auth ?? "password");
+  // Termius-style dual auth: BOTH a password and a saved credential key may
+  // be set at once — the connector tries the key first, then the password.
+  // Inline key paste is gone: private bodies live only in Credentials.
   const [password, setPassword] = useState("");
-  const [privateKey, setPrivateKey] = useState("");
-  const [keyId, setKeyId] = useState(server?.key_id || keys[0]?.id || "");
+  const [keyId, setKeyId] = useState(server?.key_id ?? "");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const hasStoredPassword = !!server?.has_password;
 
   const save = async () => {
     setError(null);
@@ -290,9 +234,9 @@ function ServerForm({
     if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
       return setError("Port must be a number from 1 to 65535.");
     }
-    if (auth === "password" && !server && !password) return setError("Enter the password (or choose another method).");
-    if (auth === "key" && !server && !privateKey.trim()) return setError("Paste the private key (or choose another method).");
-    if (auth === "cred" && !keyId) return setError("Pick a saved credential — or add one under Credentials first.");
+    if (!server && !password && !keyId) {
+      return setError("Set a password and/or pick a saved key credential.");
+    }
     setBusy(true);
     try {
       await db.saveSshServer({
@@ -301,13 +245,16 @@ function ServerForm({
         host: host.trim(),
         port: portNum,
         username: username.trim() || "root",
-        auth,
-        // Blank secrets mean "keep stored" when editing — Rust never sends
-        // plaintext back to the webview, so there is nothing to resend.
+        // "cred" when a key is linked (tried first on connect), else password.
+        auth: keyId ? "cred" : "password",
+        // Blank password means "keep stored" when editing — Rust never sends
+        // plaintext back; "-" (clear button) removes it.
         password,
-        private_key: privateKey,
-        key_id: auth === "cred" ? keyId : "",
+        private_key: "",
+        key_id: keyId,
         host_key: server?.host_key ?? "",
+        has_password: hasStoredPassword,
+        os: server?.os ?? "",
       });
       onChanged();
       onClose();
@@ -348,18 +295,20 @@ function ServerForm({
     }
   };
 
-  const seg = (id: SshServer["auth"], label: string) => (
-    <button
-      type="button"
-      className={
-        "h-7 flex-1 rounded text-[11.5px] transition-colors " +
-        (auth === id ? "bg-[var(--accent)] text-white" : "text-[var(--text-muted)] hover:text-[var(--text-main)]")
-      }
-      onClick={() => setAuth(id)}
-    >
-      {label}
-    </button>
-  );
+  const clearPassword = async () => {
+    if (!server) return;
+    setBusy(true);
+    try {
+      // "-" is the wire signal to REMOVE the stored password (key-only host).
+      await db.saveSshServer({ ...server, password: "-" });
+      onChanged();
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="flex flex-col">
@@ -385,48 +334,60 @@ function ServerForm({
       </Section>
 
       <Section title="Authentication">
-        <div className="flex gap-1 rounded-md border border-[var(--border)] bg-[var(--bg-input)] p-0.5">
-          {seg("password", "Password")}
-          {seg("key", "Key")}
-          {seg("cred", "Credential")}
+        {/* Termius-style: BOTH methods may be set at once. The connector
+            tries the key first, then falls back to the password. */}
+        <div className="flex items-start gap-1.5 text-[11px] leading-[1.5] text-[var(--text-dim)]">
+          <Info size={12} className="mt-0.5 shrink-0" />
+          You can set a password AND a key credential — on connect the key is
+          tried first, the password is the fallback. Either one alone works too.
         </div>
-        {auth === "password" && (
-          <div>
-            <label className={LABEL}>Password{server ? " — blank keeps the stored one" : ""}</label>
-            <input className={FIELD} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={server ? "••••••••" : ""} />
-          </div>
-        )}
-        {auth === "key" && (
-          <div>
-            <label className={LABEL}>Private key (PEM / OpenSSH){server ? " — blank keeps the stored one" : ""}</label>
-            <textarea
-              className={AREA + " h-28"}
-              value={privateKey}
-              onChange={(e) => setPrivateKey(e.target.value)}
-              placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
-              spellCheck={false}
+        <div>
+          <label className={LABEL}>
+            Password
+            {server ? " — blank keeps the stored one" : ""}
+          </label>
+          <div className="flex gap-2">
+            <input
+              className={FIELD}
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder={hasStoredPassword ? "•••••••• (stored)" : "optional"}
             />
-          </div>
-        )}
-        {auth === "cred" && (
-          <div>
-            <label className={LABEL}>Saved credential</label>
-            {keys.length === 0 ? (
-              <div className="rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-[11.5px] text-[var(--text-muted)]">
-                None saved — open Credentials (sidebar +) and add a private key first.
-              </div>
-            ) : (
-              <select className={FIELD} value={keyId} onChange={(e) => setKeyId(e.target.value)}>
-                {keys.map((k) => (
-                  <option key={k.id} value={k.id}>
-                    {k.name}
-                    {k.fingerprint ? " · " + k.fingerprint.slice(0, 20) : ""}
-                  </option>
-                ))}
-              </select>
+            {hasStoredPassword && (
+              <button
+                type="button"
+                className="flex h-9 shrink-0 items-center gap-1 rounded-md border border-[var(--border)] px-2 text-[11px] text-[var(--text-muted)] transition-colors hover:border-[var(--diff-del)]/50 hover:text-[var(--diff-del)]"
+                onClick={() => void clearPassword()}
+                title="Remove the stored password"
+              >
+                <RotateCcw size={11} /> Clear
+              </button>
             )}
           </div>
-        )}
+        </div>
+        <div>
+          <label className={LABEL}>Key credential — from the Credentials list only</label>
+          {keys.length === 0 ? (
+            <div className="rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-[11.5px] text-[var(--text-muted)]">
+              No credentials yet — add or generate one in Credentials (sidebar +) first.
+            </div>
+          ) : (
+            <select className={FIELD} value={keyId} onChange={(e) => setKeyId(e.target.value)}>
+              <option value="">No key — password only</option>
+              {keys.map((k) => (
+                <option key={k.id} value={k.id}>
+                  {k.name}
+                  {k.comment === "Generated By Singularity" ? " ✦" : ""}
+                  {k.fingerprint ? " · " + k.fingerprint.slice(0, 20) : ""}
+                </option>
+              ))}
+            </select>
+          )}
+          {keys.some((k) => k.id === keyId && k.comment === "Generated By Singularity") && (
+            <div className="mt-1 text-[10.5px] text-[var(--accent)]">✦ Generated By Singularity</div>
+          )}
+        </div>
       </Section>
 
       <Section title="Security">
@@ -476,6 +437,15 @@ function ServerForm({
 
 /* ---------- Key form ---------- */
 
+/** Algorithms the generator offers — labels mirror ssh-keygen -t values. */
+const KEY_ALGORITHMS: Array<{ id: string; label: string }> = [
+  { id: "ed25519", label: "Ed25519 — modern default" },
+  { id: "ecdsa-p256", label: "ECDSA P-256" },
+  { id: "ecdsa-p384", label: "ECDSA P-384" },
+  { id: "ecdsa-p521", label: "ECDSA P-521" },
+  { id: "rsa", label: "RSA 4096 — max compatibility" },
+];
+
 function KeyForm({
   value,
   onChanged,
@@ -490,6 +460,26 @@ function KeyForm({
   const [passphrase, setPassphrase] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** Create mode: paste an existing body OR generate a fresh keypair. */
+  const [mode, setMode] = useState<"paste" | "generate">("generate");
+  const [algorithm, setAlgorithm] = useState("ed25519");
+  /** Set right after generation: shows the public key to copy to servers. */
+  const [generated, setGenerated] = useState<SshKey | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const gen = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      const row = await db.generateSshKey(name.trim(), algorithm, passphrase);
+      setGenerated(row);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const save = async () => {
     setError(null);
@@ -505,6 +495,8 @@ function KeyForm({
         passphrase,
         has_key: value?.has_key ?? !!privateKey.trim(),
         fingerprint: value?.fingerprint ?? "",
+        comment: value?.comment ?? "",
+        public_key: value?.public_key ?? "",
       });
       onChanged();
       onClose();
@@ -512,6 +504,16 @@ function KeyForm({
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const copyPublic = async (pub: string) => {
+    try {
+      await navigator.clipboard.writeText(pub);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard unavailable — the key is selectable in the box anyway */
     }
   };
 
@@ -529,6 +531,53 @@ function KeyForm({
     }
   };
 
+  // Right after generation: show the public half + copy button instead of
+  // the form (the row is already saved; Done closes the panel).
+  if (generated) {
+    return (
+      <div className="flex flex-col">
+        <Section title="Generated">
+          <div className="flex items-center gap-1.5 text-[12px] font-medium text-[var(--accent)]">
+            <ShieldCheck size={13} /> {generated.comment || "Generated By Singularity"}
+          </div>
+          <div>
+            <label className={LABEL}>Name</label>
+            <div className="text-[12.5px] text-[var(--text-main)]">{generated.name}</div>
+          </div>
+          <div>
+            <label className={LABEL}>Fingerprint</label>
+            <div className="break-all font-mono text-[10.5px] text-[var(--text-muted)]">{generated.fingerprint}</div>
+          </div>
+          <div>
+            <label className={LABEL}>Public key — put it on the server (authorized_keys)</label>
+            <textarea
+              className={AREA + " h-24"}
+              readOnly
+              value={generated.public_key}
+              onFocus={(e) => e.currentTarget.select()}
+            />
+            <button
+              type="button"
+              className="mt-2 flex h-7 items-center gap-1.5 rounded-md border border-[var(--border)] px-2.5 text-[11px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+              onClick={() => void copyPublic(generated.public_key ?? "")}
+            >
+              <Copy size={11} /> {copied ? "Copied" : "Copy public key"}
+            </button>
+          </div>
+        </Section>
+        <div className="sticky bottom-0 mt-4 flex justify-end gap-2 border-t border-[var(--border)] bg-[var(--bg-sidebar)] px-1 pt-3">
+          <button
+            type="button"
+            className="flex h-8 items-center rounded-md bg-[var(--accent)] px-4 text-[12px] font-medium text-white transition-colors hover:bg-[var(--accent-hover)]"
+            onClick={onClose}
+          >
+            Done
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col">
       <Section title="Credential">
@@ -536,31 +585,96 @@ function KeyForm({
           <label className={LABEL}>Label</label>
           <input className={FIELD} value={name} onChange={(e) => setName(e.target.value)} placeholder="deploy key" autoFocus />
         </div>
-        <div>
-          <label className={LABEL}>Private key (PEM / OpenSSH){value ? " — blank keeps the stored one" : ""}</label>
-          <textarea
-            className={AREA + " h-32"}
-            value={privateKey}
-            onChange={(e) => setPrivateKey(e.target.value)}
-            placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
-            spellCheck={false}
-          />
-        </div>
-        <div>
-          <label className={LABEL}>Passphrase{value ? " — blank keeps the stored one" : " (if the key is encrypted)"}</label>
-          <input className={FIELD} type="password" value={passphrase} onChange={(e) => setPassphrase(e.target.value)} placeholder={value ? "••••••••" : ""} />
-        </div>
+        {!value && (
+          <div className="flex gap-1 rounded-md border border-[var(--border)] bg-[var(--bg-input)] p-0.5">
+            <button
+              type="button"
+              className={
+                "h-7 flex-1 rounded text-[11.5px] transition-colors " +
+                (mode === "generate" ? "bg-[var(--accent)] text-white" : "text-[var(--text-muted)] hover:text-[var(--text-main)]")
+              }
+              onClick={() => setMode("generate")}
+            >
+              Generate new
+            </button>
+            <button
+              type="button"
+              className={
+                "h-7 flex-1 rounded text-[11.5px] transition-colors " +
+                (mode === "paste" ? "bg-[var(--accent)] text-white" : "text-[var(--text-muted)] hover:text-[var(--text-main)]")
+              }
+              onClick={() => setMode("paste")}
+            >
+              Import existing
+            </button>
+          </div>
+        )}
+        {!value && mode === "generate" && (
+          <>
+            <div>
+              <label className={LABEL}>Algorithm</label>
+              <select className={FIELD} value={algorithm} onChange={(e) => setAlgorithm(e.target.value)}>
+                {KEY_ALGORITHMS.map((a) => (
+                  <option key={a.id} value={a.id}>{a.label}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className={LABEL}>Passphrase — optional</label>
+              <input className={FIELD} type="password" value={passphrase} onChange={(e) => setPassphrase(e.target.value)} placeholder="encrypts the generated key" />
+            </div>
+            <div className="flex items-start gap-1.5 text-[11px] leading-[1.5] text-[var(--text-dim)]">
+              <Info size={12} className="mt-0.5 shrink-0" />
+              The keypair is created on this machine and stored encrypted; its
+              comment will read “Generated By Singularity”.
+            </div>
+          </>
+        )}
+        {(value || mode === "paste") && (
+          <div>
+            <label className={LABEL}>Private key (PEM / OpenSSH){value ? " — blank keeps the stored one" : ""}</label>
+            <textarea
+              className={AREA + " h-32"}
+              value={privateKey}
+              onChange={(e) => setPrivateKey(e.target.value)}
+              placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+              spellCheck={false}
+            />
+          </div>
+        )}
+        {(value || mode === "paste") && (
+          <div>
+            <label className={LABEL}>Passphrase{value ? " — blank keeps the stored one" : " (if the key is encrypted)"}</label>
+            <input className={FIELD} type="password" value={passphrase} onChange={(e) => setPassphrase(e.target.value)} placeholder={value ? "••••••••" : ""} />
+          </div>
+        )}
+        {value?.comment === "Generated By Singularity" && (
+          <div className="text-[11px] font-medium text-[var(--accent)]">✦ Generated By Singularity</div>
+        )}
         {value?.fingerprint && (
           <div className="flex items-center gap-1.5 rounded-md bg-[var(--bg-input)] px-3 py-2">
             <ShieldCheck size={12} className="shrink-0 text-[var(--accent)]" />
             <span className="min-w-0 break-all font-mono text-[10.5px] text-[var(--text-muted)]">{value.fingerprint}</span>
           </div>
         )}
+        {value?.public_key && (
+          <div>
+            <label className={LABEL}>Public key</label>
+            <textarea className={AREA + " h-16"} readOnly value={value.public_key} onFocus={(e) => e.currentTarget.select()} />
+            <button
+              type="button"
+              className="mt-2 flex h-7 items-center gap-1.5 rounded-md border border-[var(--border)] px-2.5 text-[11px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+              onClick={() => void copyPublic(value.public_key ?? "")}
+            >
+              <Copy size={11} /> {copied ? "Copied" : "Copy public key"}
+            </button>
+          </div>
+        )}
       </Section>
       <ErrorLine error={error} />
       <FormButtons
-        onSave={() => void save()}
-        saveLabel={value ? "Save" : "Create"}
+        onSave={mode === "generate" && !value ? () => void gen() : () => void save()}
+        saveLabel={!value && mode === "generate" ? "Generate" : value ? "Save" : "Create"}
         busy={busy}
         onDelete={value ? () => void del() : undefined}
         onClose={onClose}
@@ -651,210 +765,6 @@ function ScriptForm({
         onDelete={value ? () => void del() : undefined}
         onClose={onClose}
       />
-    </div>
-  );
-}
-
-/* ---------- App SSH settings (Terminal / Security / Units) ---------- */
-
-const FONT_FAMILIES = [
-  "Cascadia Mono, Consolas, 'Courier New', monospace",
-  "Consolas, 'Courier New', monospace",
-  "'JetBrains Mono', 'Fira Code', monospace",
-  "'Courier New', monospace",
-];
-
-function SettingsForm({
-  servers,
-  keys,
-  scripts,
-  connected,
-  vaultBacked,
-}: {
-  servers: SshServer[];
-  keys: SshKey[];
-  scripts: SshScript[];
-  connected: string[];
-  vaultBacked: boolean;
-}) {
-  const [term, setTerm] = useState<SshTerminalSettings>(DEFAULT_SSH_TERMINAL);
-  const [loaded, setLoaded] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const [fs, ff, sb, cb, t] = await Promise.all([
-        db.getSetting("ssh_font_size"),
-        db.getSetting("ssh_font_family"),
-        db.getSetting("ssh_scrollback"),
-        db.getSetting("ssh_cursor_blink"),
-        db.getSetting("ssh_term"),
-      ]);
-      if (cancelled) return;
-      setTerm((prev) => ({
-        fontSize: fs ? Number(fs) || prev.fontSize : prev.fontSize,
-        fontFamily: ff || prev.fontFamily,
-        scrollback: sb ? Number(sb) || prev.scrollback : prev.scrollback,
-        cursorBlink: cb === null ? prev.cursorBlink : cb === "1",
-        term: t || prev.term,
-      }));
-      setLoaded(true);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const persist = (patch: Partial<SshTerminalSettings>) => {
-    setTerm((prev) => {
-      const next = { ...prev, ...patch };
-      if (patch.fontSize !== undefined) void db.setSetting("ssh_font_size", String(next.fontSize));
-      if (patch.fontFamily !== undefined) void db.setSetting("ssh_font_family", next.fontFamily);
-      if (patch.scrollback !== undefined) void db.setSetting("ssh_scrollback", String(next.scrollback));
-      if (patch.cursorBlink !== undefined) void db.setSetting("ssh_cursor_blink", next.cursorBlink ? "1" : "0");
-      if (patch.term !== undefined) void db.setSetting("ssh_term", next.term);
-      return next;
-    });
-  };
-
-  const pinned = servers.filter((s) => s.host_key).length;
-  const chip = "rounded-md bg-[var(--bg-input)] px-2 py-0.5 font-mono text-[11px] text-[var(--text-main)]";
-
-  return (
-    <div className="flex flex-col pb-4">
-      <Section title="Terminal">
-        <div>
-          <label className={LABEL}>Font size — {term.fontSize}px</label>
-          <input
-            type="range"
-            min={10}
-            max={22}
-            value={term.fontSize}
-            onChange={(e) => persist({ fontSize: Number(e.target.value) })}
-            className="w-full accent-[var(--accent)]"
-          />
-        </div>
-        <div>
-          <label className={LABEL}>Font family</label>
-          <select className={FIELD} value={term.fontFamily} onChange={(e) => persist({ fontFamily: e.target.value })}>
-            {FONT_FAMILIES.map((f) => (
-              <option key={f} value={f}>
-                {f.split(",")[0].replace(/['"]/g, "")}
-              </option>
-            ))}
-          </select>
-        </div>
-        {/* Termius-style setting row: label + hint left, control right */}
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <div className="text-[12.5px] text-[var(--text-main)]">Cursor blink</div>
-            <div className="mt-0.5 text-[11px] text-[var(--text-dim)]">Animate the terminal cursor</div>
-          </div>
-          <Switch on={term.cursorBlink} onChange={(v) => persist({ cursorBlink: v })} />
-        </div>
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <div className="text-[12.5px] text-[var(--text-main)]">Scrollback</div>
-            <div className="mt-0.5 text-[11px] text-[var(--text-dim)]">Lines kept in history</div>
-          </div>
-          <select
-            className={FIELD + " w-40 shrink-0"}
-            value={String(term.scrollback)}
-            onChange={(e) => persist({ scrollback: Number(e.target.value) })}
-          >
-            {[1000, 5000, 10000, 50000].map((n) => (
-              <option key={n} value={n}>
-                {n.toLocaleString()} lines
-              </option>
-            ))}
-          </select>
-        </div>
-        <div>
-          <label className={LABEL}>TERM</label>
-          <input
-            className={FIELD + " font-mono"}
-            value={term.term}
-            onChange={(e) => persist({ term: e.target.value })}
-            spellCheck={false}
-          />
-        </div>
-        {/* Live preview — renders with the saved settings once loaded. */}
-        {loaded && (
-          <div
-            className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-input)] p-3"
-            style={{ fontFamily: term.fontFamily, fontSize: term.fontSize + "px" }}
-          >
-            <div className="text-[var(--text-muted)]">{`root@${servers[0]?.host ?? "host"}:~# uptime`}</div>
-            <div className="text-[var(--text-main)]"> 14:02:11 up 12 days,  3:41,  1 user,  load average: 0.08, 0.12, 0.09</div>
-            <div className="text-[var(--text-muted)]">
-              {`root@${servers[0]?.host ?? "host"}:~# `}
-              <span className={term.cursorBlink ? "animate-pulse" : undefined}>▊</span>
-            </div>
-          </div>
-        )}
-      </Section>
-
-      <Section title="Security">
-        <div className="flex items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] px-3 py-2">
-          <span className="text-[12px] text-[var(--text-main)]">Credential vault</span>
-          <span
-            className={
-              "flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-medium " +
-              (vaultBacked
-                ? "bg-[var(--diff-add,#4ec9b0)]/10 text-[var(--diff-add,#4ec9b0)]"
-                : "bg-[var(--diff-del)]/10 text-[var(--diff-del)]")
-            }
-          >
-            <ShieldCheck size={12} />
-            {vaultBacked ? "Protected" : "Session-only"}
-          </span>
-        </div>
-        <div className="flex items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] px-3 py-2">
-          <span className="text-[12px] text-[var(--text-main)]">Host keys pinned</span>
-          <span className={chip}>{pinned}/{servers.length}</span>
-        </div>
-        <div className="text-[11px] leading-[1.6] text-[var(--text-dim)]">
-          Secrets are AES-256-GCM ciphertext in SQLite; the master key lives in
-          the OS credential store. First connect pins the host key; a changed
-          key is refused as a possible MITM.
-          {!vaultBacked && (
-            <span className="text-[var(--diff-del)]">
-              {" "}Neither keyring nor key-file is reachable right now — secrets
-              decrypt only until restart.
-            </span>
-          )}
-        </div>
-      </Section>
-
-      <Section title="Units">
-        <div className="flex items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] px-3 py-2">
-          <span className="flex items-center gap-1.5 text-[12px] text-[var(--text-main)]">
-            <Server size={12} className="text-[var(--text-dim)]" /> Servers
-          </span>
-          <span className={chip}>{connected.length}/{servers.length} live</span>
-        </div>
-        <div className="flex items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] px-3 py-2">
-          <span className="flex items-center gap-1.5 text-[12px] text-[var(--text-main)]">
-            <KeyRound size={12} className="text-[var(--text-dim)]" /> Credentials
-          </span>
-          <span className={chip}>{keys.length}</span>
-        </div>
-        <div className="flex items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] px-3 py-2">
-          <span className="flex items-center gap-1.5 text-[12px] text-[var(--text-main)]">
-            <FileCode2 size={12} className="text-[var(--text-dim)]" /> Scripts
-          </span>
-          <span className={chip}>{scripts.length}</span>
-        </div>
-      </Section>
-
-      <Section title="About">
-        <div className="text-[11px] leading-[1.6] text-[var(--text-dim)]">
-          SSH Client mode v{APP_VERSION} — connections, PTY terminals, SFTP and
-          the credential vault run natively in Rust (russh + russh-sftp); the
-          agent shares the same pool via the ssh_exec tool. Every action is
-          written to the audit log (Logs page).
-        </div>
-      </Section>
     </div>
   );
 }

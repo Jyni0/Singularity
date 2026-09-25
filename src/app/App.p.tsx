@@ -264,6 +264,12 @@ export default function App() {
       .onSshEvent({
         onStatus: (ids) => setSshConnectedIds(ids),
         onLogged: () => {},
+        // A connect just detected the remote OS — patch the row in place so
+        // the logo appears without a full reload.
+        onOs: ([serverId, os]) =>
+          setSshServers((prev) =>
+            prev.map((s) => (s.id === serverId ? { ...s, os } : s))
+          ),
       })
       .then((fn) => {
         off = fn;
@@ -1152,7 +1158,7 @@ export default function App() {
             connected={sshConnectedIds}
             view={view}
             activeConn={activeConn}
-            activePanel={sshPanel && sshPanel.kind !== "settings" ? sshPanel : null}
+            activePanel={sshPanel}
             onOpenConn={openSshConn}
             onSelectConn={selectSshConn}
             onCloseConn={closeSshConn}
@@ -1167,7 +1173,13 @@ export default function App() {
                 kind: tab === "servers" ? "server" : tab === "keys" ? "key" : "script",
               });
             }}
-            onOpenSettings={() => setSshPanel({ kind: "settings" })}
+            onOpenSettings={() => {
+              // Same SettingsModal the Agent mode opens — these settings and
+              // only these; unit create/edit forms stay in SshPanel.
+              setSettingsSection("general");
+              setSettingsProject(null);
+              setModal("settings");
+            }}
           />
         ) : (
           <Sidebar
@@ -1525,8 +1537,6 @@ export default function App() {
               servers={sshServers}
               keys={sshKeys}
               scripts={sshScripts}
-              connected={sshConnectedIds}
-              vaultBacked={sshVaultBacked}
               width={sshPanelWidth}
               onResizeStart={startSshPanelResize}
               onChanged={reloadSshServers}
@@ -1562,6 +1572,7 @@ export default function App() {
               }}
               initialProject={settingsProject}
               initialSection={settingsSection}
+              mode={mode}
               onClose={() => {
                 setModal("none");
                 // The next plain "Settings" click must land on General again.

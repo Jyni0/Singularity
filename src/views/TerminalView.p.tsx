@@ -7,7 +7,17 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import * as db from "../core/db.r";
 import type { SshServer } from "../core/types.i";
-import { DEFAULT_SSH_TERMINAL } from "../layout/SshPanel.c";
+import { DEFAULT_TERMINAL_THEME, terminalTheme } from "../ui/TerminalTheme.s";
+import { OsLogo } from "../ui/OsLogo.c";
+
+/** Fallbacks for the ssh_* appearance settings (persisted in SQLite). */
+const DEFAULT_SSH_TERMINAL = {
+  fontSize: 13,
+  fontFamily: "Cascadia Mono, Consolas, 'Courier New', monospace",
+  scrollback: 5000,
+  cursorBlink: true,
+  term: "xterm-256color",
+};
 
 /**
  * connId → live PTY session id. Module-level on purpose: connection pages
@@ -73,13 +83,14 @@ export function TerminalView({
       const host = hostRef.current;
       if (!host) return;
 
-      // 0. SSH-mode terminal settings (the SSH settings modal persists them).
-      const [fs, ff, sb, cb, termType] = await Promise.all([
+      // 0. SSH-mode terminal settings (Settings → Terminal persists them).
+      const [fs, ff, sb, cb, termType, themeName] = await Promise.all([
         db.getSetting("ssh_font_size"),
         db.getSetting("ssh_font_family"),
         db.getSetting("ssh_scrollback"),
         db.getSetting("ssh_cursor_blink"),
         db.getSetting("ssh_term"),
+        db.getSetting("ssh_theme"),
       ]);
       if (cancelled) {
         return;
@@ -90,21 +101,23 @@ export function TerminalView({
         scrollback: sb ? Number(sb) || DEFAULT_SSH_TERMINAL.scrollback : DEFAULT_SSH_TERMINAL.scrollback,
         cursorBlink: cb === null ? DEFAULT_SSH_TERMINAL.cursorBlink : cb === "1",
         term: termType || DEFAULT_SSH_TERMINAL.term,
+        theme: themeName || DEFAULT_TERMINAL_THEME,
       };
 
-      // 1. Terminal fills its box; theme follows CSS variables.
+      // 1. Terminal fills its box; the full palette comes from the picked
+      //    theme (Settings → Terminal). A stored but unknown name falls back
+      //    to the default palette.
       const css = getComputedStyle(document.documentElement);
       const term = new Terminal({
         cursorBlink: tset.cursorBlink,
         fontSize: tset.fontSize,
         fontFamily: tset.fontFamily,
         scrollback: tset.scrollback,
-        theme: {
-          background: css.getPropertyValue("--bg-input").trim() || "#101014",
-          foreground: css.getPropertyValue("--text-main").trim() || "#e6e6e6",
-          cursor: css.getPropertyValue("--accent").trim() || "#7aa2f7",
-        },
+        theme: terminalTheme(tset.theme),
       });
+      // Blend with the app surface: match the page background outside the
+      // terminal box so the palette does not clash with the shell theme.
+      host.style.backgroundColor = terminalTheme(tset.theme).background ?? css.getPropertyValue("--bg-input").trim();
       const fit = new FitAddon();
       term.loadAddon(fit);
       term.loadAddon(new WebLinksAddon());
@@ -249,6 +262,13 @@ export function TerminalView({
       {/* No navbar: the console IS the page. Only transient states float
           over the terminal as small pills (connecting / session closed /
           error) — they never occupy layout space. */}
+      {/* Detected-OS badge floats top-left (Rust probes it on connect). */}
+      {server.os && (
+        <div className="pointer-events-none absolute left-3 top-3 z-10 flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--bg-surface)]/80 py-1 pl-1.5 pr-2.5 shadow-[var(--shadow-popup)] backdrop-blur">
+          <OsLogo os={server.os} seed={server.id} name={server.name} size={14} />
+          <span className="text-[10.5px] font-medium capitalize text-[var(--text-muted)]">{server.os}</span>
+        </div>
+      )}
       {status === "connecting" && (
         <div className="pointer-events-none absolute left-1/2 top-3 z-10 flex -translate-x-1/2 items-center gap-2 rounded-full border border-[var(--border)] bg-[var(--bg-surface)]/95 px-3.5 py-1.5 text-[12px] text-[var(--text-muted)] shadow-[var(--shadow-popup)] backdrop-blur">
           <LoaderCircle size={12} className="animate-spin" />

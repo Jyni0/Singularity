@@ -970,15 +970,24 @@ export default function App() {
           )}
 
           {view === "chat" && (
-            <div className="relative flex min-h-0 flex-1 flex-col">
-              {/* Aurora Borealis — spans the whole chat column (behind
-                  everything), visible only while generating. z-0 keeps it
-                  under the content; the prompt glass then shines it through. */}
-              <div className="absolute inset-0 z-0 overflow-hidden">
+            <div className="relative isolate flex min-h-0 flex-1 flex-col">
+              {/* Aurora Borealis — spans the whole chat column, painted
+                  BEHIND every in-flow child via a negative z-index (the
+                  column is a stacking context via isolate, so the glow can
+                  never slip under the page background).
+
+                  Do NOT "fix" this by giving the content wrapper a positive
+                  z-index: the prompt's dropdown popups (model picker, etc.)
+                  are trapped inside the glass container's stacking context
+                  (backdrop-filter creates one), and any positioned sibling
+                  with z > 0 paints over them — menus lose their background
+                  and become unclickable. Negative-z aurora keeps the natural
+                  paint order those popups rely on. */}
+              <div className="absolute inset-0 -z-10 overflow-hidden">
                 <AuroraGlow mood={promptMood} />
               </div>
               {/* Wrapper hosts the floating "jump to latest" button over the list. */}
-              <div className="relative z-10 flex min-h-0 flex-1 flex-col">
+              <div className="relative flex min-h-0 flex-1 flex-col">
               <ScrollArea className="flex-1" innerClassName="py-4" scrollRef={chatRef}>
                 <div className="px-6">
                   <div

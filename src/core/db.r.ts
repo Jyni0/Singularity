@@ -231,6 +231,21 @@ export async function setProjectPermMode(name: string, mode: PermMode): Promise<
   }
 }
 
+/**
+ * Changes a project's working directory (the folder agents open when chatting
+ * inside it). The old folder's contents are never touched — this only repoints
+ * the project row.
+ */
+export async function setProjectPath(name: string, path: string): Promise<void> {
+  const db = await getDb();
+  if (!db) {
+    const p = memory.projects.find((x) => x.name === name);
+    if (p) p.path = path;
+    return;
+  }
+  await db.execute("UPDATE projects SET path = $1 WHERE name = $2", [path, name]);
+}
+
 /** Renames a project everywhere: the row itself and all chats that point at it. */
 export async function renameProject(oldName: string, newName: string): Promise<void> {
   const db = await getDb();
@@ -465,6 +480,8 @@ interface ProviderRow {
   status: string;
   last_sync: number | null;
   auth: string | null;
+  rate_limit_rpm: number;
+  concurrency: number;
 }
 
 interface ModelRow {
@@ -480,7 +497,8 @@ export async function loadProviders(): Promise<Provider[]> {
   const db = await getDb();
   if (!db) return memory.providers;
   const rows = await db.select<ProviderRow[]>(
-    `SELECT id, name, kind, base_url, api_key, enabled, status, last_sync, auth
+    `SELECT id, name, kind, base_url, api_key, enabled, status, last_sync, auth,
+            rate_limit_rpm, concurrency
        FROM providers ORDER BY name`
   );
   return rows.map((r) => ({
@@ -493,6 +511,8 @@ export async function loadProviders(): Promise<Provider[]> {
     status: r.status as ProviderStatus,
     last_sync: r.last_sync,
     auth: (r.auth as Provider["auth"]) ?? "key",
+    rate_limit_rpm: r.rate_limit_rpm ?? 0,
+    concurrency: r.concurrency ?? 0,
   }));
 }
 
@@ -521,8 +541,9 @@ export async function upsertProvider(p: Provider): Promise<void> {
     return;
   }
   await db.execute(
-    `INSERT INTO providers (id, name, kind, base_url, api_key, enabled, status, auth)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `INSERT INTO providers (id, name, kind, base_url, api_key, enabled, status, auth,
+                             rate_limit_rpm, concurrency)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT(id) DO UPDATE SET
        name = excluded.name,
        kind = excluded.kind,
@@ -530,8 +551,21 @@ export async function upsertProvider(p: Provider): Promise<void> {
        api_key = excluded.api_key,
        enabled = excluded.enabled,
        status = excluded.status,
-       auth = excluded.auth`,
-    [p.id, p.name, p.kind, p.base_url, p.api_key, p.enabled ? 1 : 0, p.status, p.auth]
+       auth = excluded.auth,
+       rate_limit_rpm = excluded.rate_limit_rpm,
+       concurrency = excluded.concurrency`,
+    [
+      p.id,
+      p.name,
+      p.kind,
+      p.base_url,
+      p.api_key,
+      p.enabled ? 1 : 0,
+      p.status,
+      p.auth,
+      p.rate_limit_rpm ?? 0,
+      p.concurrency ?? 0,
+    ]
   );
 }
 
@@ -887,6 +921,12 @@ export interface ProviderConfig {
   effort?: "low" | "medium" | "high";
   /** Images attached to the final user turn. */
   images?: ImageAttachment[];
+  /** Provider row id — the limiter budgets requests under this key. */
+  provider_id?: string;
+  /** Max requests/minute (0 = unlimited). */
+  rate_limit_rpm?: number;
+  /** Max parallel requests (0 = unlimited). */
+  concurrency?: number;
 }
 
 /**
@@ -963,6 +1003,22 @@ export interface AgentRequest {
    * only — credentials stay in the database and are resolved server-side.
    */
   ssh_units?: { id: string; name: string; host: string }[];
+  /** Provider row id — the limiter budgets requests under this key. */
+  provider_id?: string;
+  /** Max requests/minute for the provider (0 = unlimited). */
+  rate_limit_rpm?: number;
+  /** Max parallel requests (0 = unlimited) — also the subtask parallelism. */
+  concurrency?: number;
+  /** Decompose this prompt into parallel subtasks (Task list) first. */
+  decompose?: boolean;
+}
+
+/** One subtask of a decomposed run (agent://tasks event). */
+export interface TaskState {
+  id: number;
+  title: string;
+  status: "pending" | "running" | "done" | "error" | string;
+  summary?: string;
 }
 
 export interface AgentStepEvent {
@@ -1112,6 +1168,8 @@ export async function runAgent(
     onThink?: (delta: string) => void;
     /** A command is waiting for permission; the UI shows Allow/Deny. */
     onConfirm?: (req: ConfirmRequest) => void;
+    /** Task-list updates from a decomposed run (plan → statuses → merge). */
+    onTasks?: (tasks: TaskState[]) => void;
   }
 ): Promise<string> {
   if (!inTauri) {
@@ -1140,6 +1198,10 @@ export async function runAgent(
     listen<ConfirmRequest>("agent://confirm", (e) => {
       if (e.payload.run_id !== runId) return;
       handlers.onConfirm?.(e.payload);
+    }),
+    listen<{ run_id: string; tasks: TaskState[] }>("agent://tasks", (e) => {
+      if (e.payload.run_id !== runId) return;
+      handlers.onTasks?.(e.payload.tasks);
     }),
   ]);
 

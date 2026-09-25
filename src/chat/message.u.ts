@@ -66,9 +66,11 @@ export function toolLabel(step: db.AgentStepEvent): string {
     read_file: "Read",
     write_file: "Write",
     edit_file: "Edit",
+    apply_patch: "Patch",
     list_dir: "List",
     grep: "Search",
     run_command: "Run",
+    ssh_exec: "SSH",
   };
   return verb[step.name] ?? step.name;
 }

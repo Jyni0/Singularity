@@ -3,6 +3,7 @@
 mod agent;
 mod cancel;
 mod chat;
+mod limiter;
 mod db;
 mod discovery;
 mod oauth;

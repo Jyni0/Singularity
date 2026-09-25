@@ -9,6 +9,23 @@ export interface ComboboxOption {
   hint?: string;
   /** Small colored mark before the label (e.g. "✦" for generated keys). */
   mark?: string;
+  /** Color dots rendered before the label (e.g. a theme's preview palette). */
+  swatch?: string[];
+}
+
+/** Three little color dots — a compact palette preview (theme picker). */
+function SwatchDots({ colors }: { colors: string[] }) {
+  return (
+    <span className="flex shrink-0 items-center gap-[3px]" aria-hidden>
+      {colors.map((c, i) => (
+        <span
+          key={i}
+          className="h-2.5 w-2.5 rounded-full border border-black/20 dark:border-white/20"
+          style={{ background: c }}
+        />
+      ))}
+    </span>
+  );
 }
 
 /**
@@ -25,6 +42,7 @@ export function Combobox({
   placeholder = "Search…",
   emptyText = "Nothing found",
   disabled,
+  searchable = true,
 }: {
   options: ComboboxOption[];
   /** Current option value ("" allowed when an explicit empty option exists). */
@@ -33,12 +51,15 @@ export function Combobox({
   placeholder?: string;
   emptyText?: string;
   disabled?: boolean;
+  /** Show the filter box on top of the list (default true). */
+  searchable?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [cursor, setCursor] = useState(0);
   const boxRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
 
   const selected = options.find((o) => o.value === value);
 
@@ -53,11 +74,14 @@ export function Combobox({
     if (open) {
       setQuery("");
       setCursor(Math.max(0, filtered.findIndex((o) => o.value === value)));
-      // Focus the search box on the next frame so the popup is mounted.
-      requestAnimationFrame(() => inputRef.current?.focus());
+      // Focus the search box (or the list itself when there is no filter)
+      // on the next frame so the popup is mounted and keys are captured.
+      requestAnimationFrame(() =>
+        searchable ? inputRef.current?.focus() : listRef.current?.focus(),
+      );
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, searchable]);
 
   useEffect(() => {
     setCursor((c) => Math.min(c, Math.max(0, filtered.length - 1)));
@@ -104,6 +128,7 @@ export function Combobox({
         className="flex h-9 w-full items-center gap-2 rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 text-left text-[12.5px] outline-none transition-colors hover:border-[var(--text-dim)] disabled:cursor-not-allowed disabled:opacity-50"
         onClick={() => setOpen((v) => !v)}
       >
+        {selected?.swatch && <SwatchDots colors={selected.swatch} />}
         {selected?.mark && <span className="shrink-0 text-[11px] text-[var(--accent)]">{selected.mark}</span>}
         <span className={"min-w-0 flex-1 truncate " + (selected ? "text-[var(--text-main)]" : "text-[var(--text-dim)]")}>
           {selected?.label ?? placeholder}
@@ -120,30 +145,32 @@ export function Combobox({
           onKeyDown={onKeyDown}
         >
           {/* Search input pinned on top of the list */}
-          <div className="flex items-center gap-1.5 border-b border-[var(--border)] px-2.5">
-            <Search size={12} className="shrink-0 text-[var(--text-dim)]" />
-            <input
-              ref={inputRef}
-              className="h-8 w-full bg-transparent text-[12px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder={placeholder}
-            />
-            {query && (
-              <button
-                type="button"
-                className="shrink-0 text-[var(--text-dim)] hover:text-[var(--text-main)]"
-                onClick={() => {
-                  setQuery("");
-                  inputRef.current?.focus();
-                }}
-                title="Clear"
-              >
-                <X size={11} />
-              </button>
-            )}
-          </div>
-          <div className="max-h-52 overflow-y-auto py-1">
+          {searchable && (
+            <div className="flex items-center gap-1.5 border-b border-[var(--border)] px-2.5">
+              <Search size={12} className="shrink-0 text-[var(--text-dim)]" />
+              <input
+                ref={inputRef}
+                className="h-8 w-full bg-transparent text-[12px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder={placeholder}
+              />
+              {query && (
+                <button
+                  type="button"
+                  className="shrink-0 text-[var(--text-dim)] hover:text-[var(--text-main)]"
+                  onClick={() => {
+                    setQuery("");
+                    inputRef.current?.focus();
+                  }}
+                  title="Clear"
+                >
+                  <X size={11} />
+                </button>
+              )}
+            </div>
+          )}
+          <div ref={listRef} tabIndex={-1} className="max-h-52 overflow-y-auto py-1 outline-none">
             {filtered.length === 0 ? (
               <div className="px-3 py-2 text-[11.5px] text-[var(--text-dim)]">{emptyText}</div>
             ) : (
@@ -158,6 +185,7 @@ export function Combobox({
                   onMouseEnter={() => setCursor(i)}
                   onClick={() => pick(o.value)}
                 >
+                  {o.swatch && <SwatchDots colors={o.swatch} />}
                   {o.mark && <span className="shrink-0 text-[11px] text-[var(--accent)]">{o.mark}</span>}
                   <span className="min-w-0 flex-1 truncate text-[var(--text-main)]">{o.label}</span>
                   {o.hint && <span className="shrink-0 font-mono text-[10px] text-[var(--text-dim)]">{o.hint}</span>}

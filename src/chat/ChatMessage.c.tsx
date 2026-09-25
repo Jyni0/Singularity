@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ArrowUp, ChevronDown, ChevronRight } from "lucide-react";
+import { ArrowUp, Check, ChevronDown, ChevronRight, Circle, ListChecks, Loader2, XCircle } from "lucide-react";
 import * as db from "../core/db.r";
 import { formatDuration } from "../utils/format.u";
 import { Markdown, ToolCall, ThinkBlock } from "./Markdown.c";
@@ -107,6 +107,9 @@ export function ChatMessage({
               />
             );
           }
+          if (seg.kind === "tasks") {
+            return <TaskList key={"tasks" + i} tasks={seg.tasks} />;
+          }
           if (seg.kind === "think") {
             return seg.text.trim() ? (
               <ThinkBlock
@@ -130,6 +133,63 @@ export function ChatMessage({
       <Markdown text={text} />
       {/* Generation time — shown at the END of the finished turn. */}
       <DurationFooter streaming={streaming} durationMs={durationMs} />
+    </div>
+  );
+}
+
+/* ---------- Decomposed-run task list ---------- */
+
+/** Status icon + color per subtask state. */
+const TASK_VISUAL: Record<string, { icon: typeof Check; cls: string }> = {
+  pending: { icon: Circle, cls: "text-[var(--text-dim)]" },
+  running: { icon: Loader2, cls: "text-[var(--accent)] animate-spin" },
+  done: { icon: Check, cls: "text-[var(--diff-add)]" },
+  error: { icon: XCircle, cls: "text-[var(--diff-del)]" },
+};
+
+/**
+ * The subtask list of a decomposed run — rendered in place inside the
+ * transcript, updated live as tasks move pending → running → done/error.
+ */
+export function TaskList({ tasks }: { tasks: db.TaskState[] }) {
+  const done = tasks.filter((t) => t.status === "done").length;
+  const failed = tasks.filter((t) => t.status === "error").length;
+  return (
+    <div className="selectable overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-surface)]">
+      <div className="flex items-center gap-2 border-b border-[var(--border-soft)] px-3 py-2">
+        <ListChecks size={13} className="shrink-0 text-[var(--accent)]" />
+        <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-[var(--text-main)]">
+          Task list
+        </span>
+        <span className="shrink-0 font-mono text-[10.5px] text-[var(--text-dim)]">
+          {done}/{tasks.length} done{failed > 0 ? " · " + failed + " failed" : ""}
+        </span>
+      </div>
+      <div className="flex flex-col">
+        {tasks.map((t) => {
+          const vis = TASK_VISUAL[t.status] ?? TASK_VISUAL.pending;
+          const Icon = vis.icon;
+          return (
+            <div
+              key={t.id}
+              className="flex items-start gap-2 border-b border-[var(--border-soft)] px-3 py-1.5 last:border-b-0"
+            >
+              <Icon size={13} className={"mt-0.5 shrink-0 " + vis.cls} />
+              <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                <span className="truncate text-[12px] text-[var(--text-main)]">
+                  <span className="mr-1.5 font-mono text-[10.5px] text-[var(--text-dim)]">{t.id}.</span>
+                  {t.title}
+                </span>
+                {t.summary && (
+                  <span className="truncate text-[10.5px] text-[var(--text-dim)]" title={t.summary}>
+                    {t.summary}
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

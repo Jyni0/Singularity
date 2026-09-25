@@ -28,6 +28,7 @@ import {
   LogOut,
   CircleCheck,
   ChevronDown,
+  Gauge,
   Pencil,
 } from "lucide-react";
 import type { Model, OAuthTokens, Provider, ProviderKind } from "../core/types.i";
@@ -374,6 +375,9 @@ function AddProvider({
       status: "disconnected",
       last_sync: null,
       auth: "key",
+      // Unlimited by default — the provider card exposes the knobs.
+      rate_limit_rpm: 0,
+      concurrency: 0,
     });
     setBusy(false);
   };
@@ -523,6 +527,17 @@ function ProviderCard({
   const [showAddModel, setShowAddModel] = useState(false);
   const [newModelId, setNewModelId] = useState("");
   const [newModelName, setNewModelName] = useState("");
+  /** Rate/concurrency drafts — string state so typing "0"→"60" feels natural;
+   *  persisted (and pushed to the Rust limiter) on blur. */
+  const [rpmDraft, setRpmDraft] = useState(String(provider.rate_limit_rpm ?? 0));
+  const [concDraft, setConcDraft] = useState(String(provider.concurrency ?? 0));
+  const noLimits = (provider.rate_limit_rpm ?? 0) === 0 && (provider.concurrency ?? 0) === 0;
+  /** "" / garbage → 0 (unlimited); anything else clamps to a sane ceiling. */
+  const clampLimit = (v: string) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return Math.min(Math.floor(n), 10000);
+  };
 
   const template = PROVIDER_TEMPLATES.find((t) => t.kind === provider.kind);
   const mine = models.filter((m) => m.provider_id === provider.id);
@@ -778,6 +793,56 @@ function ProviderCard({
                   ariaLabel="toggle provider"
                 />
               </div>
+
+              {/* Rate limits — enforced in Rust (limiter.rs) before every */}
+              {/* provider call: chat streams, the agent loop and parallel */}
+              {/* decomposed subtasks all share this budget. */}
+              <div className="flex flex-col gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="flex items-center gap-2 text-[12px] font-medium text-[var(--text-main)]">
+                    <Gauge size={13} className="text-[var(--text-muted)]" />
+                    No limits
+                  </span>
+                  <Switch
+                    on={noLimits}
+                    onChange={(next) => {
+                      setRpmDraft(next ? "0" : String(rpmDraft === "0" ? 60 : rpmDraft));
+                      setConcDraft(next ? "0" : String(concDraft === "0" ? 3 : concDraft));
+                      persist(next ? { rate_limit_rpm: 0, concurrency: 0 } : { rate_limit_rpm: 60, concurrency: 3 });
+                    }}
+                    ariaLabel="toggle provider limits"
+                  />
+                </div>
+                <div className={"flex items-end gap-3 " + (noLimits ? "pointer-events-none opacity-40" : "")}>
+                  <label className="flex flex-1 flex-col gap-1">
+                    <span className="text-[11px] text-[var(--text-dim)]">Rate limit — requests / min</span>
+                    <input
+                      className={SINPUT + " !w-full"}
+                      type="number"
+                      min={0}
+                      value={rpmDraft}
+                      onChange={(e) => setRpmDraft(e.target.value)}
+                      onBlur={() => persist({ rate_limit_rpm: clampLimit(rpmDraft) })}
+                    />
+                  </label>
+                  <label className="flex flex-1 flex-col gap-1">
+                    <span className="text-[11px] text-[var(--text-dim)]">Concurrency — parallel requests</span>
+                    <input
+                      className={SINPUT + " !w-full"}
+                      type="number"
+                      min={0}
+                      value={concDraft}
+                      onChange={(e) => setConcDraft(e.target.value)}
+                      onBlur={() => persist({ concurrency: clampLimit(concDraft) })}
+                    />
+                  </label>
+                </div>
+                <span className="text-[10.5px] leading-[1.5] text-[var(--text-dim)]">
+                  Requests beyond the limit wait instead of failing; concurrency
+                  also caps how many decomposed subtasks run at once. 0 = unlimited.
+                </span>
+              </div>
+
 
               {mine.length > 0 && (
                 <div className="flex flex-col gap-1">

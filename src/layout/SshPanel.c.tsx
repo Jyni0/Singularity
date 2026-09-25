@@ -56,6 +56,7 @@ export function SshPanel({
   keys,
   scripts,
   width,
+  resizing,
   onResizeStart,
   onChanged,
   onClose,
@@ -66,6 +67,9 @@ export function SshPanel({
   scripts: SshScript[];
   /** Current panel width in px — dragged by the handle on its left edge. */
   width: number;
+  /** True while dragging the edge: the width animation is switched off so the
+   *  panel tracks the cursor 1:1 (open/close still animates). */
+  resizing?: boolean;
   /** Starts a drag-resize (same mechanics as the chat inspection panel). */
   onResizeStart: (e: React.MouseEvent) => void;
   onChanged: () => void;
@@ -112,12 +116,18 @@ export function SshPanel({
   return (
     <motion.aside
       key="ssh-panel"
-      className="selectable relative flex h-full shrink-0 flex-col border-l border-[var(--border)] bg-[var(--bg-sidebar)]"
-      style={{ width }}
-      initial={{ opacity: 0, x: 24 }}
-      animate={{ opacity: 1, x: 0 }}
-      exit={{ opacity: 0, x: 24 }}
-      transition={{ duration: 0.18, ease: "easeOut" }}
+      className="selectable relative flex h-full shrink-0 flex-col overflow-hidden border-l border-[var(--border)] bg-[var(--bg-sidebar)]"
+      /* Smooth adjust: the panel GROWS its width from 0 (and collapses back
+         on close), so the main column compresses/expands gradually instead
+         of jumping — the same feel as the chat page's content reflow. */
+      initial={{ width: 0, opacity: 0 }}
+      animate={{ width, opacity: 1 }}
+      exit={{ width: 0, opacity: 0 }}
+      transition={
+        resizing
+          ? { width: { duration: 0 }, opacity: { duration: 0.15 } }
+          : { width: { duration: 0.24, ease: [0.32, 0.72, 0, 1] }, opacity: { duration: 0.15 } }
+      }
     >
       {/* Drag handle on the left edge — resizes the panel (copied from the
           chat inspection panel: same class, same left-edge mechanics). */}
@@ -647,11 +657,12 @@ function KeyForm({
           <>
             <div>
               <label className={LABEL}>Algorithm</label>
-              <select className={FIELD} value={algorithm} onChange={(e) => setAlgorithm(e.target.value)}>
-                {KEY_ALGORITHMS.map((a) => (
-                  <option key={a.id} value={a.id}>{a.label}</option>
-                ))}
-              </select>
+              <Combobox
+                searchable={false}
+                value={algorithm}
+                onChange={setAlgorithm}
+                options={KEY_ALGORITHMS.map((a) => ({ value: a.id, label: a.label }))}
+              />
             </div>
             <div>
               <label className={LABEL}>Passphrase — optional</label>

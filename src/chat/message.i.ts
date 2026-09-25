@@ -5,11 +5,13 @@
  */
 import type * as db from "../core/db.r";
 
-/** One piece of an agent turn: reasoning, prose, or a tool call. */
+/** One piece of an agent turn: reasoning, prose, a tool call, or the
+ *  decomposed run's task list (titles + live statuses). */
 export type Segment =
   | { kind: "think"; text: string }
   | { kind: "text"; text: string }
-  | { kind: "step"; step: db.AgentStepEvent };
+  | { kind: "step"; step: db.AgentStepEvent }
+  | { kind: "tasks"; tasks: db.TaskState[] };
 
 export interface Msg {
   role: "user" | "agent";

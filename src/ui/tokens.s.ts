@@ -21,17 +21,21 @@ export const CHIP =
 export const CHIP_CTX =
   "inline-flex h-6 shrink-0 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[11px] text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
 
+/* Settings controls share ONE geometry: h-9 (36px) tall, 240px wide in the
+   right-hand control column — selects (Combobox), inputs and buttons all
+   line up. */
+
 /** Small theme-aware button (settings / panels) */
 export const SBUTTON =
-  "flex h-[30px] shrink-0 items-center justify-center rounded-md bg-[var(--bg-elevated)] px-3 text-[12px] text-[var(--text-main)] transition-colors hover:bg-[var(--bg-input)] disabled:cursor-not-allowed disabled:opacity-50";
+  "flex h-9 shrink-0 items-center justify-center rounded-md bg-[var(--bg-elevated)] px-3 text-[12px] text-[var(--text-main)] transition-colors hover:bg-[var(--bg-input)] disabled:cursor-not-allowed disabled:opacity-50";
 
 /** Select in settings */
 export const SSELECT =
-  "h-8 min-w-[130px] cursor-pointer rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2 text-[12px] text-[var(--text-main)] outline-none";
+  "h-9 w-[240px] cursor-pointer rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2 text-[12px] text-[var(--text-main)] outline-none";
 
 /** Text input in settings */
 export const SINPUT =
-  "h-8 w-[180px] rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 text-[12px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
+  "h-9 w-[240px] rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 text-[12px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
 
 /** Tiny icon button revealed on row hover (⋮, +, pin).
  *  Hover paints a solid grey pill instead of a faint translucent wash. */

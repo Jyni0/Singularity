@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import * as db from "../core/db.r";
 import { Switch } from "../ui/Switch.c";
+import { Combobox } from "../ui/Combobox.c";
 import { Segmented, SettingRow, SettingsCard, Sep } from "./SettingsParts.c";
 import {
   TERMINAL_THEMES,
@@ -60,20 +61,21 @@ export function TerminalSettings() {
     <div className="flex flex-col gap-4">
       <SettingsCard>
         <SettingRow title="Theme" hint="Color palette of the SSH console">
-          <select
-            className="h-[30px] rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2 text-[12px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]"
-            value={themeName}
-            onChange={(e) => {
-              setThemeName(e.target.value);
-              persist("ssh_theme", e.target.value);
-            }}
-          >
-            {TERMINAL_THEME_NAMES.map((n) => (
-              <option key={n} value={n}>
-                {n.charAt(0).toUpperCase() + n.slice(1)}
-              </option>
-            ))}
-          </select>
+          <div className="w-[240px]">
+            <Combobox
+              searchable={false}
+              value={themeName}
+              onChange={(v) => {
+                setThemeName(v);
+                persist("ssh_theme", v);
+              }}
+              options={TERMINAL_THEME_NAMES.map((n) => ({
+                value: n,
+                label: n.charAt(0).toUpperCase() + n.slice(1),
+                swatch: [terminalTheme(n).background ?? "#000", terminalTheme(n).blue ?? "#38f", terminalTheme(n).foreground ?? "#fff"],
+              }))}
+            />
+          </div>
         </SettingRow>
         <Sep />
         {/* Live palette preview — 8 swatches of the picked theme */}
@@ -119,25 +121,22 @@ export function TerminalSettings() {
         </SettingRow>
         <Sep />
         <SettingRow title="Font family" hint="Monospace font of the console">
-          <select
-            className="h-[30px] rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2 text-[12px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]"
-            value={fontFamily}
-            onChange={(e) => {
-              setFontFamily(e.target.value);
-              persist("ssh_font_family", e.target.value);
-            }}
-          >
-            {[
-              "Cascadia Mono, Consolas, 'Courier New', monospace",
-              "Consolas, 'Courier New', monospace",
-              "'JetBrains Mono', 'Fira Code', monospace",
-              "'Courier New', monospace",
-            ].map((f) => (
-              <option key={f} value={f}>
-                {f.split(",")[0].replace(/'/g, "")}
-              </option>
-            ))}
-          </select>
+          <div className="w-[240px]">
+            <Combobox
+              searchable={false}
+              value={fontFamily}
+              onChange={(v) => {
+                setFontFamily(v);
+                persist("ssh_font_family", v);
+              }}
+              options={[
+                "Cascadia Mono, Consolas, 'Courier New', monospace",
+                "Consolas, 'Courier New', monospace",
+                "'JetBrains Mono', 'Fira Code', monospace",
+                "'Courier New', monospace",
+              ].map((f) => ({ value: f, label: f.split(",")[0].replace(/'/g, "") }))}
+            />
+          </div>
         </SettingRow>
         <Sep />
         <SettingRow title="Cursor blink" hint="Animate the terminal cursor">
@@ -151,37 +150,37 @@ export function TerminalSettings() {
         </SettingRow>
         <Sep />
         <SettingRow title="Scrollback" hint="Lines kept in history">
-          <select
-            className="h-[30px] rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2 text-[12px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]"
-            value={String(scrollback)}
-            onChange={(e) => {
-              setScrollback(Number(e.target.value));
-              persist("ssh_scrollback", e.target.value);
-            }}
-          >
-            {[1000, 5000, 10000, 50000].map((n) => (
-              <option key={n} value={n}>
-                {n.toLocaleString()} lines
-              </option>
-            ))}
-          </select>
+          <div className="w-[240px]">
+            <Combobox
+              searchable={false}
+              value={String(scrollback)}
+              onChange={(v) => {
+                setScrollback(Number(v));
+                persist("ssh_scrollback", v);
+              }}
+              options={[1000, 5000, 10000, 50000].map((n) => ({
+                value: String(n),
+                label: n.toLocaleString() + " lines",
+              }))}
+            />
+          </div>
         </SettingRow>
         <Sep />
         <SettingRow title="Terminal type" hint="$TERM sent to the server">
-          <select
-            className="h-[30px] rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2 text-[12px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]"
-            value={termType}
-            onChange={(e) => {
-              setTermType(e.target.value);
-              persist("ssh_term", e.target.value);
-            }}
-          >
-            {["xterm-256color", "xterm", "screen-256color", "vt100"].map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </select>
+          <div className="w-[240px]">
+            <Combobox
+              searchable={false}
+              value={termType}
+              onChange={(v) => {
+                setTermType(v);
+                persist("ssh_term", v);
+              }}
+              options={["xterm-256color", "xterm", "screen-256color", "vt100"].map((t) => ({
+                value: t,
+                label: t,
+              }))}
+            />
+          </div>
         </SettingRow>
       </SettingsCard>
     </div>

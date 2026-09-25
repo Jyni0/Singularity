@@ -13,11 +13,13 @@ import {
   Check,
   Copy,
   Eye,
+  FileDiff,
   FilePlus2,
   FolderOpen,
   Loader2,
   Pencil,
   Search,
+  Server,
   Terminal,
   Wrench,
   ChevronRight,
@@ -405,9 +407,11 @@ export const TOOL_META: Record<
   read_file: { icon: Eye, label: "Read" },
   write_file: { icon: FilePlus2, label: "Write" },
   edit_file: { icon: Pencil, label: "Edit" },
+  apply_patch: { icon: FileDiff, label: "Patch" },
   list_dir: { icon: FolderOpen, label: "List" },
   grep: { icon: Search, label: "Search" },
   run_command: { icon: Terminal, label: "Run" },
+  ssh_exec: { icon: Server, label: "SSH" },
 };
 
 /** Reasoning the model streamed before or between its actions. */

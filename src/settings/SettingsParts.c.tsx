@@ -10,7 +10,7 @@ export function Segmented({
   onChange: (v: string) => void;
 }) {
   return (
-    <div className="flex h-[30px] items-center gap-0.5 rounded-md bg-[var(--bg-input)] p-0.5">
+    <div className="flex h-9 items-center gap-0.5 rounded-md bg-[var(--bg-input)] p-0.5">
       {options.map((o) => (
         <button
           key={o}

@@ -143,6 +143,9 @@ export default function App() {
   const [activeConn, setActiveConn] = useState<string | null>(null);
   /** Width of the docked right-hand panel (drag-resized like the chat panel). */
   const [sshPanelWidth, setSshPanelWidth] = useState(400);
+  /** True while the panel's left edge is being dragged — disables the width
+   *  animation so the panel tracks the cursor exactly. */
+  const [sshPanelResizing, setSshPanelResizing] = useState(false);
   /**
    * The docked right-hand panel of SSH mode: create / edit / settings forms
    * live here instead of dialogs (Termius-style). Null = closed.
@@ -178,6 +181,23 @@ export default function App() {
   const updateConvMsgs = useCallback((key: string, updater: (prev: Msg[]) => Msg[]) => {
     setConvMsgs((prev) => ({ ...prev, [key]: updater(prev[key] ?? []) }));
   }, []);
+
+  // Adaptive re-clamp: shrinking the window (or growing the sidebar) must
+  // never leave the SSH panel wider than the space that remains — otherwise
+  // the main column is squeezed off-screen. Runs on every window resize and
+  // caps the panel to window − sidebar − 320px of usable main area.
+  useEffect(() => {
+    const onResize = () => {
+      const maxW = Math.max(
+        PANEL_MIN_W,
+        Math.min(PANEL_MAX_W, window.innerWidth - sidebarWidth - 320)
+      );
+      setSshPanelWidth((w) => (w > maxW ? maxW : w));
+      setPanelWidth((w) => (w > maxW ? maxW : w));
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [sidebarWidth]);
 
   // The agent always has a workspace: the app's own folder by default, or a
   // project folder the user points it at once (no picker in the prompt box).
@@ -408,7 +428,15 @@ export default function App() {
       }
       if (!cancelled && savedSshPanelW) {
         const w = Number(savedSshPanelW);
-        if (Number.isFinite(w)) setSshPanelWidth(Math.min(Math.max(w, PANEL_MIN_W), PANEL_MAX_W));
+        if (Number.isFinite(w)) {
+          // Clamp against the ACTUAL window: a width saved on a big monitor
+          // must never push the main column off-screen on a smaller one.
+          const maxW = Math.max(
+            PANEL_MIN_W,
+            Math.min(PANEL_MAX_W, window.innerWidth - sidebarWidth - 320)
+          );
+          setSshPanelWidth(Math.min(Math.max(w, PANEL_MIN_W), maxW));
+        }
       }
       if (!cancelled && globalAuto !== null) setGlobalAutoRun(globalAuto === "1");
       if (!cancelled && savedTheme && THEMES.includes(savedTheme as Theme)) {
@@ -554,6 +582,9 @@ export default function App() {
     // column — the chat panel gets away without this because it is narrower.
     const maxW = Math.max(PANEL_MIN_W, Math.min(PANEL_MAX_W, window.innerWidth - sidebarWidth - 320));
     let latest = startW;
+    // While dragging, the open/close width animation is switched OFF so the
+    // panel follows the cursor 1:1 instead of lagging behind it.
+    setSshPanelResizing(true);
     const onMove = (ev: MouseEvent) => {
       latest = Math.min(Math.max(startW - (ev.clientX - startX), PANEL_MIN_W), maxW);
       setSshPanelWidth(latest);
@@ -561,6 +592,7 @@ export default function App() {
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      setSshPanelResizing(false);
       void db.setSetting("ssh_panel_width", String(latest));
     };
     window.addEventListener("mousemove", onMove);
@@ -620,6 +652,13 @@ export default function App() {
       setActiveConv({ project: newName, id: activeConv.id });
     }
     await db.renameProject(oldName, newName);
+  };
+
+  /** Changes a project's working directory — the folder agents open when
+   *  chatting inside this project. Files on disk are never touched. */
+  const setProjectPath = async (name: string, path: string) => {
+    setProjects((prev) => prev.map((p) => (p.name === name ? { ...p, path } : p)));
+    await db.setProjectPath(name, path);
   };
 
   /** Deletes a project; its conversations survive under “No project”. */
@@ -729,7 +768,7 @@ export default function App() {
   const sendMessage = async (
     text: string,
     target: { project: string; id: string } | null,
-    selection: { gatewayId: string; modelId: string; effort: Effort },
+    selection: { gatewayId: string; modelId: string; effort: Effort; decompose: boolean },
     attachments: Attachment[] = []
   ) => {
     // Text files are inlined into the prompt; images travel as data URLs and
@@ -885,6 +924,26 @@ export default function App() {
       });
     };
 
+    /** Task-list updates from a decomposed run: one "tasks" segment that is
+     *  replaced in place as subtasks move pending → running → done/error. */
+    const appendTasks = (tasks: db.TaskState[]) => {
+      updateConvMsgs(convId, (prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (!last || last.role !== "agent") return prev;
+
+        const segs = [...(last.segments ?? [])];
+        const at = segs.findIndex((s) => s.kind === "tasks");
+        if (at >= 0) {
+          segs[at] = { kind: "tasks", tasks };
+        } else {
+          segs.push({ kind: "tasks", tasks });
+        }
+        next[next.length - 1] = { ...last, segments: segs };
+        return next;
+      });
+    };
+
     /** Records a tool call: `done=false` shows it as running, `done=true`
      * replaces the same card with its result. */
     const appendStep = (step: db.AgentStepEvent) => {
@@ -933,6 +992,12 @@ export default function App() {
               effort: selection.effort,
               auto_run: autoRun,
               images,
+              // Provider limits — Rust (limiter.rs) enforces them across chat,
+              // agent rounds and parallel subtasks alike.
+              provider_id: provider.id,
+              rate_limit_rpm: provider.rate_limit_rpm ?? 0,
+              concurrency: provider.concurrency ?? 0,
+              decompose: selection.decompose,
               // SSH units ride along so the model gets the ssh_exec tool;
               // credentials never leave the database.
               ssh_units: sshServers.map((s) => ({ id: s.id, name: s.name, host: s.host })),
@@ -942,6 +1007,7 @@ export default function App() {
               onText: appendDelta,
               onStep: appendStep,
               onThink: appendThink,
+              onTasks: appendTasks,
               // Parked per run id: a background run's request stays available
               // and reappears the moment the user opens that chat.
               onConfirm: (req) =>
@@ -958,6 +1024,9 @@ export default function App() {
               model: modelRow.model_id,
               effort: selection.effort,
               images,
+              provider_id: provider.id,
+              rate_limit_rpm: provider.rate_limit_rpm ?? 0,
+              concurrency: provider.concurrency ?? 0,
               system:
                 "You are Singularity, a coding agent inside a desktop workspace. " +
                 "Answer concisely and prefer concrete, runnable steps.",
@@ -1059,6 +1128,9 @@ export default function App() {
           auth: cred.auth,
           model: modelId,
           effort: "low",
+          provider_id: provider.id,
+          rate_limit_rpm: provider.rate_limit_rpm ?? 0,
+          concurrency: provider.concurrency ?? 0,
           system:
             "You name conversations. Reply with a short title of at most 6 words " +
             "for the user's first message. No quotes, no trailing punctuation, " +
@@ -1538,6 +1610,7 @@ export default function App() {
               keys={sshKeys}
               scripts={sshScripts}
               width={sshPanelWidth}
+              resizing={sshPanelResizing}
               onResizeStart={startSshPanelResize}
               onChanged={reloadSshServers}
               onClose={() => setSshPanel(null)}
@@ -1559,6 +1632,7 @@ export default function App() {
                 );
                 await db.setProjectPermMode(name, mode);
               }}
+              onProjectSetPath={setProjectPath}
               onDeleteProject={removeProject}
               providers={providers}
               models={models}

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { motion } from "motion/react";
-import { Zap, Shield, Send, X, Square, Mic, Loader2, Paperclip, FileText } from "lucide-react";
+import { Zap, Shield, Send, X, Square, Mic, Loader2, Paperclip, FileText, ListChecks } from "lucide-react";
 import * as db from "../core/db.r";
 import type { Project, Gateway, Attachment, Effort } from "../core/types.i";
 import { toAttachments, formatSize } from "../utils/attachments.u";
@@ -27,7 +27,7 @@ export function PromptBox({
 }: {
   onSend: (
     text: string,
-    selection: { gatewayId: string; modelId: string; effort: Effort },
+    selection: { gatewayId: string; modelId: string; effort: Effort; decompose: boolean },
     attachments: Attachment[]
   ) => void;
   projects: Project[];
@@ -49,6 +49,11 @@ export function PromptBox({
   const [turbo, setTurbo] = useState(true);
   const [effort, setEffort] = useState<Effort>(
     () => (localStorage.getItem("effort") as Effort) || "medium"
+  );
+  /** Task mode: the prompt is first split into a task list, then the subtasks
+   *  run in parallel (bounded by the provider's concurrency limit). */
+  const [decompose, setDecompose] = useState(
+    () => localStorage.getItem("decompose") === "1"
   );
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
@@ -178,7 +183,7 @@ export function PromptBox({
     if (!text.trim() && attachments.length === 0) return;
     // Sending cancels an in-flight recording instead of transcribing it.
     speech.cancel();
-    onSend(text.trim(), { gatewayId, modelId, effort }, attachments);
+    onSend(text.trim(), { gatewayId, modelId, effort, decompose }, attachments);
     setText("");
     setAttachments([]);
     setNotice(null);
@@ -302,6 +307,24 @@ export function PromptBox({
               </span>
               {/* Reasoning effort — low is fast, high thinks harder. */}
               <EffortChip effort={effort} onPick={pickEffort} />
+              {/* Task decomposition: split the prompt into a task list and run
+                  the subtasks in parallel under the provider's limits. */}
+              <span
+                className={
+                  decompose
+                    ? "inline-flex h-6 shrink-0 cursor-pointer items-center gap-1.5 rounded-md bg-[var(--accent)]/15 px-2 text-[11px] text-[var(--accent)]"
+                    : CHIP_CTX
+                }
+                onClick={() => {
+                  const next = !decompose;
+                  setDecompose(next);
+                  localStorage.setItem("decompose", next ? "1" : "0");
+                }}
+                title="Task mode: decompose the prompt into a task list and run subtasks in parallel"
+              >
+                <ListChecks size={12} strokeWidth={1.5} />
+                Tasks
+              </span>
             </div>
 
             <div className="flex shrink-0 items-center gap-1">

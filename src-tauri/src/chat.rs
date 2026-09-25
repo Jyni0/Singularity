@@ -56,6 +56,15 @@ pub struct ProviderConfig {
     /// Images attached to the last user turn.
     #[serde(default)]
     pub images: Vec<ImageAttachment>,
+    /// Stable provider id — the key the limiter budgets requests under.
+    #[serde(default)]
+    pub provider_id: String,
+    /// Max requests/minute for this provider (0 = unlimited).
+    #[serde(default)]
+    pub rate_limit_rpm: usize,
+    /// Max parallel in-flight requests (0 = unlimited).
+    #[serde(default)]
+    pub concurrency: usize,
 }
 
 /// One attached image, carried as a `data:` URL from the frontend.
@@ -75,6 +84,21 @@ pub fn base64_body(data_url: &str) -> &str {
 
 fn default_auth() -> String {
     "key".to_string()
+}
+
+/// Reserves one request slot under the provider's configured limits
+/// (RPM + concurrency; 0 = unlimited). Shared with the agent loop, so a
+/// parallel decomposed run and a chat stream budget against the same pool.
+async fn acquire_permit(
+    provider: &ProviderConfig,
+    request_id: &str,
+) -> crate::limiter::Permit {
+    let key = if provider.provider_id.is_empty() {
+        provider.base_url.clone()
+    } else {
+        provider.provider_id.clone()
+    };
+    crate::limiter::acquire(&key, provider.rate_limit_rpm, provider.concurrency, request_id).await
 }
 
 /// OpenAI-style `reasoning_effort` value, or None when unset.
@@ -252,6 +276,12 @@ async fn stream_google(
         req = req.bearer_auth(provider.api_key.trim());
     }
 
+    // Provider limits — the permit lives until the stream finishes below.
+    // Gemini caches common prefixes implicitly; nothing to send client-side.
+    let _permit = acquire_permit(provider, request_id).await;
+    if crate::cancel::is_requested(request_id) {
+        return Err(crate::cancel::STOPPED.to_string());
+    }
     let res = req.send().await.map_err(|e| format!("request failed: {e}"))?;
     let status = res.status();
     if !status.is_success() {
@@ -406,6 +436,14 @@ async fn stream_openai(
         req = req.bearer_auth(provider.api_key.trim());
     }
 
+    // Provider limits (RPM/concurrency). OpenAI applies prompt caching
+    // automatically to any stable ≥1024-token prefix, so the only client-side
+    // requirement is a byte-stable system prompt placed first — which is how
+    // the messages above are built.
+    let _permit = acquire_permit(provider, request_id).await;
+    if crate::cancel::is_requested(request_id) {
+        return Err(crate::cancel::STOPPED.to_string());
+    }
     let res = req.send().await.map_err(|e| format!("request failed: {e}"))?;
     let status = res.status();
     if !status.is_success() {
@@ -531,9 +569,16 @@ async fn stream_anthropic(
         "messages": messages,
         "stream": true,
     });
-    // A system prompt goes top-level in Anthropic's protocol.
+    // A system prompt goes top-level in Anthropic's protocol — as a block
+    // array with an ephemeral cache_control breakpoint: the system prompt is
+    // byte-stable across turns, so the provider serves repeat turns from its
+    // prompt cache (cheaper input tokens, faster first token).
     if !provider.system.trim().is_empty() {
-        body["system"] = serde_json::json!(provider.system);
+        body["system"] = serde_json::json!([{
+            "type": "text",
+            "text": provider.system,
+            "cache_control": { "type": "ephemeral" }
+        }]);
     }
     // Effort maps onto extended thinking; "low" leaves it off entirely.
     // Anthropic requires max_tokens to exceed budget_tokens, so raise it here.
@@ -552,6 +597,10 @@ async fn stream_anthropic(
         req = req.header("x-api-key", provider.api_key.trim());
     }
 
+    let _permit = acquire_permit(provider, request_id).await;
+    if crate::cancel::is_requested(request_id) {
+        return Err(crate::cancel::STOPPED.to_string());
+    }
     let res = req.send().await.map_err(|e| format!("request failed: {e}"))?;
     let status = res.status();
     if !status.is_success() {

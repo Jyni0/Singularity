@@ -287,6 +287,195 @@ pub fn grep(root: &Path, pattern: &str, subdir: Option<&str>) -> ToolResult {
     ToolResult::ok(hits.join("\n"))
 }
 
+/* ---------- Patch application (diff-only edits) ---------- */
+
+/// Parses SEARCH/REPLACE hunks out of a diff body. The expected shape is:
+///
+/// ```text
+/// <<<<<<< SEARCH
+/// exact existing code
+/// =======
+/// replacement code
+/// >>>>>>> REPLACE
+/// ```
+///
+/// Several hunks may follow each other in one diff. An empty SEARCH side
+/// means "create the file with the REPLACE content" (new-file hunk).
+pub fn parse_patch(diff: &str) -> Vec<(String, String)> {
+    let mut hunks: Vec<(String, String)> = Vec::new();
+    let mut search: Option<Vec<String>> = None;
+    let mut replace: Option<Vec<String>> = None;
+    for line in diff.lines() {
+        let t = line.trim();
+        if t == "<<<<<<< SEARCH" {
+            search = Some(Vec::new());
+            replace = None;
+            continue;
+        }
+        if t == "=======" && search.is_some() && replace.is_none() {
+            replace = Some(Vec::new());
+            continue;
+        }
+        if t == ">>>>>>> REPLACE" {
+            if let (Some(s), Some(r)) = (search.take(), replace.take()) {
+                hunks.push((s.join("\n"), r.join("\n")));
+            }
+            continue;
+        }
+        if let Some(r) = replace.as_mut() {
+            r.push(line.to_string());
+        } else if let Some(s) = search.as_mut() {
+            s.push(line.to_string());
+        }
+    }
+    hunks
+}
+
+/// Applies a SEARCH/REPLACE diff to one file — the diff-only edit path.
+///
+/// Rules mirror `edit_file`: every SEARCH side must match the current file
+/// content EXACTLY ONCE (hunks apply sequentially, so later hunks see the
+/// result of earlier ones). A single hunk with an empty SEARCH creates the
+/// file. Failures are reported per hunk with its index so the model can fix
+/// exactly the broken block and retry.
+pub fn apply_patch(root: &Path, path: &str, diff: &str) -> ToolResult {
+    let full = match resolve(root, path) {
+        Ok(p) => p,
+        Err(e) => return ToolResult::err(e),
+    };
+    let hunks = parse_patch(diff);
+    if hunks.is_empty() {
+        return ToolResult::err(
+            "no SEARCH/REPLACE blocks found in the diff. Expected format:\n\
+             <<<<<<< SEARCH\n<exact existing code>\n=======\n<new code>\n>>>>>>> REPLACE",
+        );
+    }
+
+    let text = std::fs::read_to_string(&full).ok();
+    let original = text.clone();
+
+    // New-file hunk: file absent + exactly one hunk with an empty SEARCH.
+    if text.is_none() {
+        let create_only = hunks.len() == 1 && hunks[0].0.trim().is_empty();
+        if !create_only {
+            return ToolResult::err(format!(
+                "{path} does not exist. To create it, send ONE hunk with an empty SEARCH side."
+            ));
+        }
+        if let Some(parent) = full.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return ToolResult::err(format!("cannot create directory for {path}: {e}"));
+            }
+        }
+        let content = format!("{}\n", hunks[0].1);
+        return match std::fs::write(&full, &content) {
+            Ok(()) => ToolResult::ok(format!("created {path} ({} bytes)", content.len()))
+                .with_change(path, None, content),
+            Err(e) => ToolResult::err(format!("cannot write {path}: {e}")),
+        };
+    }
+
+    let mut current = text.unwrap_or_default();
+    let mut applied = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for (i, (search, replace)) in hunks.iter().enumerate() {
+        let needle = search.as_str();
+        let count = current.matches(needle).count();
+        if count == 0 {
+            errors.push(format!(
+                "hunk {i}: SEARCH text not found in {path} — read the file and copy the exact text (whitespace matters)"
+            ));
+            continue;
+        }
+        if count > 1 {
+            errors.push(format!(
+                "hunk {i}: SEARCH text appears {count} times in {path} — add surrounding lines to make it unique"
+            ));
+            continue;
+        }
+        current = current.replacen(needle, replace.as_str(), 1);
+        applied += 1;
+    }
+
+    if applied == 0 {
+        return ToolResult::err(errors.join("\n"));
+    }
+    match std::fs::write(&full, &current) {
+        Ok(()) => {
+            let mut out = format!("patched {path}: {applied}/{} hunks applied", hunks.len());
+            if !errors.is_empty() {
+                out.push_str("\nFAILED:\n");
+                out.push_str(&errors.join("\n"));
+            }
+            let res = if errors.is_empty() {
+                ToolResult::ok(out)
+            } else {
+                // Partially applied — report as an error so the model reacts,
+                // but the successful hunks are already on disk.
+                ToolResult::err(out)
+            };
+            res.with_change(path, original, current)
+        }
+        Err(e) => ToolResult::err(format!("cannot write {path}: {e}")),
+    }
+}
+
+/// Extracts inline patches from free assistant text. A patch is a file path
+/// line immediately followed by one or more SEARCH/REPLACE blocks.
+/// Returns (path, diff-body) pairs so the agent loop can apply them exactly
+/// like explicit apply_patch calls — the model cannot bypass diff-only mode
+/// by pasting blocks into its reply instead of calling the tool.
+pub fn extract_inline_patches(text: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if lines[i].trim() == "<<<<<<< SEARCH" {
+            // The path is the nearest previous non-empty, non-marker line.
+            let mut path = String::new();
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                let cand = lines[j].trim();
+                if cand.is_empty() {
+                    continue;
+                }
+                if cand.starts_with("<<<<<<<") || cand.starts_with("=======") || cand.starts_with(">>>>>>>") {
+                    break;
+                }
+                // Strip markdown fences / backticks around the path.
+                path = cand.trim_matches('`').trim().to_string();
+                break;
+            }
+            // Collect consecutive hunks.
+            let mut body: Vec<&str> = Vec::new();
+            while i < lines.len() {
+                body.push(lines[i]);
+                let is_end = lines[i].trim() == ">>>>>>> REPLACE";
+                i += 1;
+                if is_end {
+                    // Continue collecting while the next hunk starts right away.
+                    let mut k = i;
+                    while k < lines.len() && lines[k].trim().is_empty() {
+                        k += 1;
+                    }
+                    if k < lines.len() && lines[k].trim() == "<<<<<<< SEARCH" {
+                        i = k;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            if !path.is_empty() {
+                out.push((path, body.join("\n")));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /* ---------- Shell ---------- */
 
 /// Runs a command in `cwd` (the workspace when unset) and returns its output.
@@ -400,6 +589,7 @@ pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult
         ),
         "write_file" => write_file(root, s("path"), s("content")),
         "edit_file" => edit_file(root, s("path"), s("old_text"), s("new_text")),
+        "apply_patch" => apply_patch(root, s("path"), s("diff")),
         "list_dir" => list_dir(root, s("path")),
         "grep" => grep(root, s("pattern"), args.get("path").and_then(|v| v.as_str())),
         "run_command" => run_command(
@@ -409,5 +599,108 @@ pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult
             args.get("timeout_secs").and_then(|v| v.as_u64()),
         ),
         other => ToolResult::err(format!("unknown tool: {other}")),
+    }
+}
+
+/* ---------- Tests ---------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_single_hunk() {
+        let diff = "<<<<<<< SEARCH\nold line\n=======\nnew line\n>>>>>>> REPLACE";
+        let hunks = parse_patch(diff);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].0, "old line");
+        assert_eq!(hunks[0].1, "new line");
+    }
+
+    #[test]
+    fn parses_multi_hunk_and_markers_inside_fences() {
+        let diff = [
+            "<<<<<<< SEARCH",
+            "a",
+            "=======",
+            "b",
+            ">>>>>>> REPLACE",
+            "<<<<<<< SEARCH",
+            "c",
+            "=======",
+            "d",
+            ">>>>>>> REPLACE",
+        ]
+        .join("\n");
+        let hunks = parse_patch(&diff);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[1].0, "c");
+        assert_eq!(hunks[1].1, "d");
+    }
+
+    #[test]
+    fn new_file_hunk_has_empty_search() {
+        let diff = "<<<<<<< SEARCH\n=======\nnew content\n>>>>>>> REPLACE";
+        let hunks = parse_patch(diff);
+        assert_eq!(hunks.len(), 1);
+        assert!(hunks[0].0.is_empty());
+        assert_eq!(hunks[0].1, "new content");
+    }
+
+    #[test]
+    fn extracts_inline_patch_with_path_above() {
+        let text = [
+            "Here is the fix:",
+            "",
+            "src/app.tsx",
+            "<<<<<<< SEARCH",
+            "const a = 1;",
+            "=======",
+            "const a = 2;",
+            ">>>>>>> REPLACE",
+            "",
+            "Done.",
+        ]
+        .join("\n");
+        let patches = extract_inline_patches(&text);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].0, "src/app.tsx");
+        assert!(patches[0].1.contains("<<<<<<< SEARCH"));
+        assert!(patches[0].1.contains(">>>>>>> REPLACE"));
+    }
+
+    #[test]
+    fn strips_backtick_fenced_path() {
+        let text = "`src/app.tsx`\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE";
+        let patches = extract_inline_patches(text);
+        assert_eq!(patches[0].0, "src/app.tsx");
+    }
+
+    #[test]
+    fn apply_patch_edits_and_creates() {
+        let dir = std::env::temp_dir().join(format!("sing-patch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree").unwrap();
+
+        // Edit existing
+        let diff = "<<<<<<< SEARCH\ntwo\n=======\nTWO\n>>>>>>> REPLACE";
+        let res = apply_patch(&dir, "a.txt", diff);
+        assert!(res.ok, "{}", res.output);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\nTWO\nthree");
+
+        // Create new via empty SEARCH
+        let create = "<<<<<<< SEARCH\n=======\nfresh\n>>>>>>> REPLACE";
+        let res2 = apply_patch(&dir, "b.txt", create);
+        assert!(res2.ok, "{}", res2.output);
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "fresh\n");
+
+        // Missing SEARCH side → error, file untouched
+        let bad = "<<<<<<< SEARCH\nnope\n=======\nx\n>>>>>>> REPLACE";
+        let res3 = apply_patch(&dir, "a.txt", bad);
+        assert!(!res3.ok);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\nTWO\nthree");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

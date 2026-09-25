@@ -114,7 +114,29 @@ pub fn migrations() -> Vec<Migration> {
         ssh_assets_migration(),
         ssh_os_and_generated_keys_migration(),
         ssh_public_key_columns_migration(),
+        provider_limits_migration(),
     ]
+}
+
+/// Version 14 — per-provider request limits.
+///
+/// rate_limit_rpm: max requests per minute (0 = no limit).
+/// concurrency:    max parallel in-flight requests (0 = no limit).
+///
+/// Both are enforced in Rust (limiter.rs) before every provider call, so
+/// parallel subtask runs never trip the provider's quota.
+///
+/// FROZEN once applied: never edit this SQL after release; add version 15.
+fn provider_limits_migration() -> Migration {
+    Migration {
+        version: 14,
+        description: "provider rate limit + concurrency columns",
+        sql: "
+            ALTER TABLE providers ADD COLUMN rate_limit_rpm INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE providers ADD COLUMN concurrency INTEGER NOT NULL DEFAULT 0;
+        ",
+        kind: MigrationKind::Up,
+    }
 }
 
 /// Version 13 — derived public data stored alongside each credential.

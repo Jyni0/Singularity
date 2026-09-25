@@ -1,14 +1,9 @@
-/**
- * Project settings — an embedded panel, NOT a modal anymore.
- *
- * It lives as a tab inside the Settings window (project configuration belongs
- * to Settings, never to the chat chrome). The caller picks which project to
- * edit via the dropdown rendered here.
- */
 import { useState } from "react";
-import { Folder, Shield, Trash2 } from "lucide-react";
+import { Folder, FolderOpen, Shield, Trash2 } from "lucide-react";
 import type { Project, PermMode } from "../core/types.i";
 import { NO_PROJECT } from "../core/types.i";
+import { Combobox } from "../ui/Combobox.c";
+import { SBUTTON } from "../ui/tokens.s";
 
 /** Per-project command permission choices. */
 export const PERM_MODES: Array<{ id: PermMode; label: string; hint: string }> = [
@@ -17,37 +12,44 @@ export const PERM_MODES: Array<{ id: PermMode; label: string; hint: string }> = 
   { id: "ask", label: "Always ask", hint: "Ask before every command" },
 ];
 
+/** Shared settings-field geometry: h-9 to match Combobox/SBUTTON/SINPUT. */
 const INPUT_CLS =
-  "w-full rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2 text-[13px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
-const SELECT_CLS =
-  "h-9 min-w-[220px] cursor-pointer rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-2 text-[13px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
+  "h-9 w-full rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-3 text-[13px] text-[var(--text-main)] outline-none transition-colors focus:border-[var(--accent)]";
 
 /**
- * One project's settings: rename, folder, command permission, delete.
- * `project` is the selected project or null (nothing is configurable then).
+ * One project's settings: rename, change directory, command permission,
+ * delete. `project` is the selected project or null (nothing is
+ * configurable then).
  */
 export function ProjectSettingsPanel({
   project,
   onRename,
+  onSetPath,
   onPermMode,
   onDelete,
 }: {
   project: Project | null;
   onRename: (oldName: string, newName: string) => Promise<void>;
+  /** Changes the project's working directory (agents open this folder). */
+  onSetPath: (name: string, path: string) => Promise<void>;
   onPermMode: (name: string, mode: PermMode) => Promise<void>;
   onDelete: (name: string) => Promise<void>;
 }) {
   const [name, setName] = useState(project?.name ?? "");
+  const [path, setPath] = useState(project?.path ?? "");
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  // Re-sync the name field when a different project gets selected.
+  // Re-sync the fields when a different project gets selected.
   const [syncedTo, setSyncedTo] = useState<string | null>(project?.name ?? null);
   if (project && syncedTo !== project.name) {
     setSyncedTo(project.name);
     setName(project.name);
+    setPath(project.path ?? "");
     setConfirming(false);
     setBusy(false);
+    setError(null);
   }
 
   if (!project) {
@@ -62,15 +64,57 @@ export function ProjectSettingsPanel({
     const n = name.trim();
     if (!n || n === project.name || busy) return;
     setBusy(true);
-    await onRename(project.name, n);
-    setBusy(false);
+    setError(null);
+    try {
+      await onRename(project.name, n);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Opens the OS folder picker (Tauri dialog) and stores the new directory. */
+  const browse = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const picked = await open({ directory: true, multiple: false, defaultPath: path || undefined });
+      if (typeof picked === "string" && picked) {
+        setPath(picked);
+        await onSetPath(project.name, picked);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const savePath = async () => {
+    const v = path.trim();
+    if (busy || v === (project.path ?? "")) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await onSetPath(project.name, v);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
   };
 
   const remove = async () => {
     if (busy) return;
     setBusy(true);
-    await onDelete(project.name);
-    setBusy(false);
+    try {
+      await onDelete(project.name);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
   };
 
   return (
@@ -85,7 +129,7 @@ export function ProjectSettingsPanel({
             onKeyDown={(e) => e.key === "Enter" && void save()}
           />
           <button
-            className="shrink-0 rounded-lg bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+            className={SBUTTON + " shrink-0 !px-4"}
             disabled={!name.trim() || name.trim() === project.name || busy}
             onClick={() => void save()}
           >
@@ -94,14 +138,40 @@ export function ProjectSettingsPanel({
         </div>
       </label>
 
-      <div className="flex flex-col gap-1">
-        <span className="text-[12px] font-medium text-[var(--text-muted)]">
-          Folder <span className="text-[var(--text-dim)]">(read-only)</span>
-        </span>
-        <span className="flex items-center gap-1.5 truncate font-mono text-[11px] text-[var(--text-dim)]">
-          <Folder size={12} className="shrink-0" />
-          {project.path || "no folder on disk"}
-        </span>
+      {/* Directory — editable now: type a path or pick a folder via the OS dialog. */}
+      <div className="flex flex-col gap-1.5">
+        <span className="text-[12px] font-medium text-[var(--text-muted)]">Directory</span>
+        <div className="flex gap-2">
+          <input
+            className={INPUT_CLS + " font-mono !text-[11.5px]"}
+            value={path}
+            onChange={(e) => setPath(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && void savePath()}
+            placeholder={project.path ? project.path : "no folder — agents use the default workspace"}
+            spellCheck={false}
+          />
+          <button
+            className={SBUTTON + " shrink-0 gap-1.5 !px-3"}
+            onClick={() => void browse()}
+            disabled={busy}
+            title="Pick a folder…"
+          >
+            <FolderOpen size={13} /> Browse
+          </button>
+        </div>
+        {path.trim() !== (project.path ?? "") && (
+          <div className="flex items-center gap-1.5 text-[11px] text-[var(--text-dim)]">
+            <Folder size={11} className="shrink-0" />
+            <span className="min-w-0 flex-1 truncate">Current: {project.path || "not set"}</span>
+            <button
+              className="rounded bg-[var(--accent)] px-2 py-0.5 text-[11px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+              disabled={busy}
+              onClick={() => void savePath()}
+            >
+              Apply
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Command permission: three explicit modes instead of a boolean. */}
@@ -121,19 +191,17 @@ export function ProjectSettingsPanel({
           {PERM_MODES.map((m) => (
             <button
               key={m.id}
-              className={`flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-left transition-colors ${
-                (project.permMode ?? "default") === m.id
+              className={"flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-left transition-colors " +
+                ((project.permMode ?? "default") === m.id
                   ? "border-[var(--accent)] bg-[var(--accent)]/10"
-                  : "border-[var(--border)] hover:bg-[var(--hover-bg)]"
-              }`}
+                  : "border-[var(--border)] hover:bg-[var(--hover-bg)]")}
               onClick={() => void onPermMode(project.name, m.id)}
             >
               <span
-                className={`flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border ${
-                  (project.permMode ?? "default") === m.id
+                className={"flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border " +
+                  ((project.permMode ?? "default") === m.id
                     ? "border-[var(--accent)]"
-                    : "border-[var(--text-dim)]"
-                }`}
+                    : "border-[var(--text-dim)]")}
               >
                 {(project.permMode ?? "default") === m.id && (
                   <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
@@ -147,6 +215,12 @@ export function ProjectSettingsPanel({
           ))}
         </div>
       </div>
+
+      {error && (
+        <div className="rounded-md border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-3 py-2 text-[12px] text-[var(--diff-del)]">
+          {error}
+        </div>
+      )}
 
       {confirming ? (
         <div className="flex items-center gap-2 rounded-lg border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-3 py-2.5">
@@ -191,19 +265,18 @@ export function ProjectSelect({
   // "No project" has nothing to configure, so it is not offered.
   const options = projects.filter((p) => p.name !== NO_PROJECT);
   return (
-    <select
-      className={SELECT_CLS}
-      value={value ?? ""}
-      onChange={(e) => onChange(e.target.value || null)}
-    >
-      <option value="" disabled>
-        {options.length ? "Select a project\u2026" : "No projects yet"}
-      </option>
-      {options.map((p) => (
-        <option key={p.name} value={p.name}>
-          {p.name}
-        </option>
-      ))}
-    </select>
+    <div className="w-[240px]">
+      <Combobox
+        value={value ?? ""}
+        onChange={(v) => onChange(v || null)}
+        placeholder={options.length ? "Select a project…" : "No projects yet"}
+        emptyText="No project matches"
+        options={options.map((p) => ({
+          value: p.name,
+          label: p.name,
+          hint: p.path ? p.path.split(/[\\/]/).pop() ?? "" : "",
+        }))}
+      />
+    </div>
   );
 }

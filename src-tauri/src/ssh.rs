@@ -1,17 +1,28 @@
 //! SSH Client mode — real SSH connections, managed in Rust.
 //!
-//! The frontend saves server units (host + credentials) in SQLite; this
-//! module owns the live connections:
+//! The frontend saves server units, key credentials and scripts through the
+//! commands below; this module owns everything live:
 //!
 //! * `connect`    — TCP + password/private-key auth via russh, pooled by
-//!                  server id so the UI and the agent tool share sessions;
+//!                  server id so the UI, the terminal and the agent share
+//!                  one session per server;
 //! * `exec`       — run one command on a pooled connection, collect output;
-//! * `disconnect` — close and forget a pooled connection;
+//! * shell (PTY)  — interactive terminal sessions for the console page:
+//!                  open/input/resize/close, output streamed by events,
+//!                  ring buffer for late attachers;
+//! * SFTP         — browsing, up/download, rename/remove over the same
+//!                  pooled connection (Termius-style file transfer);
+//! * `disconnect` — close and forget a pooled connection (and its shells);
 //! * every attempt (user or agent) is written to `ssh_logs` — the audit
 //!   trail the Logs page renders.
 //!
-//! Credentials are read from the same SQLite file the SQL plugin manages
-//! (sqlx, same version), so secrets never round-trip through the webview.
+//! Security:
+//! * secrets (passwords, private keys, passphrases) are stored AES-256-GCM
+//!   encrypted by `vault.rs` — the master key lives in the OS credential
+//!   store, never in the database; the webview never receives them back;
+//! * host keys are pinned: first connect remembers the SHA-256 fingerprint
+//!   (trust on first use), every later connect verifies it — a changed key
+//!   is refused as a possible MITM.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -19,24 +30,31 @@ use std::time::Duration;
 
 use russh::client::{self, Handle};
 use russh::keys::key::PrivateKeyWithHashAlg;
-use russh::keys::PrivateKey;
+use russh::keys::{decode_secret_key, HashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect};
+use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::OpenFlags;
 use tauri::{AppHandle, Emitter};
 
 use crate::db;
+use crate::vault;
 
 /* ---------- Types shared with the frontend ---------- */
 
+/// A saved unit. password / private_key carry plaintext ONLY inside Rust
+/// (right after a vault decrypt); listings sent to the webview have them
+/// blanked.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SshServer {
+    #[serde(default)]
     pub id: String,
     pub name: String,
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
     pub username: String,
-    /// "password" | "key"
+    /// "password" | "key" (inline) | "cred" (a saved ssh_keys credential).
     #[serde(default = "default_auth")]
     pub auth: String,
     #[serde(default)]
@@ -44,6 +62,46 @@ pub struct SshServer {
     /// PEM/OpenSSH private key text (auth == "key").
     #[serde(default)]
     pub private_key: String,
+    /// Id of a saved key credential (auth == "cred").
+    #[serde(default)]
+    pub key_id: String,
+    /// Pinned host-key fingerprint ("SHA256:..."); empty = not seen yet.
+    #[serde(default)]
+    pub host_key: String,
+}
+
+/// A standalone private-key credential, reusable by several servers.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshKey {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    /// Plaintext only inside Rust; blanked in listings.
+    #[serde(default)]
+    pub private_key: String,
+    /// Plaintext only inside Rust; blanked in listings.
+    #[serde(default)]
+    pub passphrase: String,
+    /// True in listings when a key body is stored.
+    #[serde(default)]
+    pub has_key: bool,
+    /// Fingerprint of the stored key, for display (never the key itself).
+    #[serde(default)]
+    pub fingerprint: String,
+}
+
+/// A saved remote command (Units page runs it with one click).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshScript {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub content: String,
 }
 
 fn default_port() -> u16 {
@@ -53,50 +111,81 @@ fn default_auth() -> String {
     "password".into()
 }
 
-/* ---------- Connection pool ---------- */
+/* ---------- Host-key pinning + connection pool ---------- */
 
-struct ClientHandler;
+/// Fingerprints the server key exactly like `ssh-keygen -lf` does
+/// (ssh-key's own Fingerprint — Display prints "SHA256:…").
+fn host_fingerprint(key: &PublicKeyOrCertificate) -> String {
+    let fp = match key {
+        PublicKeyOrCertificate::PublicKey { key, .. } => key.fingerprint(HashAlg::Sha256),
+        PublicKeyOrCertificate::Certificate(cert) => {
+            cert.public_key().fingerprint(HashAlg::Sha256)
+        }
+    };
+    fp.to_string()
+}
+
+struct ClientHandler {
+    /// Fingerprint we expect (empty string = first contact, pin it).
+    expected: String,
+    /// Fingerprint the server actually presented.
+    seen: Arc<Mutex<String>>,
+}
 
 impl russh::client::Handler for ClientHandler {
     type Error = russh::Error;
 
-    // v1 trusts any host key (like `ssh -o StrictHostKeyChecking=accept-new`).
-    // Known-host pinning is a later hardening step.
+    /// Trust-on-first-use with pinning: the first successful connect stores
+    /// the fingerprint in ssh_servers.host_key; every later connect must
+    /// match it or is refused (possible MITM / reinstalled host).
     async fn check_server_key(
         &mut self,
-        _key: &russh::keys::PublicKeyOrCertificate,
+        key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        let fp = host_fingerprint(key);
+        if let Ok(mut seen) = self.seen.lock() {
+            *seen = fp.clone();
+        }
+        Ok(self.expected.is_empty() || self.expected == fp)
     }
 }
 
 type Conn = Arc<Handle<ClientHandler>>;
 
-static POOL: Mutex<Option<HashMap<String, Conn>>> = Mutex::new(None);
+/// Live connection: the russh handle, shared by exec / shells / SFTP.
+struct Pooled {
+    handle: Conn,
+}
 
-fn pool_get(id: &str) -> Option<Conn> {
+static POOL: Mutex<Option<HashMap<String, Arc<Pooled>>>> = Mutex::new(None);
+
+fn pool_get(id: &str) -> Option<Arc<Pooled>> {
     POOL.lock().ok()?.as_ref()?.get(id).cloned()
 }
 
-fn pool_put(id: String, conn: Conn) {
+fn pool_put(id: String, conn: Arc<Pooled>) {
     if let Ok(mut guard) = POOL.lock() {
         guard.get_or_insert_with(HashMap::new).insert(id, conn);
     }
 }
 
-fn pool_take(id: &str) -> Option<Conn> {
+fn pool_take(id: &str) -> Option<Arc<Pooled>> {
     POOL.lock().ok()?.as_mut()?.remove(id)
 }
 
-/// Ids of currently connected servers (the UI paints status dots from this).
-pub fn connected_ids() -> Vec<String> {
+fn pool_ids() -> Vec<String> {
     POOL.lock()
         .ok()
         .and_then(|g| g.as_ref().map(|m| m.keys().cloned().collect()))
         .unwrap_or_default()
 }
 
-/* ---------- Audit log (sqlx → the same singularity.db) ---------- */
+/// Ids of currently connected servers (the UI paints status dots from this).
+pub fn connected_ids() -> Vec<String> {
+    pool_ids()
+}
+
+/* ---------- Database (sqlx → the same singularity.db) ---------- */
 
 /// Cached pool (cheap Arc clone). A tokio Mutex instead of OnceCell so a
 /// failed connect is RETRIED on the next call rather than cached forever.
@@ -160,13 +249,14 @@ pub fn unique_id(prefix: &str) -> String {
     format!("{prefix}-{:x}-{:x}", d.as_nanos(), d.subsec_nanos().wrapping_mul(2654435761))
 }
 
-/* ---------- Credentials from the database ---------- */
+/* ---------- Credential resolution (vault-encrypted at rest) ---------- */
 
-/// Loads one saved server row (credentials included) for Rust-side use.
+/// Loads one saved server row and decrypts its secrets (plaintext stays
+/// inside Rust). `key_id` credentials are resolved from ssh_keys here too.
 async fn load_server(app: &AppHandle, id: &str) -> Result<SshServer, String> {
     let pool = sql(app).await.ok_or("database unavailable")?;
     let row = sqlx::query(
-        "SELECT id, name, host, port, username, auth, password, private_key FROM ssh_servers WHERE id = $1",
+        "SELECT id, name, host, port, username, auth, password, private_key, key_id, host_key FROM ssh_servers WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&pool)
@@ -175,15 +265,48 @@ async fn load_server(app: &AppHandle, id: &str) -> Result<SshServer, String> {
     .ok_or_else(|| format!("unknown server: {id}"))?;
 
     use sqlx::Row;
-    Ok(SshServer {
+    let auth: String = row.try_get("auth").unwrap_or_default();
+    let key_id: String = row.try_get("key_id").unwrap_or_default();
+    let mut server = SshServer {
         id: row.try_get("id").unwrap_or_default(),
         name: row.try_get("name").unwrap_or_default(),
         host: row.try_get("host").unwrap_or_default(),
         port: row.try_get::<i64, _>("port").unwrap_or(22) as u16,
         username: row.try_get("username").unwrap_or_default(),
-        auth: row.try_get("auth").unwrap_or_default(),
-        password: row.try_get("password").unwrap_or_default(),
-        private_key: row.try_get("private_key").unwrap_or_default(),
+        auth: auth.clone(),
+        password: vault::decrypt(&row.try_get::<String, _>("password").unwrap_or_default()),
+        private_key: vault::decrypt(&row.try_get::<String, _>("private_key").unwrap_or_default()),
+        key_id: key_id.clone(),
+        host_key: row.try_get("host_key").unwrap_or_default(),
+    };
+    if auth == "cred" && !key_id.is_empty() {
+        let key = load_key(app, &key_id).await?;
+        server.private_key = key.private_key;
+        server.password = key.passphrase; // reused as the key passphrase
+    }
+    Ok(server)
+}
+
+/// Loads a key credential and decrypts its body/passphrase.
+async fn load_key(app: &AppHandle, id: &str) -> Result<SshKey, String> {
+    let pool = sql(app).await.ok_or("database unavailable")?;
+    let row = sqlx::query("SELECT id, name, private_key, passphrase FROM ssh_keys WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| format!("db error: {e}"))?
+        .ok_or_else(|| format!("unknown credential: {id}"))?;
+    use sqlx::Row;
+    let stored_key: String = row.try_get("private_key").unwrap_or_default();
+    let stored_pass: String = row.try_get("passphrase").unwrap_or_default();
+    let plain_key = vault::decrypt(&stored_key);
+    Ok(SshKey {
+        id: row.try_get("id").unwrap_or_default(),
+        name: row.try_get("name").unwrap_or_default(),
+        private_key: plain_key,
+        passphrase: vault::decrypt(&stored_pass),
+        has_key: !stored_key.is_empty(),
+        fingerprint: String::new(),
     })
 }
 
@@ -199,7 +322,7 @@ pub async fn connect(app: &AppHandle, actor: &str, server_id: &str) -> Result<()
         return Ok(()); // already connected — idempotent
     }
     let server = load_server(app, server_id).await?;
-    let outcome = connect_inner(&server).await;
+    let outcome = connect_inner(app, &server).await;
     match &outcome {
         Ok(_) => write_log(app, actor, &server, "connect", true, "").await,
         Err(e) => write_log(app, actor, &server, "connect", false, e).await,
@@ -208,26 +331,55 @@ pub async fn connect(app: &AppHandle, actor: &str, server_id: &str) -> Result<()
     outcome
 }
 
-async fn connect_inner(server: &SshServer) -> Result<(), String> {
+async fn connect_inner(app: &AppHandle, server: &SshServer) -> Result<(), String> {
     let config = Arc::new(client::Config {
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
         ..Default::default()
     });
+    let seen = Arc::new(Mutex::new(String::new()));
+    let handler = ClientHandler {
+        expected: server.host_key.clone(),
+        seen: seen.clone(),
+    };
     let addr = (server.host.as_str(), server.port);
-    let mut session = tokio::time::timeout(
+    let session = tokio::time::timeout(
         CONNECT_TIMEOUT,
-        client::connect(config, addr, ClientHandler),
+        client::connect(config, addr, handler),
     )
-    .await
-    .map_err(|_| format!("connection to {}:{} timed out", server.host, server.port))?
-    .map_err(|e| format!("ssh handshake failed: {e}"))?;
+    .await;
+    let mut session = match session {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            // A pinned-key mismatch surfaces here — make it actionable.
+            if !server.host_key.is_empty() {
+                let fp = seen.lock().map(|g| g.clone()).unwrap_or_default();
+                if !fp.is_empty() && fp != server.host_key {
+                    return Err(format!(
+                        "host key changed! expected {} but the server presented {} — possible MITM, refusing to connect (fix: clear the fingerprint on the server's settings page if you reinstalled it)",
+                        server.host_key, fp
+                    ));
+                }
+            }
+            return Err(format!("ssh handshake failed: {e}"));
+        }
+        Err(_) => return Err(format!("connection to {}:{} timed out", server.host, server.port)),
+    };
 
-    let auth = if server.auth == "key" {
-        let key = PrivateKey::from_openssh(server.private_key.trim())
+    let auth = if server.auth == "password" {
+        session
+            .authenticate_password(&server.username, &server.password)
+            .await
+    } else {
+        // "key" (inline) and "cred" (saved credential, already merged into
+        // private_key/passphrase by load_server) both land here.
+        let pass = if server.password.is_empty() {
+            None
+        } else {
+            Some(server.password.as_str())
+        };
+        let key = decode_secret_key(server.private_key.trim(), pass)
             .map_err(|e| format!("cannot parse private key: {e}"))?;
-        // RSA keys need a hash algorithm the server advertises; russh asks
-        // the server which SHA variant it prefers (None = legacy sha1).
         let hash = if key.algorithm().is_rsa() {
             session.best_supported_rsa_hash().await.ok().flatten().flatten()
         } else {
@@ -235,10 +387,6 @@ async fn connect_inner(server: &SshServer) -> Result<(), String> {
         };
         let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
         session.authenticate_publickey(&server.username, key).await
-    } else {
-        session
-            .authenticate_password(&server.username, &server.password)
-            .await
     };
 
     let auth = auth.map_err(|e| format!("authentication error: {e}"))?;
@@ -248,7 +396,22 @@ async fn connect_inner(server: &SshServer) -> Result<(), String> {
             server.username
         ));
     }
-    pool_put(server.id.clone(), Arc::new(session));
+
+    // Pin the fingerprint the server presented (trust on first use).
+    let fp = seen.lock().map(|g| g.clone()).unwrap_or_default();
+    if !fp.is_empty() && fp != server.host_key {
+        if let Some(pool) = sql(app).await {
+            let _ = sqlx::query("UPDATE ssh_servers SET host_key = $1 WHERE id = $2")
+                .bind(&fp)
+                .bind(&server.id)
+                .execute(&pool)
+                .await;
+        }
+    }
+    pool_put(
+        server.id.clone(),
+        Arc::new(Pooled { handle: Arc::new(session) }),
+    );
     Ok(())
 }
 
@@ -267,7 +430,7 @@ pub async fn exec(
     let conn = pool_get(server_id).ok_or("not connected")?;
     let server = load_server(app, server_id).await?;
 
-    let outcome = exec_inner(&conn, command).await;
+    let outcome = exec_inner(&conn.handle, command).await;
     let (ok, detail) = match &outcome {
         Ok(text) => (true, first_line(text)),
         Err(e) => (false, first_line(e)),
@@ -331,9 +494,7 @@ async fn exec_inner(conn: &Handle<ClientHandler>, command: &str) -> Result<Strin
     };
     tokio::time::timeout(EXEC_TIMEOUT, collect)
         .await
-        .map_err(|_| {
-            format!("command timed out after {}s", EXEC_TIMEOUT.as_secs())
-        })?;
+        .map_err(|_| format!("command timed out after {}s", EXEC_TIMEOUT.as_secs()))?;
 
     let mut out = String::new();
     if !stdout.is_empty() {
@@ -355,16 +516,954 @@ async fn exec_inner(conn: &Handle<ClientHandler>, command: &str) -> Result<Strin
     }
 }
 
-/// Closes a pooled connection (idempotent).
+/// Closes a pooled connection and every shell/SFTP session riding it.
 pub async fn disconnect(app: &AppHandle, actor: &str, server_id: &str) -> Result<(), String> {
+    close_shells(server_id).await;
     let Some(conn) = pool_take(server_id) else {
         return Ok(());
     };
+    drop_sftp(server_id);
     let server = load_server(app, server_id).await?;
     let res = conn
+        .handle
         .disconnect(Disconnect::ByApplication, "", "en")
         .await;
     write_log(app, actor, &server, "disconnect", res.is_ok(), "").await;
     let _ = app.emit("ssh://status", connected_ids());
     res.map_err(|e| format!("disconnect failed: {e}"))
 }
+
+/* ---------- Interactive shells (PTY) ---------- */
+// One shell = one PTY channel + a reader task streaming output to the
+// webview (`ssh://shell-data`, base64) and a write half parked in SHELLS
+// for input/resize. A ring buffer keeps the last 256 KB so a terminal
+// page reopened later restores what it missed — shells, like agent runs,
+// outlive the view that opened them.
+
+use russh::ChannelWriteHalf;
+
+const SHELL_BUFFER_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShellData {
+    session_id: String,
+    /// base64 of the raw PTY bytes (may split UTF-8 — the frontend
+    /// decodes to Uint8Array and lets xterm handle the rest).
+    data: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShellExit {
+    session_id: String,
+    code: Option<u32>,
+}
+
+struct ShellState {
+    server_id: String,
+    write: tokio::sync::Mutex<ChannelWriteHalf<russh::client::Msg>>,
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+static SHELLS: tokio::sync::Mutex<Option<HashMap<String, Arc<ShellState>>>> =
+    tokio::sync::Mutex::const_new(None);
+
+fn b64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| format!("bad base64: {e}"))
+}
+
+/// Opens an interactive PTY shell sized cols×rows (the frontend measures
+/// the real terminal box first — that is what keeps the remote side from
+/// defaulting to a tiny 80×24).
+pub async fn shell_open(
+    app: &AppHandle,
+    actor: &str,
+    server_id: &str,
+    cols: u32,
+    rows: u32,
+    term: &str,
+) -> Result<String, String> {
+    if pool_get(server_id).is_none() {
+        connect(app, actor, server_id).await?;
+    }
+    let conn = pool_get(server_id).ok_or("not connected")?;
+
+    let channel = conn
+        .handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("cannot open channel: {e}"))?;
+    let term = if term.trim().is_empty() { "xterm-256color" } else { term.trim() };
+    channel
+        .request_pty(true, term, cols.max(2), rows.max(1), 0, 0, &[])
+        .await
+        .map_err(|e| format!("pty request failed: {e}"))?;
+    channel
+        .request_shell(true)
+        .await
+        .map_err(|e| format!("shell request failed: {e}"))?;
+
+    let (mut read, write) = channel.split();
+    let session_id = unique_id("sh");
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let state = Arc::new(ShellState {
+        server_id: server_id.to_string(),
+        write: tokio::sync::Mutex::new(write),
+        buffer: buffer.clone(),
+    });
+    {
+        let mut guard = SHELLS.lock().await;
+        guard
+            .get_or_insert_with(HashMap::new)
+            .insert(session_id.clone(), state);
+    }
+
+    // Reader task: PTY output → ring buffer + event stream.
+    let app2 = app.clone();
+    let sid = session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut exit_code: Option<u32> = None;
+        while let Some(msg) = read.wait().await {
+            match msg {
+                ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
+                    if let Ok(mut b) = buffer.lock() {
+                        b.extend_from_slice(data);
+                        if b.len() > SHELL_BUFFER_BYTES {
+                            let drop = b.len() - SHELL_BUFFER_BYTES;
+                            b.drain(..drop);
+                        }
+                    }
+                    let _ = app2.emit(
+                        "ssh://shell-data",
+                        ShellData {
+                            session_id: sid.clone(),
+                            data: b64_encode(data),
+                        },
+                    );
+                }
+                ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        let _ = app2.emit(
+            "ssh://shell-exit",
+            ShellExit { session_id: sid.clone(), code: exit_code },
+        );
+        let mut guard = SHELLS.lock().await;
+        if let Some(map) = guard.as_mut() {
+            map.remove(&sid);
+        }
+    });
+
+    let server = load_server(app, server_id).await?;
+    write_log(app, actor, &server, "shell", true, "interactive terminal opened").await;
+    Ok(session_id)
+}
+
+/// Feeds typed bytes into the PTY (base64 over IPC — binary-safe).
+pub async fn shell_input(session_id: &str, data_b64: &str) -> Result<(), String> {
+    let bytes = b64_decode(data_b64)?;
+    let guard = SHELLS.lock().await;
+    let state = guard
+        .as_ref()
+        .and_then(|m| m.get(session_id))
+        .cloned()
+        .ok_or_else(|| format!("no such shell: {session_id}"))?;
+    drop(guard);
+    let w = state.write.lock().await;
+    w.data_bytes(bytes)
+        .await
+        .map_err(|e| format!("input failed: {e}"))
+}
+
+/// Tells the remote PTY the terminal box changed size (window resize /
+/// panel drag). Without this the shell keeps wrapping at the old width.
+pub async fn shell_resize(session_id: &str, cols: u32, rows: u32) -> Result<(), String> {
+    let guard = SHELLS.lock().await;
+    let state = guard
+        .as_ref()
+        .and_then(|m| m.get(session_id))
+        .cloned()
+        .ok_or_else(|| format!("no such shell: {session_id}"))?;
+    drop(guard);
+    let w = state.write.lock().await;
+    w.window_change(cols.max(2), rows.max(1), 0, 0)
+        .await
+        .map_err(|e| format!("resize failed: {e}"))
+}
+
+/// Base64 of everything the shell printed recently (ring buffer) — a
+/// terminal page reopening mid-session restores its scrollback with it.
+pub async fn shell_snapshot(session_id: &str) -> Result<String, String> {
+    let guard = SHELLS.lock().await;
+    let state = guard
+        .as_ref()
+        .and_then(|m| m.get(session_id))
+        .cloned()
+        .ok_or_else(|| format!("no such shell: {session_id}"))?;
+    drop(guard);
+    let buf = state.buffer.lock().map_err(|_| "buffer poisoned")?;
+    Ok(b64_encode(&buf))
+}
+
+/// Closes one shell (user closed the terminal page or the server row).
+pub async fn shell_close(session_id: &str) -> Result<(), String> {
+    let mut guard = SHELLS.lock().await;
+    let Some(state) = guard.as_mut().and_then(|m| m.remove(session_id)) else {
+        return Ok(()); // already gone — idempotent
+    };
+    drop(guard);
+    let w = state.write.lock().await;
+    let _ = w.eof().await;
+    w.close().await.map_err(|e| format!("close failed: {e}"))
+}
+
+/// Every live shell: (session_id, server_id) — the frontend attaches to
+/// the one belonging to its server instead of opening a duplicate.
+pub async fn shell_list() -> Vec<(String, String)> {
+    let guard = SHELLS.lock().await;
+    guard
+        .as_ref()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.server_id.clone())).collect())
+        .unwrap_or_default()
+}
+
+/// Kills every shell riding a server connection (called on disconnect).
+async fn close_shells(server_id: &str) {
+    let ids: Vec<String> = {
+        let guard = SHELLS.lock().await;
+        guard
+            .as_ref()
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, v)| v.server_id == server_id)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for id in ids {
+        let _ = shell_close(&id).await;
+    }
+}
+
+/* ---------- SFTP (file transfer over the same connection) ---------- */
+// Termius-style browsing: the SFTP subsystem rides a channel of the
+// pooled connection, cached per server so navigating directories does not
+// pay the handshake each time. Transfers stream in chunks; the UI gets
+// progress events (`ssh://transfer`) for the progress bar.
+
+static SFTP: tokio::sync::Mutex<Option<HashMap<String, Arc<SftpSession>>>> =
+    tokio::sync::Mutex::const_new(None);
+
+const SFTP_CHUNK: usize = 32 * 1024;
+const MAX_TEXT_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    /// Unix seconds of mtime, 0 when the server omits it.
+    pub modified: i64,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferProgress {
+    server_id: String,
+    file: String,
+    done: u64,
+    total: u64,
+    finished: bool,
+}
+
+/// Returns (or creates) the SFTP session of a pooled connection.
+async fn sftp_for(
+    app: &AppHandle,
+    actor: &str,
+    server_id: &str,
+) -> Result<Arc<SftpSession>, String> {
+    {
+        let guard = SFTP.lock().await;
+        if let Some(s) = guard.as_ref().and_then(|m| m.get(server_id)) {
+            return Ok(Arc::clone(s));
+        }
+    }
+    if pool_get(server_id).is_none() {
+        connect(app, actor, server_id).await?;
+    }
+    let conn = pool_get(server_id).ok_or("not connected")?;
+    let channel = conn
+        .handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("cannot open sftp channel: {e}"))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| format!("sftp subsystem failed: {e}"))?;
+    let session = Arc::new(
+        SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| format!("sftp init failed: {e}"))?,
+    );
+    let mut guard = SFTP.lock().await;
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(server_id.to_string(), Arc::clone(&session));
+    Ok(session)
+}
+
+fn drop_sftp(server_id: &str) {
+    // Fire and forget: the lock is async, disconnect should not block on it.
+    let id = server_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        let mut guard = SFTP.lock().await;
+        if let Some(map) = guard.as_mut() {
+            map.remove(&id);
+        }
+    });
+}
+
+/// Lists a remote directory, sorted (dirs first, then name).
+pub async fn sftp_list(
+    app: &AppHandle,
+    server_id: &str,
+    path: &str,
+) -> Result<Vec<SftpEntry>, String> {
+    let sftp = sftp_for(app, "user", server_id).await?;
+    let dir = if path.trim().is_empty() { "." } else { path.trim() };
+    let read = sftp
+        .read_dir(dir)
+        .await
+        .map_err(|e| format!("cannot list {dir}: {e}"))?;
+    let mut out: Vec<SftpEntry> = vec![];
+    for entry in read {
+        let meta = entry.metadata();
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        out.push(SftpEntry {
+            name: entry.file_name(),
+            path: entry.path(),
+            is_dir: meta.file_type().is_dir(),
+            size: meta.len(),
+            modified,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(out)
+}
+
+/// Resolves the remote home directory (SFTP starts wherever the server
+/// drops us — usually the user's home).
+pub async fn sftp_home(app: &AppHandle, server_id: &str) -> Result<String, String> {
+    let sftp = sftp_for(app, "user", server_id).await?;
+    sftp.canonicalize(".")
+        .await
+        .map_err(|e| format!("cannot resolve home: {e}"))
+}
+
+/// Downloads a remote file to a local path, streaming with progress.
+pub async fn sftp_download(
+    app: &AppHandle,
+    server_id: &str,
+    remote: &str,
+    local: &str,
+) -> Result<u64, String> {
+    use tokio::io::AsyncWriteExt;
+    let sftp = sftp_for(app, "user", server_id).await?;
+    let mut file = sftp
+        .open(remote)
+        .await
+        .map_err(|e| format!("cannot open {remote}: {e}"))?;
+    let total = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let name = remote.rsplit('/').next().unwrap_or(remote).to_string();
+    let mut out = tokio::fs::File::create(local)
+        .await
+        .map_err(|e| format!("cannot write {local}: {e}"))?;
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; SFTP_CHUNK];
+    let mut done: u64 = 0;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])
+            .await
+            .map_err(|e| format!("write failed: {e}"))?;
+        done += n as u64;
+        let _ = app.emit(
+            "ssh://transfer",
+            TransferProgress {
+                server_id: server_id.to_string(),
+                file: name.clone(),
+                done,
+                total,
+                finished: false,
+            },
+        );
+    }
+    out.flush().await.ok();
+    file.close().await.ok();
+    let _ = app.emit(
+        "ssh://transfer",
+        TransferProgress {
+            server_id: server_id.to_string(),
+            file: name,
+            done,
+            total: done,
+            finished: true,
+        },
+    );
+    let server = load_server(app, server_id).await?;
+    write_log(app, "user", &server, "sftp-download", true, remote).await;
+    Ok(done)
+}
+
+/// Uploads a local file to a remote path, streaming with progress.
+pub async fn sftp_upload(
+    app: &AppHandle,
+    server_id: &str,
+    local: &str,
+    remote: &str,
+) -> Result<u64, String> {
+    use tokio::io::AsyncReadExt;
+    let sftp = sftp_for(app, "user", server_id).await?;
+    let mut src = tokio::fs::File::open(local)
+        .await
+        .map_err(|e| format!("cannot read {local}: {e}"))?;
+    let total = src.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let mut file = sftp
+        .open_with_flags(remote, OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE)
+        .await
+        .map_err(|e| format!("cannot create {remote}: {e}"))?;
+    use tokio::io::AsyncWriteExt;
+    let name = local.rsplit(['/', '\\']).next().unwrap_or(local).to_string();
+    let mut buf = vec![0u8; SFTP_CHUNK];
+    let mut done: u64 = 0;
+    loop {
+        let n = src
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])
+            .await
+            .map_err(|e| format!("upload failed: {e}"))?;
+        done += n as u64;
+        let _ = app.emit(
+            "ssh://transfer",
+            TransferProgress {
+                server_id: server_id.to_string(),
+                file: name.clone(),
+                done,
+                total,
+                finished: false,
+            },
+        );
+    }
+    file.sync_all().await.ok();
+    file.close().await.ok();
+    let _ = app.emit(
+        "ssh://transfer",
+        TransferProgress {
+            server_id: server_id.to_string(),
+            file: name,
+            done,
+            total: done,
+            finished: true,
+        },
+    );
+    let server = load_server(app, server_id).await?;
+    write_log(app, "user", &server, "sftp-upload", true, remote).await;
+    Ok(done)
+}
+
+/// Reads a small text file (capped) for the viewer panel.
+pub async fn sftp_read_text(
+    app: &AppHandle,
+    server_id: &str,
+    remote: &str,
+) -> Result<String, String> {
+    let sftp = sftp_for(app, "user", server_id).await?;
+    let meta = sftp.metadata(remote).await.map_err(|e| format!("stat failed: {e}"))?;
+    if meta.len() > MAX_TEXT_BYTES {
+        return Err(format!(
+            "file is {} bytes — preview capped at 2 MB; download it instead",
+            meta.len()
+        ));
+    }
+    let bytes = sftp.read(remote).await.map_err(|e| format!("read failed: {e}"))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Renames/moves a remote path.
+pub async fn sftp_rename(
+    app: &AppHandle,
+    server_id: &str,
+    old: &str,
+    new: &str,
+) -> Result<(), String> {
+    let sftp = sftp_for(app, "user", server_id).await?;
+    sftp.rename(old, new).await.map_err(|e| format!("rename failed: {e}"))
+}
+
+/// Removes a remote file or (empty) directory.
+pub async fn sftp_remove(
+    app: &AppHandle,
+    server_id: &str,
+    path: &str,
+    is_dir: bool,
+) -> Result<(), String> {
+    let sftp = sftp_for(app, "user", server_id).await?;
+    if is_dir {
+        sftp.remove_dir(path).await.map_err(|e| format!("rmdir failed: {e}"))
+    } else {
+        sftp.remove_file(path).await.map_err(|e| format!("rm failed: {e}"))
+    }
+}
+
+/// Creates a remote directory.
+pub async fn sftp_mkdir(app: &AppHandle, server_id: &str, path: &str) -> Result<(), String> {
+    let sftp = sftp_for(app, "user", server_id).await?;
+    sftp.create_dir(path).await.map_err(|e| format!("mkdir failed: {e}"))
+}
+
+/* ---------- Units CRUD (frontend talks through commands) ---------- */
+// Rows are written with vault-encrypted secrets; every SELECT for the
+// webview blanks them and sends fingerprints instead.
+
+pub async fn list_servers(app: &AppHandle) -> Result<Vec<SshServer>, String> {
+    let pool = sql(app).await.ok_or("database unavailable")?;
+    let rows = sqlx::query(
+        "SELECT id, name, host, port, username, auth, key_id, host_key FROM ssh_servers ORDER BY created_at DESC",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| format!("db error: {e}"))?;
+    use sqlx::Row;
+    Ok(rows
+        .iter()
+        .map(|r| SshServer {
+            id: r.try_get("id").unwrap_or_default(),
+            name: r.try_get("name").unwrap_or_default(),
+            host: r.try_get("host").unwrap_or_default(),
+            port: r.try_get::<i64, _>("port").unwrap_or(22) as u16,
+            username: r.try_get("username").unwrap_or_default(),
+            auth: r.try_get("auth").unwrap_or_default(),
+            password: String::new(),
+            private_key: String::new(),
+            key_id: r.try_get("key_id").unwrap_or_default(),
+            host_key: r.try_get("host_key").unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// Insert-or-update a unit. Secrets arrive as plaintext over IPC (local
+/// app only) and go into the DB vault-encrypted. Empty password/key on an
+/// update keeps the stored secret — the edit form does not have to resend it.
+pub async fn save_server(app: &AppHandle, s: &SshServer) -> Result<String, String> {
+    let pool = sql(app).await.ok_or("database unavailable")?;
+    let id = if s.id.is_empty() {
+        unique_id("srv")
+    } else {
+        s.id.clone()
+    };
+    // Keep existing secrets when the field comes back blank.
+    let (old_pass, old_key): (String, String) = if s.id.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let row = sqlx::query("SELECT password, private_key FROM ssh_servers WHERE id = $1")
+            .bind(&id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| format!("db error: {e}"))?;
+        match row {
+            Some(r) => {
+                use sqlx::Row;
+                (
+                    r.try_get::<String, _>("password").unwrap_or_default(),
+                    r.try_get::<String, _>("private_key").unwrap_or_default(),
+                )
+            }
+            None => (String::new(), String::new()),
+        }
+    };
+    let password = if s.password.is_empty() { old_pass } else { vault::encrypt(&s.password) };
+    let private_key = if s.private_key.is_empty() {
+        old_key
+    } else {
+        vault::encrypt(&s.private_key)
+    };
+    let host_key = if s.host_key.trim() == "-" {
+        // "-" from the UI = clear the pinned fingerprint (reinstalled host).
+        String::new()
+    } else {
+        s.host_key.clone()
+    };
+    sqlx::query(
+        "INSERT INTO ssh_servers (id, name, host, port, username, auth, password, private_key, key_id, host_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(id) DO UPDATE SET name=$2, host=$3, port=$4, username=$5, auth=$6, password=$7, private_key=$8, key_id=$9, host_key=$10",
+    )
+    .bind(&id)
+    .bind(&s.name)
+    .bind(&s.host)
+    .bind(s.port as i64)
+    .bind(&s.username)
+    .bind(&s.auth)
+    .bind(&password)
+    .bind(&private_key)
+    .bind(&s.key_id)
+    .bind(&host_key)
+    .execute(&pool)
+    .await
+    .map_err(|e| format!("cannot save server: {e}"))?;
+    Ok(id)
+}
+
+pub async fn delete_server(app: &AppHandle, id: &str) -> Result<(), String> {
+    let _ = disconnect(app, "user", id).await;
+    let pool = sql(app).await.ok_or("database unavailable")?;
+    sqlx::query("DELETE FROM ssh_servers WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("cannot delete server: {e}"))?;
+    Ok(())
+}
+
+pub async fn list_keys(app: &AppHandle) -> Result<Vec<SshKey>, String> {
+    let pool = sql(app).await.ok_or("database unavailable")?;
+    let rows = sqlx::query("SELECT id, name, private_key FROM ssh_keys ORDER BY created_at DESC")
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
+    use sqlx::Row;
+    let mut out = vec![];
+    for r in &rows {
+        let stored: String = r.try_get("private_key").unwrap_or_default();
+        let plain = vault::decrypt(&stored);
+        // Display fingerprint — computed from the decrypted key, then the
+        // plaintext is dropped; only the fingerprint crosses into the UI.
+        let fingerprint = decode_secret_key(plain.trim(), None)
+            .ok()
+            .map(|k| k.public_key().fingerprint(HashAlg::Sha256).to_string())
+            .unwrap_or_default();
+        out.push(SshKey {
+            id: r.try_get("id").unwrap_or_default(),
+            name: r.try_get("name").unwrap_or_default(),
+            private_key: String::new(),
+            passphrase: String::new(),
+            has_key: !stored.is_empty(),
+            fingerprint,
+        });
+    }
+    Ok(out)
+}
+
+/// Insert-or-update a key credential. Blank key/passphrase on update keeps
+/// the stored value (same rule as save_server).
+pub async fn save_key(app: &AppHandle, k: &SshKey) -> Result<String, String> {
+    let pool = sql(app).await.ok_or("database unavailable")?;
+    let id = if k.id.is_empty() {
+        unique_id("key")
+    } else {
+        k.id.clone()
+    };
+    let (old_key, old_pass): (String, String) = if k.id.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let row = sqlx::query("SELECT private_key, passphrase FROM ssh_keys WHERE id = $1")
+            .bind(&id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| format!("db error: {e}"))?;
+        match row {
+            Some(r) => {
+                use sqlx::Row;
+                (
+                    r.try_get::<String, _>("private_key").unwrap_or_default(),
+                    r.try_get::<String, _>("passphrase").unwrap_or_default(),
+                )
+            }
+            None => (String::new(), String::new()),
+        }
+    };
+    let private_key = if k.private_key.trim().is_empty() {
+        old_key
+    } else {
+        // Validate before storing: a broken key must not poison the row.
+        decode_secret_key(k.private_key.trim(), Some(k.passphrase.as_str()))
+            .map_err(|e| format!("invalid private key (or wrong passphrase): {e}"))?;
+        vault::encrypt(&k.private_key)
+    };
+    let passphrase = if k.passphrase.is_empty() {
+        old_pass
+    } else {
+        vault::encrypt(&k.passphrase)
+    };
+    sqlx::query(
+        "INSERT INTO ssh_keys (id, name, private_key, passphrase) VALUES ($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET name=$2, private_key=$3, passphrase=$4",
+    )
+    .bind(&id)
+    .bind(&k.name)
+    .bind(&private_key)
+    .bind(&passphrase)
+    .execute(&pool)
+    .await
+    .map_err(|e| format!("cannot save credential: {e}"))?;
+    Ok(id)
+}
+
+pub async fn delete_key(app: &AppHandle, id: &str) -> Result<(), String> {
+    let pool = sql(app).await.ok_or("database unavailable")?;
+    // Units referencing it fall back to password auth until re-edited.
+    sqlx::query("UPDATE ssh_servers SET key_id = '', auth = 'password' WHERE key_id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM ssh_keys WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("cannot delete credential: {e}"))?;
+    Ok(())
+}
+
+pub async fn list_scripts(app: &AppHandle) -> Result<Vec<SshScript>, String> {
+    let pool = sql(app).await.ok_or("database unavailable")?;
+    let rows = sqlx::query(
+        "SELECT id, name, description, content FROM ssh_scripts ORDER BY created_at DESC",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| format!("db error: {e}"))?;
+    use sqlx::Row;
+    Ok(rows
+        .iter()
+        .map(|r| SshScript {
+            id: r.try_get("id").unwrap_or_default(),
+            name: r.try_get("name").unwrap_or_default(),
+            description: r.try_get("description").unwrap_or_default(),
+            content: r.try_get("content").unwrap_or_default(),
+        })
+        .collect())
+}
+
+pub async fn save_script(app: &AppHandle, s: &SshScript) -> Result<String, String> {
+    let pool = sql(app).await.ok_or("database unavailable")?;
+    let id = if s.id.is_empty() {
+        unique_id("scr")
+    } else {
+        s.id.clone()
+    };
+    sqlx::query(
+        "INSERT INTO ssh_scripts (id, name, description, content) VALUES ($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET name=$2, description=$3, content=$4",
+    )
+    .bind(&id)
+    .bind(&s.name)
+    .bind(&s.description)
+    .bind(&s.content)
+    .execute(&pool)
+    .await
+    .map_err(|e| format!("cannot save script: {e}"))?;
+    Ok(id)
+}
+
+pub async fn delete_script(app: &AppHandle, id: &str) -> Result<(), String> {
+    let pool = sql(app).await.ok_or("database unavailable")?;
+    sqlx::query("DELETE FROM ssh_scripts WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("cannot delete script: {e}"))?;
+    Ok(())
+}
+
+/// Runs a saved script on a server (Units page one-click run).
+pub async fn run_script(
+    app: &AppHandle,
+    actor: &str,
+    server_id: &str,
+    script_id: &str,
+) -> Result<String, String> {
+    let scripts = list_scripts(app).await?;
+    let script = scripts
+        .into_iter()
+        .find(|s| s.id == script_id)
+        .ok_or_else(|| format!("unknown script: {script_id}"))?;
+    exec(app, actor, server_id, &script.content).await
+}
+
+/* ---------- Tauri command layer ---------- */
+// Thin wrappers; `lib.rs` registers them. Everything that could carry a
+// secret crosses as vault ciphertext or not at all (listings blank them).
+
+#[tauri::command]
+pub async fn ssh_list_servers(app: AppHandle) -> Result<Vec<SshServer>, String> {
+    list_servers(&app).await
+}
+
+#[tauri::command]
+pub async fn ssh_save_server(app: AppHandle, server: SshServer) -> Result<String, String> {
+    save_server(&app, &server).await
+}
+
+#[tauri::command]
+pub async fn ssh_delete_server(app: AppHandle, server_id: String) -> Result<(), String> {
+    delete_server(&app, &server_id).await
+}
+
+#[tauri::command]
+pub async fn ssh_list_keys(app: AppHandle) -> Result<Vec<SshKey>, String> {
+    list_keys(&app).await
+}
+
+#[tauri::command]
+pub async fn ssh_save_key(app: AppHandle, key: SshKey) -> Result<String, String> {
+    save_key(&app, &key).await
+}
+
+#[tauri::command]
+pub async fn ssh_delete_key(app: AppHandle, key_id: String) -> Result<(), String> {
+    delete_key(&app, &key_id).await
+}
+
+#[tauri::command]
+pub async fn ssh_list_scripts(app: AppHandle) -> Result<Vec<SshScript>, String> {
+    list_scripts(&app).await
+}
+
+#[tauri::command]
+pub async fn ssh_save_script(app: AppHandle, script: SshScript) -> Result<String, String> {
+    save_script(&app, &script).await
+}
+
+#[tauri::command]
+pub async fn ssh_delete_script(app: AppHandle, script_id: String) -> Result<(), String> {
+    delete_script(&app, &script_id).await
+}
+
+#[tauri::command]
+pub async fn ssh_run_script(app: AppHandle, server_id: String, script_id: String) -> Result<String, String> {
+    run_script(&app, "user", &server_id, &script_id).await
+}
+
+#[tauri::command]
+pub async fn ssh_shell_open(
+    app: AppHandle,
+    server_id: String,
+    cols: u32,
+    rows: u32,
+    term: Option<String>,
+) -> Result<String, String> {
+    shell_open(&app, "user", &server_id, cols, rows, term.as_deref().unwrap_or("")).await
+}
+
+#[tauri::command]
+pub async fn ssh_shell_input(session_id: String, data: String) -> Result<(), String> {
+    shell_input(&session_id, &data).await
+}
+
+#[tauri::command]
+pub async fn ssh_shell_resize(session_id: String, cols: u32, rows: u32) -> Result<(), String> {
+    shell_resize(&session_id, cols, rows).await
+}
+
+#[tauri::command]
+pub async fn ssh_shell_snapshot(session_id: String) -> Result<String, String> {
+    shell_snapshot(&session_id).await
+}
+
+#[tauri::command]
+pub async fn ssh_shell_close(session_id: String) -> Result<(), String> {
+    shell_close(&session_id).await
+}
+
+#[tauri::command]
+pub async fn ssh_shell_list() -> Vec<(String, String)> {
+    shell_list().await
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_list(app: AppHandle, server_id: String, path: String) -> Result<Vec<SftpEntry>, String> {
+    sftp_list(&app, &server_id, &path).await
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_home(app: AppHandle, server_id: String) -> Result<String, String> {
+    sftp_home(&app, &server_id).await
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_download(
+    app: AppHandle,
+    server_id: String,
+    remote: String,
+    local: String,
+) -> Result<u64, String> {
+    sftp_download(&app, &server_id, &remote, &local).await
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_upload(
+    app: AppHandle,
+    server_id: String,
+    local: String,
+    remote: String,
+) -> Result<u64, String> {
+    sftp_upload(&app, &server_id, &local, &remote).await
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_read_text(app: AppHandle, server_id: String, remote: String) -> Result<String, String> {
+    sftp_read_text(&app, &server_id, &remote).await
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_rename(app: AppHandle, server_id: String, old: String, new: String) -> Result<(), String> {
+    sftp_rename(&app, &server_id, &old, &new).await
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_remove(app: AppHandle, server_id: String, path: String, is_dir: bool) -> Result<(), String> {
+    sftp_remove(&app, &server_id, &path, is_dir).await
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_mkdir(app: AppHandle, server_id: String, path: String) -> Result<(), String> {
+    sftp_mkdir(&app, &server_id, &path).await
+}
+
+#[tauri::command]
+pub fn ssh_vault_status() -> bool {
+    vault::vault_backed()
+}
+

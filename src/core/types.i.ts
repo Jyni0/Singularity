@@ -51,7 +51,18 @@ export interface Project {
   permMode?: PermMode;
 }
 
-export type ViewKind = "chat" | "new" | "history" | "tasks" | "units" | "ssh-logs";
+export type ViewKind =
+  | "chat"
+  | "new"
+  | "history"
+  | "tasks"
+  | "units"
+  | "ssh-logs"
+  | "ssh-terminal"
+  | "ssh-files";
+
+/** Which Units sub-collection the Units page shows (segmented switcher). */
+export type UnitsTab = "servers" | "keys" | "scripts";
 
 /* ---------- SSH Client mode ---------- */
 
@@ -63,17 +74,73 @@ export type ViewKind = "chat" | "new" | "history" | "tasks" | "units" | "ssh-log
  */
 export type AppMode = "agent" | "ssh";
 
-/** A saved SSH server unit (credentials persist in SQLite via db.r). */
+/**
+ * A saved SSH server unit. Secrets live in SQLite AES-256-GCM encrypted
+ * (vault.rs); listings from Rust carry blank password/privateKey — the UI
+ * only sends plaintext when saving.
+ */
 export interface SshServer {
   id: string;
   name: string;
   host: string;
   port: number;
   username: string;
-  auth: "password" | "key";
+  /** "password" | "key" (inline) | "cred" (saved key credential). */
+  auth: "password" | "key" | "cred";
   password: string;
   /** PEM/OpenSSH private key text when auth === "key". */
   private_key: string;
+  /** ssh_keys row id when auth === "cred". */
+  key_id: string;
+  /** Pinned host-key fingerprint ("SHA256:…"); "" = not seen yet. */
+  host_key: string;
+}
+
+/** A reusable private-key credential (secrets encrypted at rest). */
+export interface SshKey {
+  id: string;
+  name: string;
+  /** Plaintext only when saving; blank in listings. */
+  private_key: string;
+  /** Plaintext only when saving; blank in listings. */
+  passphrase: string;
+  /** True when a key body is stored. */
+  has_key: boolean;
+  /** "SHA256:…" of the stored key — for display only. */
+  fingerprint: string;
+}
+
+/** A saved remote command the Units page runs with one click. */
+export interface SshScript {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+}
+
+/**
+ * One open SSH connection page — the Connections section of the sidebar.
+ * A server can have several: each terminal click opens a NEW session
+ * (like Termius tabs), and every SFTP browser page is its own entry too.
+ */
+export interface SshConn {
+  /** Unique id of this connection page. */
+  id: string;
+  serverId: string;
+  /** terminal = PTY console page, sftp = Files page. */
+  kind: "terminal" | "sftp";
+  /** Live PTY session id once the shell is open (terminal only). */
+  sessionId?: string;
+}
+
+/** One SFTP directory entry. */
+export interface SftpEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number;
+  /** Unix seconds; 0 when unknown. */
+  modified: number;
 }
 
 /** One audit row of the Logs page: who connected when, and how it ended. */
@@ -84,7 +151,7 @@ export interface SshLog {
   server_id: string;
   server_name: string;
   host: string;
-  /** "connect" | "disconnect" | "exec" */
+  /** "connect" | "disconnect" | "exec" | "shell" | "sftp-upload" | "sftp-download" */
   action: string;
   ok: boolean;
   detail: string;

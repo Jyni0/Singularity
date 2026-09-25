@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { motion } from "motion/react";
-import { ScrollText, Bot, User, ArrowRightLeft, LogOut, TerminalSquare } from "lucide-react";
+import { Bot, User, ArrowRightLeft, LogOut, TerminalSquare, Upload, Download } from "lucide-react";
 import * as db from "../core/db.r";
 import type { SshLog } from "../core/types.i";
 import { useNow } from "../hooks/useNow.h";
@@ -37,13 +37,6 @@ export function SshLogsView() {
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.2, ease: "easeOut" }}
     >
-      <div className="flex items-center gap-2 text-[18px] font-semibold text-[var(--text-main)]">
-        <ScrollText size={18} strokeWidth={1.5} /> Logs
-      </div>
-      <div className="mb-4 mt-1 text-[13px] text-[var(--text-muted)]">
-        Who connected where and when — you and the agent, newest first.
-      </div>
-
       {logs.length === 0 && (
         <div className="rounded-xl border border-dashed border-[var(--border)] p-10 text-center text-[13px] text-[var(--text-muted)]">
           Nothing yet — connect to a unit and the trail starts here.
@@ -78,6 +71,9 @@ export function SshLogsView() {
               {l.action === "connect" && <ArrowRightLeft size={12} />}
               {l.action === "disconnect" && <LogOut size={12} />}
               {l.action === "exec" && <TerminalSquare size={12} />}
+              {l.action === "shell" && <TerminalSquare size={12} />}
+              {l.action === "sftp-upload" && <Upload size={12} />}
+              {l.action === "sftp-download" && <Download size={12} />}
               {l.action}
             </span>
 

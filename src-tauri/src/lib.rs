@@ -9,6 +9,7 @@ mod oauth;
 mod runs;
 mod ssh;
 mod stt;
+mod vault;
 mod tools;
 mod tray;
 
@@ -374,6 +375,31 @@ pub fn run() {
             ssh_disconnect,
             ssh_exec,
             ssh_connected,
+            ssh::ssh_list_servers,
+            ssh::ssh_save_server,
+            ssh::ssh_delete_server,
+            ssh::ssh_list_keys,
+            ssh::ssh_save_key,
+            ssh::ssh_delete_key,
+            ssh::ssh_list_scripts,
+            ssh::ssh_save_script,
+            ssh::ssh_delete_script,
+            ssh::ssh_run_script,
+            ssh::ssh_shell_open,
+            ssh::ssh_shell_input,
+            ssh::ssh_shell_resize,
+            ssh::ssh_shell_snapshot,
+            ssh::ssh_shell_close,
+            ssh::ssh_shell_list,
+            ssh::ssh_sftp_list,
+            ssh::ssh_sftp_home,
+            ssh::ssh_sftp_download,
+            ssh::ssh_sftp_upload,
+            ssh::ssh_sftp_read_text,
+            ssh::ssh_sftp_rename,
+            ssh::ssh_sftp_remove,
+            ssh::ssh_sftp_mkdir,
+            ssh::ssh_vault_status,
             chat_stream
         ])
         .run(tauri::generate_context!())

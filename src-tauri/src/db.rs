@@ -111,7 +111,48 @@ pub fn migrations() -> Vec<Migration> {
         project_permission_migration(),
         message_segments_migration(),
         ssh_migration(),
+        ssh_assets_migration(),
     ]
+}
+
+/// Version 11 — SSH units grow credentials and scripts.
+///
+/// ssh_keys are standalone private-key credentials (reusable by several
+/// servers via ssh_servers.key_id); ssh_scripts are saved remote commands
+/// the Units page runs with one click. Secret columns are AES-256-GCM
+/// ciphertext written by vault.rs — the master key lives in the OS
+/// credential store, never in the database.
+///
+/// FROZEN: sqlx validates the checksum of applied migrations — editing this
+/// SQL after release breaks EVERY existing database (the migrator refuses to
+/// run and the whole app loses its data layer). Need a new column? Add
+/// migration 12 instead.
+fn ssh_assets_migration() -> Migration {
+    Migration {
+        version: 11,
+        description: "ssh keys, scripts, server key link",
+        sql: "
+            CREATE TABLE IF NOT EXISTS ssh_keys (
+              id          TEXT PRIMARY KEY,
+              name        TEXT NOT NULL,
+              private_key TEXT NOT NULL DEFAULT '',
+              passphrase  TEXT NOT NULL DEFAULT '',
+              created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            CREATE TABLE IF NOT EXISTS ssh_scripts (
+              id          TEXT PRIMARY KEY,
+              name        TEXT NOT NULL,
+              description TEXT NOT NULL DEFAULT '',
+              content     TEXT NOT NULL DEFAULT '',
+              created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            ALTER TABLE ssh_servers ADD COLUMN key_id TEXT NOT NULL DEFAULT '';
+            ALTER TABLE ssh_servers ADD COLUMN host_key TEXT NOT NULL DEFAULT '';
+        ",
+        kind: MigrationKind::Up,
+    }
 }
 
 /// Version 10 — the SSH Client mode.

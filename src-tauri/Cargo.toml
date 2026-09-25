@@ -32,3 +32,10 @@ tiny_http = "0.12"
 # Everything runs on-device; no cloud transcription service is ever called.
 whisper-rs = "0.16"
 symphonia = { version = "0.5", features = ["wav", "pcm"] }
+# SSH client for "SSH Client" mode. The default aws-lc-sys crypto needs NASM
+# on Windows; ring builds with plain MSVC toolchain, so pin it.
+russh = { version = "0.63", default-features = false, features = ["ring", "flate2", "rsa"] }
+# Direct read access to the app database for the SSH module (agent tool +
+# connect command need server credentials without a frontend round-trip).
+# Same version the sql plugin uses, so one sqlx build serves both.
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite"] }

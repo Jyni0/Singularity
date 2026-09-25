@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Shield, ChevronDown } from "lucide-react";
 import * as db from "../core/db.r";
-import type { Conversation, Model, Project, Provider, Theme, ViewKind, Attachment, Effort } from "../core/types.i";
+import type { AppMode, Conversation, Model, Project, Provider, SshServer, Theme, ViewKind, Attachment, Effort } from "../core/types.i";
 import { NO_PROJECT, THEMES } from "../core/types.i";
 import { composePrompt } from "../utils/attachments.u";
 import { toGateways } from "../utils/gateways.u";
@@ -17,8 +17,11 @@ import { PromptBox } from "../chat/PromptBox.c";
 import { InspectionPanel } from "../chat/InspectionPanel.c";
 import { TitleBar } from "../layout/TitleBar.c";
 import { Sidebar } from "../layout/Sidebar.c";
+import { SshSidebar } from "../layout/SshSidebar.c";
 import { HistoryView } from "../views/HistoryView.p";
 import { TasksView } from "../views/TasksView.p";
+import { UnitsView } from "../views/UnitsView.p";
+import { SshLogsView } from "../views/SshLogsView.p";
 import { NewProjectModal } from "../settings/NewProjectModal.c";
 import { ScheduleModal } from "../settings/ScheduleModal.c";
 import { SettingsModal } from "../settings/SettingsModal.c";
@@ -106,6 +109,22 @@ export default function App() {
   const [confirmReqs, setConfirmReqs] = useState<Record<string, db.ConfirmRequest>>({});
   const chatRef = useRef<HTMLDivElement>(null);
 
+  /* ---------- App mode (Agent ↔ SSH Client) ----------
+     The mode only swaps what the sidebar and the main area SHOW. Agent runs
+     live in Rust and keep streaming into their buffers regardless of which
+     mode is on screen — switching modes never interrupts a generation. */
+  const [mode, setMode] = useState<AppMode>("agent");
+  /** View to return to when the user switches back to Agent mode. */
+  const agentViewRef = useRef<ViewKind>("chat");
+  const [sshServers, setSshServers] = useState<SshServer[]>([]);
+  const [sshConnectedIds, setSshConnectedIds] = useState<string[]>([]);
+  const [sshBusyIds, setSshBusyIds] = useState<string[]>([]);
+  const [sshNotice, setSshNotice] = useState<string | null>(null);
+  /** Server whose console is open in the Units view. */
+  const [selectedServer, setSelectedServer] = useState<string | null>(null);
+  /** Raised by the sidebar's + button — UnitsView opens the add modal on it. */
+  const [sshAddNonce, setSshAddNonce] = useState(0);
+
   /** Messages of the conversation currently on screen. */
   const draftMsgs = activeConv
     ? convMsgs[activeConv.id] ?? []
@@ -165,6 +184,88 @@ export default function App() {
       cancelled = true;
     };
   }, [activeConv?.project, projects]);
+
+  /* ---------- App mode switching ----------
+     Swapping modes only changes what the sidebar/main area render. Agent runs
+     are owned by Rust and keep streaming into their per-conversation buffers,
+     so nothing is cancelled by a switch — the run even finishes while you are
+     looking at the SSH units. */
+  const applyMode = useCallback(
+    (next: AppMode) => {
+      if (mode === next) return;
+      if (next === "ssh") {
+        // Park the current agent view so returning restores it exactly.
+        agentViewRef.current = view;
+        setView("units");
+      } else {
+        setView(agentViewRef.current);
+      }
+      setMode(next);
+      void db.setSetting("app_mode", next);
+    },
+    [mode, view]
+  );
+
+  // Restore the last-used mode on boot.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const saved = await db.getSetting("app_mode");
+      if (cancelled) return;
+      if (saved === "ssh") {
+        setMode("ssh");
+        setView("units");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /* ---------- SSH Client data ---------- */
+
+  const reloadSshServers = useCallback(() => {
+    void db.loadSshServers().then(setSshServers).catch(() => {});
+    void db.sshConnected().then(setSshConnectedIds).catch(() => {});
+  }, []);
+
+  // Load units once, then track live status/log events pushed by Rust.
+  useEffect(() => {
+    reloadSshServers();
+    let off: (() => void) | undefined;
+    void db
+      .onSshEvent({
+        onStatus: (ids) => setSshConnectedIds(ids),
+        onLogged: () => {},
+      })
+      .then((fn) => {
+        off = fn;
+      });
+    return () => off?.();
+  }, [reloadSshServers]);
+
+  const setSshBusy = (id: string, busy: boolean) =>
+    setSshBusyIds((prev) => (busy ? [...new Set([...prev, id])] : prev.filter((x) => x !== id)));
+
+  const connectServer = useCallback((id: string) => {
+    setSshBusy(id, true);
+    setSshNotice(null);
+    db.sshConnect(id)
+      .then(() => db.sshConnected())
+      .then(setSshConnectedIds)
+      .catch((e) => setSshNotice(e instanceof Error ? e.message : String(e)))
+      .finally(() => setSshBusy(id, false));
+  }, []);
+
+  const disconnectServer = useCallback((id: string) => {
+    setSshBusy(id, true);
+    setSshNotice(null);
+    db.sshDisconnect(id)
+      .then(() => db.sshConnected())
+      .then(setSshConnectedIds)
+      .catch((e) => setSshNotice(e instanceof Error ? e.message : String(e)))
+      .finally(() => setSshBusy(id, false));
+  }, []);
 
   /* ---------- Boot: hydrate the workspace from SQLite ---------- */
 
@@ -325,6 +426,8 @@ export default function App() {
   const activeTitle = (() => {
     if (view === "history") return "Conversation History";
     if (view === "tasks") return "Scheduled Tasks";
+    if (view === "units") return "Units";
+    if (view === "ssh-logs") return "Logs";
     if (!activeConv) return "New Conversation";
     for (const p of projects) {
       const c = p.conversations.find((c) => c.id === activeConv.id);
@@ -687,6 +790,9 @@ export default function App() {
               effort: selection.effort,
               auto_run: autoRun,
               images,
+              // SSH units ride along so the model gets the ssh_exec tool;
+              // credentials never leave the database.
+              ssh_units: sshServers.map((s) => ({ id: s.id, name: s.name, host: s.host })),
             },
             historyTurns,
             {
@@ -892,37 +998,60 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col">
-      <TitleBar />
+      <TitleBar mode={mode} onSetMode={applyMode} />
       <div className="flex min-h-0 flex-1">
-        <Sidebar
-          width={sidebarWidth}
-          startResize={startResize}
-          projects={projects}
-          activeConversation={activeConv?.id ?? null}
-          view={view}
-          runningConversations={runningConvIds}
-          onSelectConversation={openConversation}
-          onNewConversation={() => {
-            // Plain "New Conversation" starts a chat with no project folder.
-            setNewChatProject(NO_PROJECT);
-            setActiveConv(null);
-            setConvMsgs((prev) => ({ ...prev, [DRAFT_ID]: [] }));
-            setView("new");
-          }}
-          onNewConversationInProject={(project) => {
-            setNewChatProject(project);
-            setActiveConv(null);
-            setConvMsgs((prev) => ({ ...prev, [DRAFT_ID]: [] }));
-            setView("new");
-          }}
-          onShowView={(v) => setView(v)}
-          onOpenSettings={() => setModal("settings")}
-          onOpenProjectSettings={openProjectSettings}
-          onNewProject={() => setModal("new-project")}
-          onRenameConversation={renameConversation}
-          onDeleteConversation={deleteConversation}
-          onTogglePin={togglePin}
-        />
+        {mode === "ssh" ? (
+          /* SSH Client mode: Units / Logs nav + the server list, laid out
+             exactly like the Agent sidebar's conversations. */
+          <SshSidebar
+            width={sidebarWidth}
+            startResize={startResize}
+            servers={sshServers}
+            connected={sshConnectedIds}
+            view={view === "ssh-logs" ? "ssh-logs" : "units"}
+            selected={selectedServer}
+            onSelectServer={(id) => {
+              setSelectedServer((cur) => (cur === id ? null : id));
+              setView("units");
+            }}
+            onShowView={(v) => setView(v)}
+            onAddServer={() => {
+              setSshAddNonce((n) => n + 1);
+              setView("units");
+            }}
+            onOpenSettings={() => setModal("settings")}
+          />
+        ) : (
+          <Sidebar
+            width={sidebarWidth}
+            startResize={startResize}
+            projects={projects}
+            activeConversation={activeConv?.id ?? null}
+            view={view}
+            runningConversations={runningConvIds}
+            onSelectConversation={openConversation}
+            onNewConversation={() => {
+              // Plain "New Conversation" starts a chat with no project folder.
+              setNewChatProject(NO_PROJECT);
+              setActiveConv(null);
+              setConvMsgs((prev) => ({ ...prev, [DRAFT_ID]: [] }));
+              setView("new");
+            }}
+            onNewConversationInProject={(project) => {
+              setNewChatProject(project);
+              setActiveConv(null);
+              setConvMsgs((prev) => ({ ...prev, [DRAFT_ID]: [] }));
+              setView("new");
+            }}
+            onShowView={(v) => setView(v)}
+            onOpenSettings={() => setModal("settings")}
+            onOpenProjectSettings={openProjectSettings}
+            onNewProject={() => setModal("new-project")}
+            onRenameConversation={renameConversation}
+            onDeleteConversation={deleteConversation}
+            onTogglePin={togglePin}
+          />
+        )}
 
         <div className="flex min-w-0 flex-1 flex-col bg-[var(--bg-app)]">
           {view !== "new" && (
@@ -943,6 +1072,33 @@ export default function App() {
             <ScrollArea className="flex-1" innerClassName="py-4">
               <div className="px-6">
                 <TasksView scheduled={scheduled} onScheduleTask={() => setModal("schedule")} />
+              </div>
+            </ScrollArea>
+          )}
+
+          {view === "units" && (
+            <ScrollArea className="flex-1" innerClassName="py-4">
+              <div className="px-6">
+                <UnitsView
+                  servers={sshServers}
+                  connected={sshConnectedIds}
+                  busyIds={sshBusyIds}
+                  notice={sshNotice}
+                  addNonce={sshAddNonce}
+                  onChanged={reloadSshServers}
+                  onConnect={connectServer}
+                  onDisconnect={disconnectServer}
+                  selected={selectedServer}
+                  onSelect={setSelectedServer}
+                />
+              </div>
+            </ScrollArea>
+          )}
+
+          {view === "ssh-logs" && (
+            <ScrollArea className="flex-1" innerClassName="py-4">
+              <div className="px-6">
+                <SshLogsView />
               </div>
             </ScrollArea>
           )}

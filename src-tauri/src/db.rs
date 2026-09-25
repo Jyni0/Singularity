@@ -110,7 +110,48 @@ pub fn migrations() -> Vec<Migration> {
         message_meta_migration(),
         project_permission_migration(),
         message_segments_migration(),
+        ssh_migration(),
     ]
+}
+
+/// Version 10 — the SSH Client mode.
+///
+/// ssh_servers are the saved units (host + credentials); ssh_logs is the
+/// audit trail of every connection attempt — who (user or agent), when, to
+/// which server and how it ended. The frontend reads both through the SQL
+/// plugin; Rust (agent tool + connect command) writes logs through sqlx.
+fn ssh_migration() -> Migration {
+    Migration {
+        version: 10,
+        description: "ssh servers and connection logs",
+        sql: "
+            CREATE TABLE IF NOT EXISTS ssh_servers (
+              id           TEXT PRIMARY KEY,
+              name         TEXT NOT NULL,
+              host         TEXT NOT NULL,
+              port         INTEGER NOT NULL DEFAULT 22,
+              username     TEXT NOT NULL DEFAULT 'root',
+              auth         TEXT NOT NULL DEFAULT 'password',
+              password     TEXT NOT NULL DEFAULT '',
+              private_key  TEXT NOT NULL DEFAULT '',
+              created_at   INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            CREATE TABLE IF NOT EXISTS ssh_logs (
+              id          TEXT PRIMARY KEY,
+              actor       TEXT NOT NULL,
+              server_id   TEXT NOT NULL,
+              server_name TEXT NOT NULL,
+              host        TEXT NOT NULL DEFAULT '',
+              action      TEXT NOT NULL,
+              ok          INTEGER NOT NULL DEFAULT 1,
+              detail      TEXT NOT NULL DEFAULT '',
+              created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_ssh_logs_time ON ssh_logs(created_at);
+        ",
+        kind: MigrationKind::Up,
+    }
 }
 
 /// Version 9 — agent turns keep their tool steps ("actions").

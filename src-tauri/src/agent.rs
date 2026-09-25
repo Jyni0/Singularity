@@ -148,8 +148,10 @@ pub struct AgentError {
 /* ---------- Tool schema exposed to the model ---------- */
 
 /// Tool definitions in a neutral shape, converted per protocol when sent.
-fn tool_specs() -> Value {
-    json!([
+/// The ssh_exec tool is appended only when the project has saved SSH units,
+/// so the model never sees a tool it cannot use.
+fn tool_specs(req: &AgentRequest) -> Value {
+    let mut specs = json!([
         {
             "name": "read_file",
             "description": "Read a text file. Returns the contents with line numbers. Use start_line/end_line for large files.",
@@ -224,7 +226,37 @@ fn tool_specs() -> Value {
                 "required": ["command"]
             }
         }
-    ])
+    ]);
+    if !req.ssh_units.is_empty() {
+        let names: Vec<String> = req.ssh_units.iter().map(|u| u.name.clone()).collect();
+        let hint = req
+            .ssh_units
+            .iter()
+            .map(|u| format!("{} = {}", u.name, u.host))
+            .collect::<Vec<_>>()
+            .join(", ");
+        specs.as_array_mut().unwrap().push(json!({
+            "name": "ssh_exec",
+            "description": format!(
+                "Run a command on a remote server over SSH and return its output. \
+                 Available units (server → host): {hint}. Connections are pooled \
+                 and authenticated automatically from saved credentials."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "enum": names,
+                        "description": "Which saved SSH unit to run on."
+                    },
+                    "command": { "type": "string", "description": "Command line to execute on the remote server." }
+                },
+                "required": ["server", "command"]
+            }
+        }));
+    }
+    specs
 }
 
 /// Default system prompt — tells the model it can act, not just answer.
@@ -242,6 +274,9 @@ fn default_system() -> String {
      so read the real files instead of guessing.\n\
      Work step by step: look at the actual files before changing them, keep edits small and \
      exact, and run the build or tests when that helps.\n\
+     When an ssh_exec tool is offered, remote servers are saved units: pick the right one by \
+     name and run commands on it exactly like run_command runs them locally. Connections are \
+     established and authenticated automatically; every remote command is audit-logged.\n\
      Prefer doing the work over describing it. When you are done, give a short summary of \
      what changed."
         .to_string()
@@ -275,6 +310,22 @@ pub struct AgentRequest {
     /// Images attached to the last user turn.
     #[serde(default)]
     pub images: Vec<crate::chat::ImageAttachment>,
+    /// Saved SSH units the project may use (name + host only — credentials
+    /// stay in the database; the ssh_exec tool resolves them server-side).
+    #[serde(default)]
+    pub ssh_units: Vec<SshUnitRef>,
+}
+
+/// What the model needs to see about an SSH unit: a name to pick and the
+/// host for context. No credentials ever cross into the prompt.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SshUnitRef {
+    pub name: String,
+    #[serde(default)]
+    pub host: String,
+    /// Server row id — ssh_exec maps name → id with this.
+    #[serde(default)]
+    pub id: String,
 }
 
 fn default_auth() -> String {
@@ -403,6 +454,28 @@ fn summarize(name: &str, args: &Value) -> String {
     }
 }
 
+/// Runs the model's ssh_exec call through the shared SSH pool. The unit name
+/// from the model maps to a saved server id; credentials never leave Rust.
+/// Every attempt is audit-logged with actor "agent" (the Logs page shows it).
+async fn run_ssh_tool(app: &AppHandle, req: &AgentRequest, args: &Value) -> tools::ToolResult {
+    let server_name = args.get("server").and_then(|v| v.as_str()).unwrap_or("");
+    let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    if server_name.is_empty() || command.is_empty() {
+        return tools::ToolResult::err("ssh_exec needs both server and command");
+    }
+    let unit = req.ssh_units.iter().find(|u| u.name == server_name);
+    let Some(unit) = unit else {
+        let known: Vec<&str> = req.ssh_units.iter().map(|u| u.name.as_str()).collect();
+        return tools::ToolResult::err(format!(
+            "unknown server {server_name:?}; available: {known:?}"
+        ));
+    };
+    match crate::ssh::exec(app, "agent", &unit.id, command).await {
+        Ok(out) => tools::ToolResult::ok(out),
+        Err(e) => tools::ToolResult::err(e),
+    }
+}
+
 /* ---------- OpenAI tool_calls protocol ---------- */
 
 #[derive(Deserialize)]
@@ -505,7 +578,7 @@ async fn run_openai(
         let mut body = json!({
             "model": req.model,
             "messages": messages,
-            "tools": tool_specs().as_array().map(|specs| {
+            "tools": tool_specs(req).as_array().map(|specs| {
                 specs.iter().map(|s| json!({
                     "type": "function",
                     "function": {
@@ -677,6 +750,7 @@ async fn run_openai(
             // Tools block (file IO, waiting on a process). Running them on the
             // async worker thread stalls the whole task and starves event
             // delivery, so hand them to the blocking pool and await the result.
+            // ssh_exec is async itself (russh) and runs right here instead.
             let tool_root = root.to_path_buf();
             let tool_name = call.name.clone();
             let tool_args = args.clone();
@@ -684,6 +758,8 @@ async fn run_openai(
                 tools::ToolResult::err(
                     "The user denied this command. Do not retry it — continue without it.",
                 )
+            } else if tool_name == "ssh_exec" {
+                run_ssh_tool(app, req, &tool_args).await
             } else {
                 tokio::task::spawn_blocking(move || {
                     tools::dispatch(&tool_root, &tool_name, &tool_args)
@@ -802,7 +878,7 @@ async fn run_anthropic(
             "max_tokens": max_tokens,
             "system": system,
             "messages": messages,
-            "tools": tool_specs().as_array().map(|specs| {
+            "tools": tool_specs(req).as_array().map(|specs| {
                 specs.iter().map(|s| json!({
                     "name": s["name"],
                     "description": s["description"],
@@ -968,6 +1044,7 @@ async fn run_anthropic(
             };
 
             // Tools block; keep the async worker free so events keep flowing.
+            // ssh_exec is async itself (russh) and runs right here instead.
             let tool_root = root.to_path_buf();
             let tool_name = b.name.clone();
             let tool_args = args.clone();
@@ -975,6 +1052,8 @@ async fn run_anthropic(
                 tools::ToolResult::err(
                     "The user denied this command. Do not retry it — continue without it.",
                 )
+            } else if tool_name == "ssh_exec" {
+                run_ssh_tool(app, req, &tool_args).await
             } else {
                 tokio::task::spawn_blocking(move || {
                     tools::dispatch(&tool_root, &tool_name, &tool_args)

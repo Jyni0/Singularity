@@ -51,7 +51,46 @@ export interface Project {
   permMode?: PermMode;
 }
 
-export type ViewKind = "chat" | "new" | "history" | "tasks";
+export type ViewKind = "chat" | "new" | "history" | "tasks" | "units" | "ssh-logs";
+
+/* ---------- SSH Client mode ---------- */
+
+/**
+ * The two app modes. Agent is the coding-assistant workspace (chats,
+ * projects, settings); SSH Client swaps the sidebar and the main view to
+ * server units and their connection log. Generation runs live in Rust and
+ * keep streaming across a mode switch — nothing is cancelled by switching.
+ */
+export type AppMode = "agent" | "ssh";
+
+/** A saved SSH server unit (credentials persist in SQLite via db.r). */
+export interface SshServer {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  auth: "password" | "key";
+  password: string;
+  /** PEM/OpenSSH private key text when auth === "key". */
+  private_key: string;
+}
+
+/** One audit row of the Logs page: who connected when, and how it ended. */
+export interface SshLog {
+  id: string;
+  /** "user" — you, via the UI; "agent" — a model through the ssh_exec tool. */
+  actor: string;
+  server_id: string;
+  server_name: string;
+  host: string;
+  /** "connect" | "disconnect" | "exec" */
+  action: string;
+  ok: boolean;
+  detail: string;
+  /** Unix seconds. */
+  created_at: number;
+}
 
 export type ProviderKind =
   | "google"

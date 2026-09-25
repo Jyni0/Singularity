@@ -14,6 +14,8 @@ import type {
   Provider,
   ProviderKind,
   ProviderStatus,
+  SshLog,
+  SshServer,
   StoredImage,
   StoredMessage,
 } from "./types.i";
@@ -28,6 +30,8 @@ interface MemoryStore {
   models: Model[];
   messages: StoredMessage[];
   settings: Record<string, string>;
+  sshServers: SshServer[];
+  sshLogs: SshLog[];
 }
 
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -40,6 +44,8 @@ const memory: MemoryStore = {
   models: [],
   messages: [],
   settings: {},
+  sshServers: [],
+  sshLogs: [],
 };
 
 const memId = () => `mem-${Math.random().toString(36).slice(2, 10)}`;
@@ -945,6 +951,11 @@ export interface AgentRequest {
   auto_run?: boolean;
   /** Images attached to the final user turn. */
   images?: ImageAttachment[];
+  /**
+   * Saved SSH units the agent may use through the ssh_exec tool. Name + host
+   * only — credentials stay in the database and are resolved server-side.
+   */
+  ssh_units?: { id: string; name: string; host: string }[];
 }
 
 export interface AgentStepEvent {
@@ -1160,4 +1171,138 @@ export async function setWorkspace(path: string): Promise<string> {
   if (!inTauri) return path;
   const { invoke } = await import("@tauri-apps/api/core");
   return await invoke<string>("set_agent_workspace", { path });
+}
+
+/* ---------- SSH Client mode ---------- */
+
+interface SshServerRow {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  auth: string;
+  password: string;
+  private_key: string;
+}
+
+function rowToServer(r: SshServerRow): SshServer {
+  return {
+    id: r.id,
+    name: r.name,
+    host: r.host,
+    port: r.port || 22,
+    username: r.username || "root",
+    auth: r.auth === "key" ? "key" : "password",
+    password: r.password ?? "",
+    private_key: r.private_key ?? "",
+  };
+}
+
+/** All saved SSH units, newest first. */
+export async function loadSshServers(): Promise<SshServer[]> {
+  const db = await getDb();
+  if (!db) return [...memory.sshServers];
+  const rows = await db.select<SshServerRow[]>(
+    "SELECT id, name, host, port, username, auth, password, private_key FROM ssh_servers ORDER BY created_at DESC",
+  );
+  return rows.map(rowToServer);
+}
+
+/** Inserts or replaces one unit (id is generated when missing). */
+export async function saveSshServer(
+  server: Omit<SshServer, "id"> & { id?: string },
+): Promise<string> {
+  const id = server.id || memId() + "-ssh";
+  const db = await getDb();
+  if (!db) {
+    const next: SshServer = { ...server, id };
+    memory.sshServers = [next, ...memory.sshServers.filter((s) => s.id !== id)];
+    return id;
+  }
+  await db.execute(
+    "INSERT INTO ssh_servers (id, name, host, port, username, auth, password, private_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO UPDATE SET name=$2, host=$3, port=$4, username=$5, auth=$6, password=$7, private_key=$8",
+    [id, server.name, server.host, server.port || 22, server.username || "root", server.auth, server.password ?? "", server.private_key ?? ""],
+  );
+  return id;
+}
+
+/** Deletes a unit (its logs stay — the audit trail outlives the server). */
+export async function deleteSshServer(id: string): Promise<void> {
+  const db = await getDb();
+  if (!db) {
+    memory.sshServers = memory.sshServers.filter((s) => s.id !== id);
+    return;
+  }
+  await db.execute("DELETE FROM ssh_servers WHERE id = $1", [id]);
+}
+
+interface SshLogRow {
+  id: string;
+  actor: string;
+  server_id: string;
+  server_name: string;
+  host: string;
+  action: string;
+  ok: number;
+  detail: string;
+  created_at: number;
+}
+
+/** The audit trail, newest first, capped for the Logs page. */
+export async function loadSshLogs(limit = 300): Promise<SshLog[]> {
+  const db = await getDb();
+  if (!db) return [...memory.sshLogs];
+  const rows = await db.select<SshLogRow[]>(
+    "SELECT id, actor, server_id, server_name, host, action, ok, detail, created_at FROM ssh_logs ORDER BY created_at DESC, id DESC LIMIT $1",
+    [limit],
+  );
+  return rows.map((r) => ({ ...r, ok: !!r.ok }));
+}
+
+/* ---------- Live SSH connections (Rust owns the pool) ---------- */
+
+async function sshInvoke<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
+  if (!inTauri) throw new Error("SSH needs the desktop shell (npm run tauri:dev)");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(cmd, args);
+}
+
+/** Connects to a saved unit (idempotent — a live session is reused). */
+export async function sshConnect(serverId: string): Promise<void> {
+  await sshInvoke("ssh_connect", { serverId });
+}
+
+/** Disconnects a unit (unknown ids are a no-op). */
+export async function sshDisconnect(serverId: string): Promise<void> {
+  await sshInvoke("ssh_disconnect", { serverId });
+}
+
+/** Runs one command on a unit, auto-connecting when needed. */
+export async function sshExec(serverId: string, command: string): Promise<string> {
+  return sshInvoke<string>("ssh_exec", { serverId, command });
+}
+
+/** Server ids with a live connection right now. */
+export async function sshConnected(): Promise<string[]> {
+  if (!inTauri) return [];
+  return sshInvoke<string[]>("ssh_connected", {});
+}
+
+/**
+ * Subscribes to live SSH events: connection status changes (ssh://status,
+ * the full connected-id list) and new audit rows (ssh://logged). Returns a
+ * disposer.
+ */
+export async function onSshEvent(handlers: {
+  onStatus?: (connectedIds: string[]) => void;
+  onLogged?: () => void;
+}): Promise<() => void> {
+  if (!inTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  const offs = await Promise.all([
+    listen<string[]>("ssh://status", (e) => handlers.onStatus?.(e.payload)),
+    listen("ssh://logged", () => handlers.onLogged?.()),
+  ]);
+  return () => offs.forEach((off) => off());
 }

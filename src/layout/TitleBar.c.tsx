@@ -6,11 +6,19 @@ import { inTauri } from "../utils/env.u";
 
 export const MENUS: Record<string, string[]> = {
   File: ["New Conversation", "Open Folder…", "Save Workspace", "Close Window"],
+  Mode: ["Agent", "SSH Client"],
   View: ["Command Palette", "Toggle Sidebar", "Reload", "Toggle Fullscreen"],
   Window: ["Minimize", "Zoom", "Close"],
 };
 
-export function TitleBar() {
+export function TitleBar({
+  mode,
+  onSetMode,
+}: {
+  /** Current app mode — the Mode menu marks the active entry with a check. */
+  mode?: "agent" | "ssh";
+  onSetMode?: (mode: "agent" | "ssh") => void;
+}) {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [maximized, setMaximized] = useState(false);
   const barRef = useRef<HTMLDivElement>(null);
@@ -44,6 +52,9 @@ export function TitleBar() {
 
   const runMenuAction = (item: string) => {
     setOpenMenu(null);
+    // Mode switching is pure frontend state — works even in a browser tab.
+    if (item === "Agent") onSetMode?.("agent");
+    if (item === "SSH Client") onSetMode?.("ssh");
     if (!inTauri) return;
     if (item === "Minimize") minimize();
     if (item === "Close" || item === "Close Window") close();
@@ -87,15 +98,31 @@ export function TitleBar() {
                   exit={{ opacity: 0, y: -4 }}
                   transition={{ duration: 0.12 }}
                 >
-                  {MENUS[m].map((item) => (
-                    <button
-                      key={item}
-                      className="flex w-full items-center rounded-md px-2.5 py-1.5 text-left text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
-                      onClick={() => runMenuAction(item)}
-                    >
-                      {item}
-                    </button>
-                  ))}
+                  {MENUS[m].map((item) => {
+                    // In the Mode menu the active mode gets a check mark.
+                    const isModeItem = m === "Mode";
+                    const active =
+                      isModeItem &&
+                      ((item === "Agent" && mode !== "ssh") ||
+                        (item === "SSH Client" && mode === "ssh"));
+                    return (
+                      <button
+                        key={item}
+                        className="flex w-full items-center gap-1.5 rounded-md px-2.5 py-1.5 text-left text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+                        onClick={() => runMenuAction(item)}
+                      >
+                        {isModeItem && (
+                          <span
+                            className="w-3 shrink-0 text-center text-[var(--accent)]"
+                            style={{ opacity: active ? 1 : 0 }}
+                          >
+                            ✓
+                          </span>
+                        )}
+                        {item}
+                      </button>
+                    );
+                  })}
                 </motion.div>
               )}
             </AnimatePresence>

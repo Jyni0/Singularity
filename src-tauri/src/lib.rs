@@ -7,6 +7,7 @@ mod db;
 mod discovery;
 mod oauth;
 mod runs;
+mod ssh;
 mod stt;
 mod tools;
 mod tray;
@@ -279,6 +280,35 @@ async fn transcribe_audio(
     stt::transcribe(app, audio, language).await
 }
 
+/* ---------- SSH Client mode ---------- */
+
+/// Connects (or reuses a pooled session) to a saved server. The frontend
+/// never sends credentials here — Rust reads them from the database, so the
+/// audit log and the agent tool see the exact same stored units.
+#[tauri::command]
+async fn ssh_connect(app: tauri::AppHandle, server_id: String) -> Result<(), String> {
+    ssh::connect(&app, "user", &server_id).await
+}
+
+/// Disconnects a pooled session (idempotent — an unknown id is a no-op).
+#[tauri::command]
+async fn ssh_disconnect(app: tauri::AppHandle, server_id: String) -> Result<(), String> {
+    ssh::disconnect(&app, "user", &server_id).await
+}
+
+/// Runs one command on a server, auto-connecting when needed.
+#[tauri::command]
+async fn ssh_exec(app: tauri::AppHandle, server_id: String, command: String) -> Result<String, String> {
+    ssh::exec(&app, "user", &server_id, &command).await
+}
+
+/// Server ids with a live connection — the Units grid paints status from it.
+#[tauri::command]
+fn ssh_connected(app: tauri::AppHandle) -> Vec<String> {
+    let _ = app;
+    ssh::connected_ids()
+}
+
 pub fn run() {
     let migrations = db::migrations();
 
@@ -340,6 +370,10 @@ pub fn run() {
             tray::tray_state,
             tray::tray_action,
             tray::tray_resize,
+            ssh_connect,
+            ssh_disconnect,
+            ssh_exec,
+            ssh_connected,
             chat_stream
         ])
         .run(tauri::generate_context!())

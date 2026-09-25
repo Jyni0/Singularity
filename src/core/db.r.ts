@@ -1321,6 +1321,43 @@ export async function saveSshKey(key: SshKey): Promise<string> {
   return sshInvoke<string>("ssh_save_key", { key: toRustKey(key) });
 }
 
+/**
+ * FULL view of one credential — private key and passphrase decrypted.
+ * Called ONLY when the credential's edit form opens; listings stay blank.
+ */
+export async function getSshKey(id: string): Promise<SshKey> {
+  if (!inTauri) {
+    return memory.sshKeys.find((k) => k.id === id) ?? {
+      id,
+      name: "",
+      private_key: "",
+      passphrase: "",
+      has_key: false,
+      fingerprint: "",
+      comment: "",
+      public_key: "",
+    };
+  }
+  const r = await sshInvoke<RustKey>("ssh_get_key", { keyId: id });
+  return toKey(r);
+}
+
+/**
+ * Derives (publicKey, fingerprint) from a pasted private key body without
+ * saving anything — the import form previews the public half live.
+ */
+export async function deriveSshPublicKey(
+  privateKey: string,
+  passphrase: string
+): Promise<{ publicKey: string; fingerprint: string }> {
+  if (!inTauri) return { publicKey: "", fingerprint: "" };
+  const [publicKey, fingerprint] = await sshInvoke<[string, string]>("ssh_derive_public", {
+    privateKey,
+    passphrase,
+  });
+  return { publicKey, fingerprint };
+}
+
 export async function deleteSshKey(id: string): Promise<void> {
   if (!inTauri) {
     memory.sshKeys = memory.sshKeys.filter((k) => k.id !== id);

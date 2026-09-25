@@ -1330,34 +1330,59 @@ pub async fn delete_server(app: &AppHandle, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Derives the non-secret display data of a private key body:
+/// (public_key in authorized_keys form, SHA-256 fingerprint).
+fn derive_public(body: &str, passphrase: &str) -> (String, String) {
+    let pass = if passphrase.is_empty() {
+        None
+    } else {
+        Some(passphrase)
+    };
+    match decode_secret_key(body.trim(), pass) {
+        Ok(k) => (
+            k.public_key().to_openssh().unwrap_or_default(),
+            k.public_key().fingerprint(HashAlg::Sha256).to_string(),
+        ),
+        Err(_) => (String::new(), String::new()),
+    }
+}
+
+/// Lists credentials WITHOUT decrypting anything: public_key + fingerprint
+/// live in their own plaintext columns (they are not secrets). Rows saved
+/// before migration 13 are backfilled lazily — one decrypt here, then the
+/// derived values are stored and later listings are pure column reads.
 pub async fn list_keys(app: &AppHandle) -> Result<Vec<SshKey>, String> {
     let pool = sql(app).await.ok_or("database unavailable")?;
-    let rows =
-        sqlx::query("SELECT id, name, private_key, passphrase, comment FROM ssh_keys ORDER BY created_at DESC")
-            .fetch_all(&pool)
-            .await
-            .map_err(|e| format!("db error: {e}"))?;
+    let rows = sqlx::query(
+        "SELECT id, name, private_key, passphrase, public_key, fingerprint, comment FROM ssh_keys ORDER BY created_at DESC",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| format!("db error: {e}"))?;
     use sqlx::Row;
     let mut out = vec![];
     for r in &rows {
+        let id: String = r.try_get("id").unwrap_or_default();
         let stored: String = r.try_get("private_key").unwrap_or_default();
-        let stored_pass: String = r.try_get("passphrase").unwrap_or_default();
-        let plain = vault::decrypt(&stored);
-        // Display data derived from the decrypted key (fingerprint + public
-        // half); the private plaintext is dropped right after.
-        let pass = vault::decrypt(&stored_pass);
-        let pass_opt = if pass.is_empty() { None } else { Some(pass.as_str()) };
-        let parsed = decode_secret_key(plain.trim(), pass_opt).ok();
-        let fingerprint = parsed
-            .as_ref()
-            .map(|k| k.public_key().fingerprint(HashAlg::Sha256).to_string())
-            .unwrap_or_default();
-        let public_key = parsed
-            .as_ref()
-            .and_then(|k| k.public_key().to_openssh().ok())
-            .unwrap_or_default();
+        let mut public_key: String = r.try_get("public_key").unwrap_or_default();
+        let mut fingerprint: String = r.try_get("fingerprint").unwrap_or_default();
+        // Lazy backfill of legacy rows: derive once, persist, never again.
+        if !stored.is_empty() && fingerprint.is_empty() {
+            let stored_pass: String = r.try_get("passphrase").unwrap_or_default();
+            let (pk, fp) = derive_public(&vault::decrypt(&stored), &vault::decrypt(&stored_pass));
+            if !fp.is_empty() {
+                let _ = sqlx::query("UPDATE ssh_keys SET public_key = $1, fingerprint = $2 WHERE id = $3")
+                    .bind(&pk)
+                    .bind(&fp)
+                    .bind(&id)
+                    .execute(&pool)
+                    .await;
+                public_key = pk;
+                fingerprint = fp;
+            }
+        }
         out.push(SshKey {
-            id: r.try_get("id").unwrap_or_default(),
+            id,
             name: r.try_get("name").unwrap_or_default(),
             private_key: String::new(),
             passphrase: String::new(),
@@ -1368,6 +1393,52 @@ pub async fn list_keys(app: &AppHandle) -> Result<Vec<SshKey>, String> {
         });
     }
     Ok(out)
+}
+
+/// Full view of ONE credential with its secrets decrypted — called only
+/// when the edit form opens, so the private key/passphrase are visible to
+/// the user looking at this exact credential (and nowhere else).
+pub async fn get_key(app: &AppHandle, id: &str) -> Result<SshKey, String> {
+    let pool = sql(app).await.ok_or("database unavailable")?;
+    let row = sqlx::query(
+        "SELECT id, name, private_key, passphrase, public_key, fingerprint, comment FROM ssh_keys WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| format!("db error: {e}"))?
+    .ok_or_else(|| format!("unknown credential: {id}"))?;
+    use sqlx::Row;
+    let id: String = row.try_get("id").unwrap_or_default();
+    let stored: String = row.try_get("private_key").unwrap_or_default();
+    let stored_pass: String = row.try_get("passphrase").unwrap_or_default();
+    let mut public_key: String = row.try_get("public_key").unwrap_or_default();
+    let mut fingerprint: String = row.try_get("fingerprint").unwrap_or_default();
+    let plain = vault::decrypt(&stored);
+    let pass = vault::decrypt(&stored_pass);
+    if !stored.is_empty() && fingerprint.is_empty() {
+        let (pk, fp) = derive_public(&plain, &pass);
+        if !fp.is_empty() {
+            let _ = sqlx::query("UPDATE ssh_keys SET public_key = $1, fingerprint = $2 WHERE id = $3")
+                .bind(&pk)
+                .bind(&fp)
+                .bind(&id)
+                .execute(&pool)
+                .await;
+            public_key = pk;
+            fingerprint = fp;
+        }
+    }
+    Ok(SshKey {
+        id,
+        name: row.try_get("name").unwrap_or_default(),
+        private_key: plain,
+        passphrase: pass,
+        has_key: !stored.is_empty(),
+        fingerprint,
+        public_key,
+        comment: row.try_get("comment").unwrap_or_default(),
+    })
 }
 
 /// Insert-or-update a key credential. Blank key/passphrase on update keeps
@@ -1398,8 +1469,9 @@ pub async fn save_key(app: &AppHandle, k: &SshKey) -> Result<String, String> {
             None => (String::new(), String::new()),
         }
     };
+    let body_changed = !k.private_key.trim().is_empty() || !k.passphrase.is_empty();
     let private_key = if k.private_key.trim().is_empty() {
-        old_key
+        old_key.clone()
     } else {
         // Validate before storing: a broken key must not poison the row.
         let pass = if k.passphrase.is_empty() {
@@ -1412,18 +1484,27 @@ pub async fn save_key(app: &AppHandle, k: &SshKey) -> Result<String, String> {
         vault::encrypt(k.private_key.trim())
     };
     let passphrase = if k.passphrase.is_empty() {
-        old_pass
+        old_pass.clone()
     } else {
         vault::encrypt(&k.passphrase)
     };
+    // (Re)derive the plaintext display columns whenever the body/passphrase
+    // changed — listings then never need to decrypt anything.
+    let (public_key, fingerprint) = if body_changed {
+        derive_public(&vault::decrypt(&private_key), &vault::decrypt(&passphrase))
+    } else {
+        (k.public_key.clone(), k.fingerprint.clone())
+    };
     sqlx::query(
-        "INSERT INTO ssh_keys (id, name, private_key, passphrase, comment) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET name=$2, private_key=$3, passphrase=$4, comment=$5",
+        "INSERT INTO ssh_keys (id, name, private_key, passphrase, comment, public_key, fingerprint) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET name=$2, private_key=$3, passphrase=$4, comment=$5, public_key=$6, fingerprint=$7",
     )
     .bind(&id)
     .bind(&k.name)
     .bind(&private_key)
     .bind(&passphrase)
     .bind(&k.comment)
+    .bind(&public_key)
+    .bind(&fingerprint)
     .execute(&pool)
     .await
     .map_err(|e| format!("cannot save credential: {e}"))?;
@@ -1643,6 +1724,24 @@ pub async fn ssh_save_key(app: AppHandle, key: SshKey) -> Result<String, String>
 #[tauri::command]
 pub async fn ssh_delete_key(app: AppHandle, key_id: String) -> Result<(), String> {
     delete_key(&app, &key_id).await
+}
+
+/// Full credential WITH decrypted secrets — only for the edit form opening
+/// on this exact key. Listings never expose the private body.
+#[tauri::command]
+pub async fn ssh_get_key(app: AppHandle, key_id: String) -> Result<SshKey, String> {
+    get_key(&app, &key_id).await
+}
+
+/// Derives (public_key, fingerprint) from a pasted private key body — the
+/// import form shows the public half live without saving anything.
+#[tauri::command]
+pub async fn ssh_derive_public(private_key: String, passphrase: String) -> Result<(String, String), String> {
+    let (pk, fp) = derive_public(&private_key, &passphrase);
+    if fp.is_empty() {
+        return Err("cannot parse this private key (or the passphrase is wrong)".into());
+    }
+    Ok((pk, fp))
 }
 
 /// Generates a new keypair credential ("Generated By Singularity" comment).

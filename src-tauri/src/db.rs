@@ -113,7 +113,28 @@ pub fn migrations() -> Vec<Migration> {
         ssh_migration(),
         ssh_assets_migration(),
         ssh_os_and_generated_keys_migration(),
+        ssh_public_key_columns_migration(),
     ]
+}
+
+/// Version 13 — derived public data stored alongside each credential.
+///
+/// public_key (authorized_keys form) and fingerprint are NOT secrets: they
+/// are kept in plaintext columns so listings never need to decrypt private
+/// bodies. Rows saved before this migration are backfilled lazily (the first
+/// listing decrypts once, derives, and UPDATEs the row).
+///
+/// FROZEN once applied: never edit this SQL after release; add version 14.
+fn ssh_public_key_columns_migration() -> Migration {
+    Migration {
+        version: 13,
+        description: "ssh_keys public key + fingerprint columns",
+        sql: "
+            ALTER TABLE ssh_keys ADD COLUMN public_key TEXT NOT NULL DEFAULT '';
+            ALTER TABLE ssh_keys ADD COLUMN fingerprint TEXT NOT NULL DEFAULT '';
+        ",
+        kind: MigrationKind::Up,
+    }
 }
 
 /// Version 12 — detected server OS + generated-key marks.

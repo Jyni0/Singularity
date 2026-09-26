@@ -344,6 +344,8 @@ pub fn run() {
                 if let Some(icon) = app.default_window_icon() {
                     let _ = window.set_icon(icon.clone());
                 }
+                #[cfg(windows)]
+                keep_find_keys_for_the_page(&window);
             }
             // The tray keeps the app alive after the window closes: runs keep
             // streaming, and the menu shows them plus version and Quit.
@@ -395,6 +397,7 @@ pub fn run() {
             ssh_connected,
             ssh::ssh_list_servers,
             ssh::ssh_save_server,
+            ssh::ssh_reorder_units,
             ssh::ssh_delete_server,
             ssh::ssh_list_keys,
             ssh::ssh_save_key,
@@ -417,6 +420,8 @@ pub fn run() {
             ssh::ssh_sftp_download,
             ssh::ssh_sftp_upload,
             ssh::ssh_sftp_read_text,
+            ssh::ssh_sftp_write_text,
+            ssh::ssh_sftp_write_chunk,
             ssh::ssh_sftp_rename,
             ssh::ssh_sftp_remove,
             ssh::ssh_sftp_mkdir,
@@ -425,4 +430,39 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running singularity");
+}
+
+/// WebView2 opens its own find bar on Ctrl+F before the page can say no —
+/// preventDefault in JS does not stop it. Turn the browser handling of the
+/// find keys off: the key still reaches the page, so the app's own search
+/// (SFTP filter, code editor search) gets it instead.
+#[cfg(windows)]
+fn keep_find_keys_for_the_page(window: &tauri::WebviewWindow) {
+    use webview2_com::AcceleratorKeyPressedEventHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2AcceleratorKeyPressedEventArgs2;
+    use windows_core::Interface;
+
+    const VK_F: u32 = 0x46;
+    const VK_G: u32 = 0x47;
+    const VK_F3: u32 = 0x72;
+
+    let _ = window.with_webview(|webview| unsafe {
+        let handler = AcceleratorKeyPressedEventHandler::create(Box::new(|_, args| {
+            let Some(args) = args else { return Ok(()) };
+            let mut key = 0u32;
+            args.VirtualKey(&mut key)?;
+            // The event only fires for accelerators (Ctrl/Alt combos and
+            // function keys), so a bare F/G typed into a field never lands here.
+            if matches!(key, VK_F | VK_G | VK_F3) {
+                if let Ok(args2) = args.cast::<ICoreWebView2AcceleratorKeyPressedEventArgs2>() {
+                    args2.SetIsBrowserAcceleratorKeyEnabled(false)?;
+                }
+            }
+            Ok(())
+        }));
+        let mut token = 0i64;
+        if let Err(e) = webview.controller().add_AcceleratorKeyPressed(&handler, &mut token) {
+            eprintln!("[singularity] cannot hook find keys: {e}");
+        }
+    });
 }

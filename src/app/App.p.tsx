@@ -289,6 +289,30 @@ export default function App() {
 
   /* ---------- SSH Client data ---------- */
 
+  /**
+   * A list was dragged into a new order: show it at once, then persist.
+   * Open connections are session-only, so their order is not stored.
+   */
+  const reorderSsh = useCallback((kind: "server" | "key" | "script" | "conn", ids: string[]) => {
+    const sortBy = <T extends { id: string }>(cur: T[]): T[] => {
+      const byId = new Map(cur.map((x) => [x.id, x]));
+      const moved = ids.map((id) => byId.get(id)).filter((x): x is T => !!x);
+      return [...moved, ...cur.filter((x) => !ids.includes(x.id))];
+    };
+    if (kind === "conn") {
+      setSshConns(sortBy);
+      return;
+    }
+    if (kind === "server") setSshServers(sortBy);
+    else if (kind === "key") setSshKeys(sortBy);
+    else setSshScripts(sortBy);
+    void db.reorderSshUnits(kind, ids).catch(() => {
+      void db.loadSshServers().then(setSshServers).catch(() => {});
+      void db.loadSshKeys().then(setSshKeys).catch(() => {});
+      void db.loadSshScripts().then(setSshScripts).catch(() => {});
+    });
+  }, []);
+
   const reloadSshServers = useCallback(() => {
     void db.loadSshServers().then(setSshServers).catch(() => {});
     void db.loadSshKeys().then(setSshKeys).catch(() => {});
@@ -405,16 +429,6 @@ export default function App() {
     setSshBusy(id, true);
     setSshNotice(null);
     db.sshConnect(id)
-      .then(() => db.sshConnected())
-      .then(setSshConnectedIds)
-      .catch((e) => setSshNotice(e instanceof Error ? e.message : String(e)))
-      .finally(() => setSshBusy(id, false));
-  }, []);
-
-  const disconnectServer = useCallback((id: string) => {
-    setSshBusy(id, true);
-    setSshNotice(null);
-    db.sshDisconnect(id)
       .then(() => db.sshConnected())
       .then(setSshConnectedIds)
       .catch((e) => setSshNotice(e instanceof Error ? e.message : String(e)))
@@ -874,6 +888,7 @@ export default function App() {
             onSelectConn={selectSshConn}
             onCloseConn={closeSshConn}
             onOpenPanel={openSshPanel}
+            onReorder={reorderSsh}
             onPasteScript={
               view === "ssh-terminal" && activeConn
                 ? (script) => void pasteIntoConn(activeConn, script.content)
@@ -972,9 +987,8 @@ export default function App() {
                   onEditUnit={(t) => setSshPanel(t)}
                   onAddUnit={(kind) => setSshPanel({ kind })}
                   onConnect={connectServer}
-                  onDisconnect={disconnectServer}
                   onOpenTerminal={(id) => openSshConn(id, "terminal", true)}
-                  onOpenFiles={(id) => openSshConn(id, "sftp", true)}
+                  onReorder={reorderSsh}
                 />
               </div>
             </ScrollArea>

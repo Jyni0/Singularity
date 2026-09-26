@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { motion, AnimatePresence } from "motion/react";
+import { motion, AnimatePresence, Reorder } from "motion/react";
 import {
   Server,
   ScrollText,
@@ -16,6 +16,7 @@ import type { SshConn, SshKey, SshScript, SshServer, UnitsTab, ViewKind } from "
 import { ROW, ROW_HOVER, ROW_ACTIVE, ROW_ICON } from "../ui/tokens.s";
 import { ScrollArea } from "../ui/ScrollArea.c";
 import { OsLogo } from "../ui/OsLogo.c";
+import { useDragOrder } from "../hooks/useDragOrder.h";
 
 /**
  * Sidebar of the SSH Client mode. Same anatomy as the Agent sidebar — nav
@@ -43,6 +44,7 @@ export function SshSidebar({
   onSelectConn,
   onCloseConn,
   onOpenPanel,
+  onReorder,
   onPasteScript,
   onShowView,
   onAdd,
@@ -67,6 +69,8 @@ export function SshSidebar({
   onSelectConn: (connId: string) => void;
   onCloseConn: (connId: string) => void;
   onOpenPanel: (target: { kind: "server" | "key" | "script"; id: string }) => void;
+  /** A section was dragged into a new order (ids top to bottom). */
+  onReorder: (kind: "server" | "key" | "script" | "conn", ids: string[]) => void;
   /** Pastes a script into the terminal on screen; null when no terminal is. */
   onPasteScript: ((script: SshScript) => void) | null;
   onShowView: (v: "units" | "ssh-logs") => void;
@@ -174,7 +178,8 @@ export function SshSidebar({
                 No open connections.
               </div>
             ) : (
-              conns.map((c) => {
+              <SideDragList items={conns} onReorder={(ids) => onReorder("conn", ids)} onHover={(id) => setHovered(id && "conn-" + id)}>
+              {(c) => {
                 const isSftp = c.kind === "sftp";
                 const isActive = activeConn === c.id;
                 const hoverKey = "conn-" + c.id;
@@ -182,12 +187,7 @@ export function SshSidebar({
                 const label = isSftp ? "SFTP " + serverName(c.serverId) : serverName(c.serverId);
                 const srv = servers.find((x) => x.id === c.serverId);
                 return (
-                  <div
-                    key={c.id}
-                    className="relative shrink-0"
-                    onMouseEnter={() => setHovered(hoverKey)}
-                    onMouseLeave={() => setHovered(null)}
-                  >
+                  <>
                     <button
                       className={
                         ROW + " w-full " +
@@ -203,12 +203,12 @@ export function SshSidebar({
                           console icon — it duplicated the logo); SFTP rows by
                           the folder icon (no logo). */}
                       {isSftp ? (
-                        <FolderOpen size={13} strokeWidth={1.5} className="shrink-0 text-[var(--accent)]" />
+                        <FolderOpen size={18} strokeWidth={1.5} className="shrink-0 text-[var(--accent)]" />
                       ) : (
                         srv ? (
-                          <OsLogo os={srv.os} seed={srv.id} name={srv.name} size={16} />
+                          <OsLogo os={srv.os} seed={srv.id} name={srv.name} />
                         ) : (
-                          <TerminalSquare size={13} strokeWidth={1.5} className="shrink-0 text-[var(--accent)]" />
+                          <TerminalSquare size={18} strokeWidth={1.5} className="shrink-0 text-[var(--accent)]" />
                         )
                       )}
                       <span className="truncate">{label}</span>
@@ -231,9 +231,10 @@ export function SshSidebar({
                         <X size={13} strokeWidth={1.5} />
                       </button>
                     </div>
-                  </div>
+                  </>
                 );
-              })
+              }}
+              </SideDragList>
             )
           )}
 
@@ -241,18 +242,14 @@ export function SshSidebar({
           {sectionHeader("servers", "Servers", servers.length, "servers", "Add server")}
           {sectionBody(
             "servers",
-            servers.map((s) => {
+            <SideDragList items={servers} onReorder={(ids) => onReorder("server", ids)} onHover={(id) => setHovered(id && "srv-" + id)}>
+            {(s) => {
               const live = connected.includes(s.id);
               const panelActive = activePanel?.kind === "server" && activePanel.id === s.id;
               const hoverKey = "srv-" + s.id;
               const isHover = hovered === hoverKey;
               return (
-                <div
-                  key={s.id}
-                  className="relative shrink-0"
-                  onMouseEnter={() => setHovered(hoverKey)}
-                  onMouseLeave={() => setHovered(null)}
-                >
+                <>
                   <button
                     className={
                       ROW + " w-full " +
@@ -308,20 +305,21 @@ export function SshSidebar({
                       <Settings size={13} strokeWidth={1.5} />
                     </button>
                   </div>
-                </div>
+                </>
               );
-            })
+            }}
+            </SideDragList>
           )}
 
           {/* ---- Credentials ---- */}
           {sectionHeader("keys", "Credentials", keys.length, "keys", "Add credential")}
           {sectionBody(
             "keys",
-            keys.map((k) => {
+            <SideDragList items={keys} onReorder={(ids) => onReorder("key", ids)}>
+            {(k) => {
               const active = activePanel?.kind === "key" && activePanel.id === k.id;
               return (
                 <button
-                  key={k.id}
                   className={ROW + " w-full " + (active ? ROW_ACTIVE : ROW_HOVER)}
                   onClick={() => onOpenPanel({ kind: "key", id: k.id })}
                 >
@@ -334,23 +332,20 @@ export function SshSidebar({
                   )}
                 </button>
               );
-            })
+            }}
+            </SideDragList>
           )}
 
           {/* ---- Scripts ---- */}
           {sectionHeader("scripts", "Scripts", scripts.length, "scripts", "Add script")}
           {sectionBody(
             "scripts",
-            scripts.map((s) => {
+            <SideDragList items={scripts} onReorder={(ids) => onReorder("script", ids)} onHover={(id) => setHovered(id && "script:" + id)}>
+            {(s) => {
               const active = activePanel?.kind === "script" && activePanel.id === s.id;
               const rowKey = "script:" + s.id;
               return (
-                <div
-                  key={s.id}
-                  className="relative"
-                  onMouseEnter={() => setHovered(rowKey)}
-                  onMouseLeave={() => setHovered((h) => (h === rowKey ? null : h))}
-                >
+                <>
                   <button
                     className={ROW + " w-full " + (active ? ROW_ACTIVE : ROW_HOVER)}
                     // With a terminal on screen the script is pasted into it;
@@ -380,9 +375,10 @@ export function SshSidebar({
                       <Settings size={13} strokeWidth={1.5} />
                     </button>
                   </div>
-                </div>
+                </>
               );
-            })
+            }}
+            </SideDragList>
           )}
 
           <div className="h-2 shrink-0" />
@@ -399,5 +395,44 @@ export function SshSidebar({
 
       <div className="sidebar-resizer" onMouseDown={startResize} />
     </aside>
+  );
+}
+
+/**
+ * A sidebar section in the user's own order: grab a row and drag it up or
+ * down (no buttons). A drop never counts as a click on the row.
+ */
+function SideDragList<T extends { id: string }>({
+  items,
+  onReorder,
+  onHover,
+  children,
+}: {
+  items: T[];
+  onReorder: (ids: string[]) => void;
+  /** Row hover in/out (null = left), for the rows' hover actions. */
+  onHover?: (id: string | null) => void;
+  children: (item: T) => React.ReactNode;
+}) {
+  const drag = useDragOrder(items, onReorder);
+  return (
+    <Reorder.Group axis="y" values={drag.order} onReorder={drag.setOrder} as="div" className="flex flex-col gap-0.5">
+      {drag.order.map((item) => (
+        <Reorder.Item
+          key={item.id}
+          value={item}
+          as="div"
+          className="relative shrink-0 select-none rounded-md"
+          onDragStart={drag.onDragStart}
+          onDragEnd={drag.onDragEnd}
+          onClickCapture={drag.suppressClick}
+          whileDrag={{ scale: 1.03, zIndex: 10, backgroundColor: "var(--row-solid-hover)" }}
+          onMouseEnter={() => onHover?.(item.id)}
+          onMouseLeave={() => onHover?.(null)}
+        >
+          {children(item)}
+        </Reorder.Item>
+      ))}
+    </Reorder.Group>
   );
 }

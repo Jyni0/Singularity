@@ -1,23 +1,19 @@
-import { motion, AnimatePresence } from "motion/react";
+import { motion, AnimatePresence, Reorder } from "motion/react";
 import {
   Server,
   KeyRound,
   FileCode2,
   Plus,
-  TerminalSquare,
-  Power,
-  PowerOff,
   Pencil,
   Trash2,
   LoaderCircle,
   X,
-  FolderOpen,
-  ShieldCheck,
   ShieldAlert,
 } from "lucide-react";
 import * as db from "../core/db.r";
 import type { SshKey, SshScript, SshServer, UnitsTab } from "../core/types.i";
 import { OsLogo } from "../ui/OsLogo.c";
+import { useDragOrder } from "../hooks/useDragOrder.h";
 
 /**
  * Units — the SSH Client mode's home page: one grid, three collections.
@@ -41,9 +37,8 @@ export function UnitsView({
   onEditUnit,
   onAddUnit,
   onConnect,
-  onDisconnect,
   onOpenTerminal,
-  onOpenFiles,
+  onReorder,
 }: {
   servers: SshServer[];
   keys: SshKey[];
@@ -62,9 +57,9 @@ export function UnitsView({
   /** Open the right-hand panel to create a unit of the given kind. */
   onAddUnit: (kind: "server" | "key" | "script") => void;
   onConnect: (id: string) => void;
-  onDisconnect: (id: string) => void;
   onOpenTerminal: (serverId: string) => void;
-  onOpenFiles: (serverId: string) => void;
+  /** A list was dragged into a new order (ids top to bottom). */
+  onReorder: (kind: "server" | "key" | "script", ids: string[]) => void;
 }) {
   const TABS: { id: UnitsTab; label: string; icon: typeof Server; count: number }[] = [
     { id: "servers", label: "Servers", icon: Server, count: servers.length },
@@ -149,9 +144,8 @@ export function UnitsView({
               connected={connected}
               busyIds={busyIds}
               onConnect={onConnect}
-              onDisconnect={onDisconnect}
               onOpenTerminal={onOpenTerminal}
-              onOpenFiles={onOpenFiles}
+              onReorder={(ids) => onReorder("server", ids)}
               onEdit={(s) => onEditUnit({ kind: "server", id: s.id })}
               onDelete={async (s) => {
                 await db.deleteSshServer(s.id);
@@ -163,6 +157,7 @@ export function UnitsView({
           {tab === "keys" && (
             <KeyGrid
               keys={keys}
+              onReorder={(ids) => onReorder("key", ids)}
               onEdit={(k) => onEditUnit({ kind: "key", id: k.id })}
               onDelete={async (k) => {
                 await db.deleteSshKey(k.id);
@@ -174,6 +169,7 @@ export function UnitsView({
           {tab === "scripts" && (
             <ScriptGrid
               scripts={scripts}
+              onReorder={(ids) => onReorder("script", ids)}
               onEdit={(s) => onEditUnit({ kind: "script", id: s.id })}
               onDelete={async (s) => {
                 await db.deleteSshScript(s.id);
@@ -239,14 +235,53 @@ function Empty({ icon: Icon, text }: { icon: typeof Server; text: string }) {
   );
 }
 
+/**
+ * A units list in the user's own order: grab any row and drag it up or
+ * down. Clicks still work — a drop never counts as a click on the row.
+ */
+function DragList<T extends { id: string }>({
+  items,
+  onReorder,
+  children,
+}: {
+  items: T[];
+  onReorder: (ids: string[]) => void;
+  children: (item: T) => React.ReactNode;
+}) {
+  const drag = useDragOrder(items, onReorder);
+  return (
+    <Reorder.Group axis="y" values={drag.order} onReorder={drag.setOrder} className={LIST} as="div">
+      {drag.order.map((item, i) => (
+        <Reorder.Item
+          key={item.id}
+          value={item}
+          as="div"
+          className="relative select-none bg-[var(--bg-surface)]"
+          onDragStart={drag.onDragStart}
+          onDragEnd={drag.onDragEnd}
+          whileDrag={{ scale: 1.015, boxShadow: "0 8px 24px rgba(0,0,0,0.28)", zIndex: 10 }}
+          onClickCapture={drag.suppressClick}
+        >
+          {i > 0 && <div className={ROW_DIV} />}
+          {children(item)}
+        </Reorder.Item>
+      ))}
+    </Reorder.Group>
+  );
+}
+
+/**
+ * Servers, in the user's own order: grab a row and drag it up or down.
+ * Clicking a row connects (or opens the live terminal); edit and delete
+ * appear on hover.
+ */
 function ServerGrid({
   servers,
   connected,
   busyIds,
   onConnect,
-  onDisconnect,
   onOpenTerminal,
-  onOpenFiles,
+  onReorder,
   onEdit,
   onDelete,
 }: {
@@ -254,25 +289,22 @@ function ServerGrid({
   connected: string[];
   busyIds: string[];
   onConnect: (id: string) => void;
-  onDisconnect: (id: string) => void;
   onOpenTerminal: (id: string) => void;
-  onOpenFiles: (id: string) => void;
+  onReorder: (ids: string[]) => void;
   onEdit: (s: SshServer) => void;
   onDelete: (s: SshServer) => void;
 }) {
   if (servers.length === 0) return <Empty icon={Server} text="No servers yet — add your first unit." />;
   return (
-    <div className={LIST}>
-      {servers.map((s, i) => {
+    <DragList items={servers} onReorder={onReorder}>
+      {(s) => {
         const live = connected.includes(s.id);
         const busy = busyIds.includes(s.id);
         return (
-          <div key={s.id}>
-            {i > 0 && <div className={ROW_DIV} />}
             <div
-              className={LIST_ROW + " cursor-pointer"}
+              className={LIST_ROW + " cursor-pointer active:cursor-grabbing"}
               onClick={() => (live ? onOpenTerminal(s.id) : onConnect(s.id))}
-              title={live ? "Open terminal" : "Connect"}
+              title={live ? "Open terminal — drag to reorder" : "Connect — drag to reorder"}
             >
               <span className="relative flex h-9 w-9 shrink-0 items-center justify-center">
                 {/* OS logo when Rust detected the distro; initial avatar otherwise */}
@@ -280,6 +312,11 @@ function ServerGrid({
                   <OsLogo os={s.os} seed={s.id} name={s.name} size={36} />
                 ) : (
                   <Avatar label={s.name} color={avatarColor(s.id)} icon={Server} />
+                )}
+                {busy && (
+                  <span className="absolute inset-0 flex items-center justify-center rounded-full bg-black/40">
+                    <LoaderCircle size={16} className="animate-spin text-white" />
+                  </span>
                 )}
                 {/* Live dot on the avatar, Termius-style */}
                 <span
@@ -295,62 +332,30 @@ function ServerGrid({
                   {s.username}@{s.host}{s.port !== 22 ? ":" + s.port : ""}
                 </span>
               </span>
-              <span className="flex shrink-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
-                {live ? (
-                  <>
-                    <button
-                      className="flex h-7 items-center gap-1.5 rounded-md px-2.5 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-                      title="Files (SFTP)"
-                      onClick={() => onOpenFiles(s.id)}
-                    >
-                      <FolderOpen size={13} />
-                    </button>
-                    <button
-                      className="flex h-7 items-center gap-1.5 rounded-full bg-[var(--accent)] px-3 text-[12px] font-medium text-white transition-opacity hover:opacity-90"
-                      onClick={() => onOpenTerminal(s.id)}
-                    >
-                      <TerminalSquare size={12} /> Console
-                    </button>
-                    <button
-                      className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
-                      disabled={busy}
-                      onClick={() => onDisconnect(s.id)}
-                      title="Disconnect"
-                    >
-                      {busy ? <LoaderCircle size={13} className="animate-spin" /> : <PowerOff size={13} />}
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    className="flex h-7 items-center gap-1.5 rounded-full border border-[var(--border)] px-3 text-[12px] text-[var(--text-muted)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
-                    disabled={busy}
-                    onClick={() => onConnect(s.id)}
-                  >
-                    {busy ? <LoaderCircle size={12} className="animate-spin" /> : <Power size={12} />} Connect
-                  </button>
-                )}
-                <span className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-                  <button
-                    className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-                    title="Edit"
-                    onClick={() => onEdit(s)}
-                  >
-                    <Pencil size={13} />
-                  </button>
-                  <button
-                    className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
-                    title="Delete"
-                    onClick={() => onDelete(s)}
-                  >
-                    <Trash2 size={13} />
-                  </button>
-                </span>
+              <span
+                className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100"
+                onClick={(e) => e.stopPropagation()}
+                onPointerDown={(e) => e.stopPropagation()}
+              >
+                <button
+                  className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                  title="Edit"
+                  onClick={() => onEdit(s)}
+                >
+                  <Pencil size={13} />
+                </button>
+                <button
+                  className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
+                  title="Delete"
+                  onClick={() => onDelete(s)}
+                >
+                  <Trash2 size={13} />
+                </button>
               </span>
             </div>
-          </div>
         );
-      })}
-    </div>
+      }}
+    </DragList>
   );
 }
 
@@ -358,20 +363,20 @@ function ServerGrid({
 
 function KeyGrid({
   keys,
+  onReorder,
   onEdit,
   onDelete,
 }: {
   keys: SshKey[];
+  onReorder: (ids: string[]) => void;
   onEdit: (k: SshKey) => void;
   onDelete: (k: SshKey) => void;
 }) {
   if (keys.length === 0) return <Empty icon={KeyRound} text="No credentials yet — add a private key." />;
   return (
-    <div className={LIST}>
-      {keys.map((k, i) => (
-        <div key={k.id}>
-          {i > 0 && <div className={ROW_DIV} />}
-          <div className={LIST_ROW + " cursor-pointer"} onClick={() => onEdit(k)} title="Edit credential">
+    <DragList items={keys} onReorder={onReorder}>
+      {(k) => (
+          <div className={LIST_ROW + " cursor-pointer"} onClick={() => onEdit(k)} title="Edit credential — drag to reorder">
             <Avatar label={k.name} color={avatarColor(k.id)} icon={KeyRound} />
             <span className="min-w-0 flex-1">
               <span className="flex min-w-0 items-center gap-1.5">
@@ -382,9 +387,6 @@ function KeyGrid({
               </span>
             </span>
             <span className="flex shrink-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
-              <span className="flex items-center gap-1 text-[11px] text-[var(--text-dim)]" title="AES-256-GCM, master key in the OS credential store">
-                <ShieldCheck size={12} /> encrypted
-              </span>
               <span className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                 <button
                   className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
@@ -403,9 +405,8 @@ function KeyGrid({
               </span>
             </span>
           </div>
-        </div>
-      ))}
-    </div>
+      )}
+    </DragList>
   );
 }
 
@@ -417,20 +418,20 @@ function KeyGrid({
  */
 function ScriptGrid({
   scripts,
+  onReorder,
   onEdit,
   onDelete,
 }: {
   scripts: SshScript[];
+  onReorder: (ids: string[]) => void;
   onEdit: (s: SshScript) => void;
   onDelete: (s: SshScript) => void;
 }) {
   if (scripts.length === 0) return <Empty icon={FileCode2} text="No scripts yet — save a command you run often." />;
   return (
-    <div className={LIST}>
-      {scripts.map((s, i) => (
-        <div key={s.id}>
-          {i > 0 && <div className={ROW_DIV} />}
-          <div className={LIST_ROW + " cursor-pointer"} onClick={() => onEdit(s)} title="Edit script">
+    <DragList items={scripts} onReorder={onReorder}>
+      {(s) => (
+          <div className={LIST_ROW + " cursor-pointer"} onClick={() => onEdit(s)} title="Edit script — drag to reorder">
             <Avatar label={s.name} color={avatarColor(s.id)} icon={FileCode2} />
             <span className="min-w-0 flex-1">
               <span className="block truncate text-[13.5px] font-medium text-[var(--text-main)]">{s.name}</span>
@@ -457,8 +458,7 @@ function ScriptGrid({
               </span>
             </span>
           </div>
-        </div>
-      ))}
-    </div>
+      )}
+    </DragList>
   );
 }

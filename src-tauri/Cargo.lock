@@ -5589,6 +5589,7 @@ dependencies = [
  "encoding_rs",
  "futures-util",
  "keyring",
+ "percent-encoding",
  "rand 0.8.8",
  "reqwest 0.12.28",
  "rig-agent",
@@ -5609,7 +5610,9 @@ dependencies = [
  "tiny_http",
  "tokio",
  "urlencoding",
+ "webview2-com",
  "whisper-rs",
+ "windows-core 0.61.2",
 ]
 
 [[package]]

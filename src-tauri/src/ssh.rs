@@ -1200,7 +1200,7 @@ pub async fn sftp_rename(
     sftp.rename(old, new).await.map_err(|e| format!("rename failed: {e}"))
 }
 
-/// Removes a remote file or (empty) directory.
+/// Removes a remote file, or a directory with everything inside it.
 pub async fn sftp_remove(
     app: &AppHandle,
     server_id: &str,
@@ -1209,16 +1209,123 @@ pub async fn sftp_remove(
 ) -> Result<(), String> {
     let sftp = sftp_for(app, "user", server_id).await?;
     if is_dir {
-        sftp.remove_dir(path).await.map_err(|e| format!("rmdir failed: {e}"))
+        remove_tree(&sftp, path.to_string()).await
     } else {
         sftp.remove_file(path).await.map_err(|e| format!("rm failed: {e}"))
     }
+}
+
+/// Depth-first delete of a remote directory. Symlinks are unlinked, never
+/// followed, so a link to "/" cannot take the whole server with it.
+fn remove_tree(
+    sftp: &SftpSession,
+    dir: String,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+    Box::pin(async move {
+        let entries = sftp
+            .read_dir(dir.clone())
+            .await
+            .map_err(|e| format!("cannot list {dir}: {e}"))?;
+        for entry in entries {
+            let name = entry.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let child = format!("{}/{}", dir.trim_end_matches('/'), name);
+            let ft = entry.file_type();
+            if ft.is_dir() && !ft.is_symlink() {
+                remove_tree(sftp, child).await?;
+            } else {
+                sftp.remove_file(child.clone())
+                    .await
+                    .map_err(|e| format!("rm {child} failed: {e}"))?;
+            }
+        }
+        sftp.remove_dir(dir.clone())
+            .await
+            .map_err(|e| format!("rmdir {dir} failed: {e}"))
+    })
 }
 
 /// Creates a remote directory.
 pub async fn sftp_mkdir(app: &AppHandle, server_id: &str, path: &str) -> Result<(), String> {
     let sftp = sftp_for(app, "user", server_id).await?;
     sftp.create_dir(path).await.map_err(|e| format!("mkdir failed: {e}"))
+}
+
+/// Saves a file edited in the SFTP editor. The file is truncated and
+/// rewritten in place, so it keeps its owner and permissions.
+pub async fn sftp_write_text(
+    app: &AppHandle,
+    server_id: &str,
+    remote: &str,
+    content: &str,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    let sftp = sftp_for(app, "user", server_id).await?;
+    let mut file = sftp
+        .open_with_flags(remote, OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE)
+        .await
+        .map_err(|e| format!("cannot open {remote}: {e}"))?;
+    file.write_all(content.as_bytes())
+        .await
+        .map_err(|e| format!("save failed: {e}"))?;
+    file.sync_all().await.ok();
+    file.close().await.ok();
+    let server = load_server(app, server_id).await?;
+    write_log(app, "user", &server, "sftp-upload", true, &format!("{remote} (edited)")).await;
+    Ok(())
+}
+
+/// Writes one chunk of a file dropped onto the SFTP page. The webview has
+/// the bytes, not a local path, so it streams them in order: offset 0
+/// creates/truncates the file, later chunks are written at their offset.
+pub async fn sftp_write_chunk(
+    app: &AppHandle,
+    server_id: &str,
+    remote: &str,
+    offset: u64,
+    total: u64,
+    data: &[u8],
+) -> Result<(), String> {
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+    let sftp = sftp_for(app, "user", server_id).await?;
+    let flags = if offset == 0 {
+        OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE
+    } else {
+        OpenFlags::WRITE
+    };
+    let mut file = sftp
+        .open_with_flags(remote, flags)
+        .await
+        .map_err(|e| format!("cannot create {remote}: {e}"))?;
+    if offset > 0 {
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| format!("seek failed: {e}"))?;
+    }
+    file.write_all(data)
+        .await
+        .map_err(|e| format!("upload failed: {e}"))?;
+    file.sync_all().await.ok();
+    file.close().await.ok();
+    let done = offset + data.len() as u64;
+    let finished = done >= total;
+    let _ = app.emit(
+        "ssh://transfer",
+        TransferProgress {
+            server_id: server_id.to_string(),
+            file: remote.rsplit('/').next().unwrap_or(remote).to_string(),
+            done,
+            total,
+            finished,
+        },
+    );
+    if finished {
+        let server = load_server(app, server_id).await?;
+        write_log(app, "user", &server, "sftp-upload", true, remote).await;
+    }
+    Ok(())
 }
 
 /* ---------- Units CRUD (frontend talks through commands) ---------- */
@@ -1228,7 +1335,7 @@ pub async fn sftp_mkdir(app: &AppHandle, server_id: &str, path: &str) -> Result<
 pub async fn list_servers(app: &AppHandle) -> Result<Vec<SshServer>, String> {
     let pool = sql(app).await.ok_or("database unavailable")?;
     let rows = sqlx::query(
-        "SELECT id, name, host, port, username, auth, key_id, host_key, os, password FROM ssh_servers ORDER BY created_at DESC",
+        "SELECT id, name, host, port, username, auth, key_id, host_key, os, password FROM ssh_servers ORDER BY sort_order ASC, created_at DESC",
     )
     .fetch_all(&pool)
     .await
@@ -1354,7 +1461,7 @@ fn derive_public(body: &str, passphrase: &str) -> (String, String) {
 pub async fn list_keys(app: &AppHandle) -> Result<Vec<SshKey>, String> {
     let pool = sql(app).await.ok_or("database unavailable")?;
     let rows = sqlx::query(
-        "SELECT id, name, private_key, passphrase, public_key, fingerprint, comment FROM ssh_keys ORDER BY created_at DESC",
+        "SELECT id, name, private_key, passphrase, public_key, fingerprint, comment FROM ssh_keys ORDER BY sort_order ASC, created_at DESC",
     )
     .fetch_all(&pool)
     .await
@@ -1630,7 +1737,7 @@ pub async fn delete_key(app: &AppHandle, id: &str) -> Result<(), String> {
 pub async fn list_scripts(app: &AppHandle) -> Result<Vec<SshScript>, String> {
     let pool = sql(app).await.ok_or("database unavailable")?;
     let rows = sqlx::query(
-        "SELECT id, name, description, content FROM ssh_scripts ORDER BY created_at DESC",
+        "SELECT id, name, description, content FROM ssh_scripts ORDER BY sort_order ASC, created_at DESC",
     )
     .fetch_all(&pool)
     .await
@@ -1689,6 +1796,29 @@ pub async fn ssh_list_servers(app: AppHandle) -> Result<Vec<SshServer>, String> 
 #[tauri::command]
 pub async fn ssh_save_server(app: AppHandle, server: SshServer) -> Result<String, String> {
     save_server(&app, &server).await
+}
+
+/// Stores the order the user dragged a units list into (ids top to bottom).
+/// kind: "server" | "key" | "script".
+#[tauri::command]
+pub async fn ssh_reorder_units(app: AppHandle, kind: String, ids: Vec<String>) -> Result<(), String> {
+    let table = match kind.as_str() {
+        "server" => "ssh_servers",
+        "key" => "ssh_keys",
+        "script" => "ssh_scripts",
+        other => return Err(format!("unknown unit kind {other}")),
+    };
+    let pool = sql(&app).await.ok_or("database unavailable")?;
+    let mut tx = pool.begin().await.map_err(|e| format!("db error: {e}"))?;
+    for (i, id) in ids.iter().enumerate() {
+        sqlx::query(&format!("UPDATE {table} SET sort_order = ? WHERE id = ?"))
+            .bind(i as i64 + 1)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("db error: {e}"))?;
+    }
+    tx.commit().await.map_err(|e| format!("db error: {e}"))
 }
 
 #[tauri::command]
@@ -1850,6 +1980,41 @@ pub async fn ssh_sftp_upload(
 #[tauri::command]
 pub async fn ssh_sftp_read_text(app: AppHandle, server_id: String, remote: String) -> Result<String, String> {
     sftp_read_text(&app, &server_id, &remote).await
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_write_text(
+    app: AppHandle,
+    server_id: String,
+    remote: String,
+    content: String,
+) -> Result<(), String> {
+    sftp_write_text(&app, &server_id, &remote, &content).await
+}
+
+/// Raw-body upload chunk: the bytes are the IPC body, the rest travels in
+/// headers (x-server-id, x-remote percent-encoded, x-offset, x-total).
+#[tauri::command]
+pub async fn ssh_sftp_write_chunk(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
+        return Err("expected raw bytes".into());
+    };
+    let headers = request.headers();
+    let header = |k: &str| -> Result<String, String> {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .ok_or_else(|| format!("missing header {k}"))
+    };
+    let server_id = header("x-server-id")?;
+    let remote = percent_encoding::percent_decode_str(&header("x-remote")?)
+        .decode_utf8()
+        .map_err(|e| format!("bad path: {e}"))?
+        .into_owned();
+    let offset: u64 = header("x-offset")?.parse().map_err(|_| "bad offset")?;
+    let total: u64 = header("x-total")?.parse().map_err(|_| "bad total")?;
+    sftp_write_chunk(&app, &server_id, &remote, offset, total, data).await
 }
 
 #[tauri::command]

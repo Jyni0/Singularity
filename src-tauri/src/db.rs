@@ -115,7 +115,41 @@ pub fn migrations() -> Vec<Migration> {
         ssh_os_and_generated_keys_migration(),
         ssh_public_key_columns_migration(),
         provider_limits_migration(),
+        server_order_migration(),
+        key_script_order_migration(),
     ]
+}
+
+/// Version 16 — user-defined order of credentials and scripts, the same
+/// scheme as servers in version 15.
+///
+/// FROZEN once applied: never edit this SQL after release; add version 17.
+fn key_script_order_migration() -> Migration {
+    Migration {
+        version: 16,
+        description: "ssh key + script sort order",
+        sql: "
+            ALTER TABLE ssh_keys ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE ssh_scripts ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
+        ",
+        kind: MigrationKind::Up,
+    }
+}
+
+/// Version 15 — user-defined order of SSH servers (drag to reorder).
+///
+/// sort_order is written 1..n by ssh_reorder_servers; a server that was never
+/// reordered keeps 0, so newly added servers still land on top (the listing
+/// sorts by sort_order, then newest first).
+///
+/// FROZEN once applied: never edit this SQL after release; add version 16.
+fn server_order_migration() -> Migration {
+    Migration {
+        version: 15,
+        description: "ssh server sort order",
+        sql: "ALTER TABLE ssh_servers ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;",
+        kind: MigrationKind::Up,
+    }
 }
 
 /// Version 14 — per-provider request limits.

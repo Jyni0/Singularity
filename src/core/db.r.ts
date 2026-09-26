@@ -1588,6 +1588,21 @@ export async function saveSshServer(server: SshServer): Promise<string> {
   return sshInvoke<string>("ssh_save_server", { server: toRustServer(server) });
 }
 
+/** Persists the dragged order of a units list (ids top to bottom). */
+export async function reorderSshUnits(kind: "server" | "key" | "script", ids: string[]): Promise<void> {
+  if (!inTauri) {
+    const sortBy = <T extends { id: string }>(list: T[]): T[] => {
+      const byId = new Map(list.map((x) => [x.id, x]));
+      return ids.map((id) => byId.get(id)).filter((x): x is T => !!x);
+    };
+    if (kind === "server") memory.sshServers = sortBy(memory.sshServers);
+    else if (kind === "key") memory.sshKeys = sortBy(memory.sshKeys);
+    else memory.sshScripts = sortBy(memory.sshScripts);
+    return;
+  }
+  await sshInvoke("ssh_reorder_units", { kind, ids });
+}
+
 /** Deletes a unit (disconnects it first; its logs stay). */
 export async function deleteSshServer(id: string): Promise<void> {
   if (!inTauri) {
@@ -1896,6 +1911,38 @@ export async function sftpUpload(
 /** Reads a small text file for the preview pane (capped at 2 MB). */
 export async function sftpReadText(serverId: string, remote: string): Promise<string> {
   return sshInvoke<string>("ssh_sftp_read_text", { serverId, remote });
+}
+
+/** Saves text edited in the SFTP editor back to the server. */
+export async function sftpWriteText(serverId: string, remote: string, content: string): Promise<void> {
+  await sshInvoke("ssh_sftp_write_text", { serverId, remote, content });
+}
+
+/** Chunk size of drag-and-drop uploads (bytes go over IPC as a raw body). */
+const UPLOAD_CHUNK = 4 * 1024 * 1024;
+
+/**
+ * Uploads an in-memory file (e.g. dropped onto the SFTP page — the webview
+ * sees its bytes, not a local path) in chunks; progress arrives as
+ * ssh://transfer events like any other upload.
+ */
+export async function sftpUploadBlob(serverId: string, remote: string, blob: Blob): Promise<void> {
+  if (!inTauri) throw new Error("SSH needs the desktop shell (npm run tauri:dev)");
+  const { invoke } = await import("@tauri-apps/api/core");
+  const total = blob.size;
+  let offset = 0;
+  do {
+    const part = new Uint8Array(await blob.slice(offset, offset + UPLOAD_CHUNK).arrayBuffer());
+    await invoke("ssh_sftp_write_chunk", part, {
+      headers: {
+        "x-server-id": serverId,
+        "x-remote": encodeURIComponent(remote),
+        "x-offset": String(offset),
+        "x-total": String(total),
+      },
+    });
+    offset += part.length;
+  } while (offset < total);
 }
 
 export async function sftpRename(serverId: string, oldPath: string, newPath: string): Promise<void> {

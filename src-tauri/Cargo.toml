@@ -42,3 +42,7 @@ sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio
 russh-sftp = "3.0.0"
 keyring = "4.2.0"
 aes-gcm = "0.11.1"
+# Console-output decoding: Windows cmd.exe prints in the OEM codepage (cp866
+# for a Russian locale), never UTF-8 — decoding it as UTF-8 produced the
+# "кириллица выглядит как мусор" bug.
+encoding_rs = "0.8"

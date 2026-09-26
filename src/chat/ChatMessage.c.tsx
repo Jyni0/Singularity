@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { ArrowUp, Bug, Check, ChevronDown, ChevronRight, Circle, ListChecks, Loader2, XCircle } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ArrowUp, Bug, Check, ChevronDown, ChevronRight, Circle, ListChecks, Loader2, Wrench, XCircle } from "lucide-react";
 import * as db from "../core/db.r";
 import { formatDuration } from "../utils/format.u";
 import { Markdown, ToolCall, ThinkBlock } from "./Markdown.c";
@@ -27,6 +27,96 @@ export function MessageBody({ text }: { text: string }) {
   );
 }
 
+/* ---------- Collapsible action group ---------- */
+
+/**
+ * Consecutive tool calls collapsed into one transparent "Worked for …" row —
+ * the transcript reads as prose + a compact action log instead of a wall of
+ * cards. Open WHILE streaming (live progress must be visible), auto-collapses
+ * when the turn finishes; a click re-opens it to inspect every action.
+ */
+function StepGroup({
+  steps,
+  streaming,
+  durationMs,
+  onInspectStep,
+}: {
+  steps: { step: db.AgentStepEvent; key: string }[];
+  streaming?: boolean;
+  durationMs?: number;
+  onInspectStep?: (step: db.AgentStepEvent) => void;
+}) {
+  const [open, setOpen] = useState(!!streaming);
+  // Collapse once the turn is over — the answer matters, not the log.
+  useEffect(() => {
+    if (!streaming) setOpen(false);
+  }, [streaming]);
+  // Live elapsed while streaming; the stored duration takes over when done.
+  const startRef = useRef(Date.now());
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!streaming) return;
+    const id = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [streaming]);
+  const elapsed = streaming ? Date.now() - startRef.current : durationMs;
+  const label = elapsed && elapsed > 0 ? "Worked for " + formatDuration(elapsed) : "Worked";
+  const running = steps.some((s) => !s.step.done);
+  return (
+    <div className="flex flex-col">
+      {/* Transparent header row — same airy treatment as the project rows. */}
+      <button
+        className="flex w-fit items-center gap-1.5 rounded-md px-1 py-0.5 text-[11.5px] text-[var(--text-dim)] transition-colors select-none hover:text-[var(--text-muted)]"
+        onClick={() => setOpen(!open)}
+        title="Show the tool calls of this turn"
+      >
+        {streaming && running ? (
+          <Loader2 size={12} className="animate-spin text-[var(--accent)]" />
+        ) : (
+          <Wrench size={12} strokeWidth={1.5} />
+        )}
+        <span>{label}</span>
+        <span className="text-[10px] opacity-70">· {steps.length} action{steps.length === 1 ? "" : "s"}</span>
+        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+      </button>
+      {open && (
+        <div className="mt-1 flex flex-col gap-2 border-l border-[var(--border)] pl-3">
+          {steps.map((s) => (
+            <ToolCall
+              key={s.key}
+              call={{
+                name: s.step.name,
+                input: s.step.input,
+                result: s.step.result,
+                ok: s.step.ok,
+                running: !s.step.done,
+                onInspect: () => onInspectStep?.(s.step),
+              }}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Folds consecutive step segments into groups so the renderer can show one
+ * StepGroup per run of tool calls. Text/think/tasks/usage pass through.
+ */
+function groupSegments(segments: Segment[]): (Segment | { group: Segment[] })[] {
+  const out: (Segment | { group: Segment[] })[] = [];
+  for (const seg of segments) {
+    if (seg.kind === "step") {
+      const tail = out[out.length - 1];
+      if (tail && "group" in tail) tail.group.push(seg);
+      else out.push({ group: [seg] });
+    } else {
+      out.push(seg);
+    }
+  }
+  return out;
+}
 /* ---------- Unified chat message row ---------- */
 
 export function ChatMessage({
@@ -87,26 +177,27 @@ export function ChatMessage({
 
   // Segments keep prose and tool calls in the order they happened, so the
   // answer reads as a transcript rather than text with a dump of calls below.
+  // Consecutive tool calls fold into ONE transparent "Worked for …" group.
   if (segments && segments.length > 0) {
+    const grouped = groupSegments(segments);
     return (
       <div className="flex flex-col gap-2">
-        {segments.map((seg, i) => {
-          const isLast = i === segments.length - 1;
-          if (seg.kind === "step") {
-            const st = seg.step;
-            // Every step opens as its own closeable tab in the side panel —
-            // the card itself never expands anymore.
+        {grouped.map((seg, i) => {
+          const isLast = i === grouped.length - 1;
+          if ("group" in seg) {
+            // Only the group that sits at the tail of a LIVE turn stays open
+            // by itself; a finished turn collapses its actions.
+            const live = !!streaming && isLast;
             return (
-              <ToolCall
-                key={`s${st.index}-${i}`}
-                call={{
-                  name: st.name,
-                  input: st.input,
-                  result: st.result,
-                  ok: st.ok,
-                  running: !st.done,
-                  onInspect: () => onInspectStep?.(st),
-                }}
+              <StepGroup
+                key={`g${i}`}
+                streaming={live}
+                durationMs={durationMs}
+                onInspectStep={onInspectStep}
+                steps={seg.group.map((s, j) => ({
+                  step: (s as { kind: "step"; step: db.AgentStepEvent }).step,
+                  key: `s${i}-${j}`,
+                }))}
               />
             );
           }
@@ -129,8 +220,25 @@ export function ChatMessage({
               />
             ) : null;
           }
-          return seg.text.trim() ? <Markdown key={`t${i}`} text={seg.text} /> : null;
+          // Plain prose (steps were folded into groups above).
+          if (seg.kind === "text") {
+            return seg.text.trim() ? <Markdown key={`t${i}`} text={seg.text} /> : null;
+          }
+          return null;
         })}
+        {/* Live run, nothing visibly growing at the tail (a tool spinner or
+            freshly streamed prose is its own progress) — show the pulse so
+            the screen is never "frozen" while the model thinks. */}
+        {streaming && (() => {
+          const last = segments[segments.length - 1];
+          const tailActive =
+            last?.kind === "text"
+              ? last.text.trim().length > 0
+              : last?.kind === "step"
+                ? !last.step.done
+                : false;
+          return tailActive ? null : <WorkingIndicator label="Working…" />;
+        })()}
         {/* Generation time — shown at the END of the finished turn. */}
         <DurationFooter streaming={streaming} durationMs={durationMs} />
       </div>
@@ -140,9 +248,33 @@ export function ChatMessage({
   return (
     <div className="flex flex-col gap-2">
       {/* Model output is markdown: headings, lists, tables and fenced code. */}
-      <Markdown text={text} />
+      {text.trim() ? (
+        <Markdown text={text} />
+      ) : streaming ? (
+        /* Waiting for the first token — an empty bubble looked like a dead app. */
+        <WorkingIndicator label="Thinking…" />
+      ) : null}
       {/* Generation time — shown at the END of the finished turn. */}
       <DurationFooter streaming={streaming} durationMs={durationMs} />
+    </div>
+  );
+}
+
+/* ---------- Live activity indicator ---------- */
+
+/**
+ * Pulsing "working" line shown while the run is live but nothing is visibly
+ * happening — reasoning models can spend a minute before the first token,
+ * and an empty bubble looked like a frozen app ("нет прогресса на экране").
+ */
+function WorkingIndicator({ label }: { label: string }) {
+  return (
+    <div className="flex items-center gap-2 px-1 py-0.5 text-[12px] text-[var(--text-dim)]">
+      <span className="relative flex h-2 w-2">
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--accent)] opacity-60" />
+        <span className="relative inline-flex h-2 w-2 rounded-full bg-[var(--accent)]" />
+      </span>
+      <span className="animate-pulse">{label}</span>
     </div>
   );
 }

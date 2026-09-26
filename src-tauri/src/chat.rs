@@ -307,7 +307,13 @@ async fn stream_google(
     if crate::cancel::is_requested(request_id) {
         return Err(crate::cancel::STOPPED.to_string());
     }
-    let res = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+    // Stop interrupts the send immediately instead of waiting for the wire.
+    let res = tokio::select! {
+        r = req.send() => r.map_err(|e| format!("request failed: {e}"))?,
+        _ = crate::cancel::cancel_signal(request_id) => {
+            return Err(crate::cancel::STOPPED.to_string());
+        }
+    };
     let status = res.status();
     if !status.is_success() {
         let detail = res.text().await.unwrap_or_default();
@@ -315,16 +321,26 @@ async fn stream_google(
     }
 
     let mut stream = res.bytes_stream();
+    // Incremental UTF-8: a chunk boundary must not split a multi-byte char
+    // (Cyrillic/emoji in streamed answers must arrive intact).
+    let mut decoder = crate::utf8stream::StreamDecoder::new();
     let mut buf = String::new();
     let mut saw_text = false;
 
-    while let Some(chunk) = stream.next().await {
-        // The Stop button aborts the stream; the UI keeps the partial text.
-        if crate::cancel::is_requested(request_id) {
-            return Err(crate::cancel::STOPPED.to_string());
-        }
+    loop {
+        // The Stop button aborts IMMEDIATELY — the cancel signal races the
+        // next chunk instead of waiting for the provider to emit one.
+        let chunk = tokio::select! {
+            c = stream.next() => match c {
+                Some(c) => c,
+                None => break,
+            },
+            _ = crate::cancel::cancel_signal(request_id) => {
+                return Err(crate::cancel::STOPPED.to_string());
+            }
+        };
         let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
+        buf.push_str(&decoder.push(&bytes));
 
         // SSE frames are separated by a blank line.
         while let Some(idx) = buf.find("\n\n") {
@@ -494,7 +510,13 @@ async fn stream_openai(
     if crate::cancel::is_requested(request_id) {
         return Err(crate::cancel::STOPPED.to_string());
     }
-    let res = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+    // Stop interrupts the send immediately instead of waiting for the wire.
+    let res = tokio::select! {
+        r = req.send() => r.map_err(|e| format!("request failed: {e}"))?,
+        _ = crate::cancel::cancel_signal(request_id) => {
+            return Err(crate::cancel::STOPPED.to_string());
+        }
+    };
     let status = res.status();
     if !status.is_success() {
         let detail = res.text().await.unwrap_or_default();
@@ -506,15 +528,25 @@ async fn stream_openai(
     }
 
     let mut stream = res.bytes_stream();
+    // Incremental UTF-8: a chunk boundary must not split a multi-byte char
+    // (Cyrillic/emoji in streamed answers must arrive intact).
+    let mut decoder = crate::utf8stream::StreamDecoder::new();
     let mut buf = String::new();
 
-    while let Some(chunk) = stream.next().await {
-        // The Stop button aborts the stream; the UI keeps the partial text.
-        if crate::cancel::is_requested(request_id) {
-            return Err(crate::cancel::STOPPED.to_string());
-        }
+    loop {
+        // The Stop button aborts IMMEDIATELY — the cancel signal races the
+        // next chunk instead of waiting for the provider to emit one.
+        let chunk = tokio::select! {
+            c = stream.next() => match c {
+                Some(c) => c,
+                None => break,
+            },
+            _ = crate::cancel::cancel_signal(request_id) => {
+                return Err(crate::cancel::STOPPED.to_string());
+            }
+        };
         let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
+        buf.push_str(&decoder.push(&bytes));
 
         while let Some(idx) = buf.find('\n') {
             let line = buf[..idx].trim().to_string();
@@ -690,7 +722,13 @@ async fn stream_anthropic(
     if crate::cancel::is_requested(request_id) {
         return Err(crate::cancel::STOPPED.to_string());
     }
-    let res = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+    // Stop interrupts the send immediately instead of waiting for the wire.
+    let res = tokio::select! {
+        r = req.send() => r.map_err(|e| format!("request failed: {e}"))?,
+        _ = crate::cancel::cancel_signal(request_id) => {
+            return Err(crate::cancel::STOPPED.to_string());
+        }
+    };
     let status = res.status();
     if !status.is_success() {
         let detail = res.text().await.unwrap_or_default();
@@ -698,15 +736,25 @@ async fn stream_anthropic(
     }
 
     let mut stream = res.bytes_stream();
+    // Incremental UTF-8: a chunk boundary must not split a multi-byte char
+    // (Cyrillic/emoji in streamed answers must arrive intact).
+    let mut decoder = crate::utf8stream::StreamDecoder::new();
     let mut buf = String::new();
 
-    while let Some(chunk) = stream.next().await {
-        // The Stop button aborts the stream; the UI keeps the partial text.
-        if crate::cancel::is_requested(request_id) {
-            return Err(crate::cancel::STOPPED.to_string());
-        }
+    loop {
+        // The Stop button aborts IMMEDIATELY — the cancel signal races the
+        // next chunk instead of waiting for the provider to emit one.
+        let chunk = tokio::select! {
+            c = stream.next() => match c {
+                Some(c) => c,
+                None => break,
+            },
+            _ = crate::cancel::cancel_signal(request_id) => {
+                return Err(crate::cancel::STOPPED.to_string());
+            }
+        };
         let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
+        buf.push_str(&decoder.push(&bytes));
 
         while let Some(idx) = buf.find('\n') {
             let line = buf[..idx].trim().to_string();
@@ -810,7 +858,15 @@ async fn stream_responses(
         req = req.bearer_auth(provider.api_key.trim());
     }
 
-    let res = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+    // Provider limits (RPM/concurrency) — same budget as the other protocols.
+    let _permit = acquire_permit(provider, request_id).await;
+    // Stop interrupts the send immediately instead of waiting for the wire.
+    let res = tokio::select! {
+        r = req.send() => r.map_err(|e| format!("request failed: {e}"))?,
+        _ = crate::cancel::cancel_signal(request_id) => {
+            return Err(crate::cancel::STOPPED.to_string());
+        }
+    };
     let status = res.status();
     if !status.is_success() {
         let detail = res.text().await.unwrap_or_default();
@@ -818,15 +874,25 @@ async fn stream_responses(
     }
 
     let mut stream = res.bytes_stream();
+    // Incremental UTF-8: a chunk boundary must not split a multi-byte char
+    // (Cyrillic/emoji in streamed answers must arrive intact).
+    let mut decoder = crate::utf8stream::StreamDecoder::new();
     let mut buf = String::new();
 
-    while let Some(chunk) = stream.next().await {
-        // The Stop button aborts the stream; the UI keeps the partial text.
-        if crate::cancel::is_requested(request_id) {
-            return Err(crate::cancel::STOPPED.to_string());
-        }
+    loop {
+        // The Stop button aborts IMMEDIATELY — the cancel signal races the
+        // next chunk instead of waiting for the provider to emit one.
+        let chunk = tokio::select! {
+            c = stream.next() => match c {
+                Some(c) => c,
+                None => break,
+            },
+            _ = crate::cancel::cancel_signal(request_id) => {
+                return Err(crate::cancel::STOPPED.to_string());
+            }
+        };
         let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
+        buf.push_str(&decoder.push(&bytes));
 
         while let Some(idx) = buf.find('\n') {
             let line = buf[..idx].trim().to_string();

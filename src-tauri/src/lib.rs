@@ -13,6 +13,7 @@ mod stt;
 mod vault;
 mod tools;
 mod tray;
+mod utf8stream;
 
 use tauri::Manager;
 
@@ -253,6 +254,20 @@ fn agent_confirm(run_id: String, approve: bool) {
 fn stop_generation(run_id: String) {
     cancel::request(&run_id);
 }
+/// Live state of a run for WebView re-attach: after a page reload the frontend
+/// lost every event emitted before it — this returns the buffered transcript
+/// of a STILL-RUNNING run so the chat can rebuild and keep listening.
+#[tauri::command]
+fn agent_snapshot(run_id: String) -> Option<Vec<runs::RunEvent>> {
+    runs::events(&run_id)
+}
+
+/// All currently live run ids — the frontend polls this once on boot to find
+/// runs that survived a reload.
+#[tauri::command]
+fn agent_live_runs() -> Vec<String> {
+    runs::snapshot().into_iter().map(|r| r.run_id).collect()
+}
 
 /* ---------- Dictation (fully local) ---------- */
 
@@ -367,6 +382,8 @@ pub fn run() {
             discovery::list_provider_models,
             agent_run,
             agent_confirm,
+            agent_snapshot,
+            agent_live_runs,
             stop_generation,
             transcribe_audio,
             tray::tray_state,

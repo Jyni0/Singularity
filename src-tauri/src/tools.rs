@@ -113,9 +113,19 @@ pub fn read_file(root: &Path, path: &str, start_line: Option<usize>, end_line: O
             bytes.len()
         ));
     }
+    // Legacy files (Windows-1251 and friends) are decoded instead of rejected:
+    // a Russian-locale codebase often carries cp1251 sources, and refusing to
+    // read them at all was the "не видит кириллицу" complaint for files.
     let text = match String::from_utf8(bytes) {
         Ok(t) => t,
-        Err(_) => return ToolResult::err(format!("{path} is not valid UTF-8 text")),
+        Err(e) => {
+            let bytes = e.into_bytes();
+            let (cow, _, had_errors) = encoding_rs::WINDOWS_1251.decode(&bytes);
+            if had_errors {
+                return ToolResult::err(format!("{path} is not valid UTF-8 text"));
+            }
+            cow.into_owned()
+        }
     };
 
     let lines: Vec<&str> = text.lines().collect();
@@ -496,8 +506,11 @@ pub fn run_command(root: &Path, command: &str, cwd: Option<&str>, timeout_secs: 
         use std::os::windows::process::CommandExt;
         // CREATE_NO_WINDOW keeps a console window from flashing on every call.
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // Force UTF-8 console output (chcp 65001) — without it cmd prints in
+        // the OEM codepage (cp866) and Cyrillic reaches the model as mojibake.
+        let utf8_command = format!("chcp 65001>nul & {command}");
         Command::new("cmd")
-            .args(["/C", command])
+            .args(["/C", utf8_command.as_str()])
             .current_dir(&workdir)
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::piped())
@@ -543,9 +556,8 @@ pub fn run_command(root: &Path, command: &str, cwd: Option<&str>, timeout_secs: 
         Err(e) => return ToolResult::err(format!("cannot collect output: {e}")),
     };
 
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut text = decode_console(&output.stdout);
+    let stderr = decode_console(&output.stderr);
     if !stderr.trim().is_empty() {
         if !text.is_empty() {
             text.push('\n');
@@ -555,9 +567,20 @@ pub fn run_command(root: &Path, command: &str, cwd: Option<&str>, timeout_secs: 
     }
 
     // Truncate from the middle so both the start and the end stay visible.
+    // Slice on CHAR boundaries — byte slicing here panicked on any Cyrillic
+    // output ("byte index is not a char boundary").
     if text.len() > MAX_OUTPUT_BYTES {
-        let head = &text[..MAX_OUTPUT_BYTES / 2];
-        let tail = &text[text.len() - MAX_OUTPUT_BYTES / 2..];
+        fn cut(s: &str, at: usize) -> usize {
+            let mut i = at.min(s.len());
+            while i > 0 && !s.is_char_boundary(i) {
+                i -= 1;
+            }
+            i
+        }
+        let head_end = cut(&text, MAX_OUTPUT_BYTES / 2);
+        let tail_start = cut(&text, text.len().saturating_sub(MAX_OUTPUT_BYTES / 2));
+        let head = &text[..head_end];
+        let tail = &text[tail_start..];
         text = format!("{head}\n\n… output truncated …\n\n{tail}");
     }
     if text.trim().is_empty() {
@@ -572,6 +595,26 @@ pub fn run_command(root: &Path, command: &str, cwd: Option<&str>, timeout_secs: 
     } else {
         ToolResult::err(body)
     }
+}
+
+/// Decodes command output the way the user's console actually wrote it.
+///
+/// Windows cmd.exe emits the OEM codepage (cp866 on a Russian system, cp850
+/// on Western ones) — decoding it as UTF-8 mangles every Cyrillic letter.
+/// Strategy: strict UTF-8 first (cross-platform tools, modern builds); if that
+/// fails, fall back to the system ANSI codepage via encoding_rs (which maps
+/// cp866/cp1251 correctly for the Russian locale).
+pub fn decode_console(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    // Not UTF-8: on a Russian Windows the OEM page is cp866 — decode that.
+    // (run_command also forces "chcp 65001" so this path is rare.)
+    let (cow, _, had_errors) = encoding_rs::IBM866.decode(bytes);
+    if !had_errors {
+        return cow.into_owned();
+    }
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /* ---------- Dispatch ---------- */

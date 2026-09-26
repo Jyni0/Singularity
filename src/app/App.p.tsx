@@ -10,7 +10,7 @@ import { useBlockContextMenu } from "../hooks/useBlockContextMenu.h";
 import { ScrollArea } from "../ui/ScrollArea.c";
 import { AuroraGlow } from "../ui/AuroraGlow.c";
 
-import type { Msg, PanelState, PanelTabSpec } from "../chat/message.i";
+import type { Msg, PanelState, PanelTabSpec, Segment } from "../chat/message.i";
 import { storedToMsg, fileLabel, toolLabel } from "../chat/message.u";
 import { ChatMessage } from "../chat/ChatMessage.c";
 import { PromptBox } from "../chat/PromptBox.c";
@@ -473,8 +473,19 @@ export default function App() {
       const conv = first?.conversations[0];
       if (first && conv) {
         setActiveConv({ project: first.name, id: conv.id });
+        // A run that was live across the reload owns this conversation's
+        // buffer — the re-attach effect loads the stored rows AND appends the
+        // streaming draft; overwriting here would wipe the draft mid-stream.
+        const reattaching = (() => {
+          try {
+            const m = JSON.parse(localStorage.getItem("dsh:live-run") ?? "null");
+            return m?.convId === conv.id;
+          } catch {
+            return false;
+          }
+        })();
         const stored = await db.loadMessages(conv.id);
-        if (!cancelled && stored.length) {
+        if (!cancelled && stored.length && !reattaching) {
           setConvMsgs((prev) => ({
             ...prev,
             [conv.id]: stored.map(storedToMsg),
@@ -485,6 +496,220 @@ export default function App() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+
+  /* ---------- Reload re-attach ----------
+     Agent runs live in Rust and keep streaming when the WebView reloads, but
+     every event emitted BEFORE the reload used to be lost — the chat came back
+     empty while the run kept working ("если обновить страницу, всё пропадает").
+     runs.rs now buffers each run's output; on boot we find the run that was
+     live (localStorage marker), replay its buffer into the conversation and
+     keep listening until it finishes, then persist the turn like a normal run. */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const marker = localStorage.getItem("dsh:live-run");
+      if (!marker) return;
+      let runId = "";
+      let convId = "";
+      try {
+        const parsed = JSON.parse(marker) as { runId?: string; convId?: string };
+        runId = parsed.runId ?? "";
+        convId = parsed.convId ?? "";
+      } catch {
+        localStorage.removeItem("dsh:live-run");
+        return;
+      }
+      if (!runId || !convId) return;
+      const live = await db.liveRuns();
+      const snapshot = await db.agentSnapshot(runId);
+      if (cancelled) return;
+      // Not live and nothing buffered — the run finished long ago (or never
+      // existed after an app restart). Drop the marker and move on.
+      if (!live.includes(runId) && snapshot.length === 0) {
+        localStorage.removeItem("dsh:live-run");
+        return;
+      }
+
+      // Rebuild the conversation buffer from the DB, then append the draft
+      // agent turn the live events will stream into.
+      const stored = await db.loadMessages(convId);
+      if (cancelled) return;
+      setConvMsgs((prev) => ({
+        ...prev,
+        [convId]: [...stored.map(storedToMsg), { role: "agent", text: "", segments: [] }],
+      }));
+      setActiveRuns((prev) => ({ ...prev, [convId]: runId }));
+      setRunPhase((prev) => ({ ...prev, [convId]: "thinking" }));
+
+      /** Everything this session has seen. apply() pushes here — both the
+       *  replayed buffer events and every live event afterwards — so
+       *  finish() folds the COMPLETE transcript, not just what existed at
+       *  reload time. (Do NOT prefill with the snapshot: the replay loop
+       *  below feeds those same events through apply, which would double
+       *  every delta in the persisted text.) */
+      const collected: db.RunEvent[] = [];
+
+      /** Replay/append one buffered or live event into the draft turn. */
+      const apply = (ev: db.RunEvent) => {
+        collected.push(ev);
+        if (ev.kind === "Text") setRunPhase((pp) => ({ ...pp, [convId]: "streaming" }));
+        setConvMsgs((prev) => {
+          const msgs = prev[convId];
+          if (!msgs || !msgs.length) return prev;
+          const next = [...msgs];
+          const last = { ...next[next.length - 1] };
+          if (last.role !== "agent") return prev;
+          const segs = [...(last.segments ?? [])];
+          if (ev.kind === "Text") {
+            const tail = segs[segs.length - 1];
+            if (tail && tail.kind === "text") {
+              segs[segs.length - 1] = { kind: "text", text: tail.text + ev.delta };
+            } else {
+              segs.push({ kind: "text", text: ev.delta });
+            }
+            last.text += ev.delta;
+          } else if (ev.kind === "Think") {
+            const tail = segs[segs.length - 1];
+            if (tail && tail.kind === "think") {
+              segs[segs.length - 1] = { kind: "think", text: tail.text + ev.delta };
+            } else {
+              segs.push({ kind: "think", text: ev.delta });
+            }
+          } else if (ev.kind === "Step") {
+            const step: db.AgentStepEvent = {
+              name: ev.name,
+              input: ev.input,
+              result: ev.result,
+              ok: ev.ok,
+              index: ev.index,
+              done: ev.done,
+              path: ev.path,
+              old_text: ev.old_text,
+              new_text: ev.new_text,
+            };
+            const at = segs.findIndex((s) => s.kind === "step" && s.step.index === step.index);
+            if (at >= 0) segs[at] = { kind: "step", step };
+            else segs.push({ kind: "step", step });
+          } else if (ev.kind === "Tasks") {
+            const at = segs.findIndex((s) => s.kind === "tasks");
+            if (at >= 0) segs[at] = { kind: "tasks", tasks: ev.tasks };
+            else segs.push({ kind: "tasks", tasks: ev.tasks });
+          } else if (ev.kind === "Confirm") {
+            // A reload landed while a command waited for permission — show the
+            // Allow/Deny banner again instead of hanging forever.
+            setConfirmReqs((prev) => ({
+              ...prev,
+              [runId]: { run_id: runId, command: ev.command, cwd: ev.cwd },
+            }));
+          }
+          last.segments = segs;
+          next[next.length - 1] = last;
+          return { ...prev, [convId]: next };
+        });
+      };
+
+      // 1) Replay everything buffered so far.
+      for (const ev of snapshot) {
+        if (ev.kind === "Done" || ev.kind === "Error") continue; // handled below
+        apply(ev);
+      }
+
+      const terminal = [...snapshot].reverse().find((e) => e.kind === "Done" || e.kind === "Error");
+
+      /** Fold buffered events into the final text + segments (think blocks
+       *  are ephemeral — never persisted, same contract as a normal run). */
+      const foldSnapshot = () => {
+        let text = "";
+        const segs: Segment[] = [];
+        for (const ev of collected) {
+          if (ev.kind === "Text") {
+            text += ev.delta;
+            const tail = segs[segs.length - 1];
+            if (tail && tail.kind === "text") tail.text += ev.delta;
+            else segs.push({ kind: "text", text: ev.delta });
+          } else if (ev.kind === "Step") {
+            segs.push({
+              kind: "step",
+              step: {
+                name: ev.name, input: ev.input, result: ev.result, ok: ev.ok,
+                index: ev.index, done: true, path: ev.path,
+                old_text: ev.old_text, new_text: ev.new_text,
+              },
+            });
+          } else if (ev.kind === "Tasks") {
+            const at = segs.findIndex((s) => s.kind === "tasks");
+            if (at >= 0) segs[at] = { kind: "tasks", tasks: ev.tasks };
+            else segs.push({ kind: "tasks", tasks: ev.tasks });
+          }
+        }
+        return { text, segs };
+      };
+
+      const finish = async (answer: string, failed: boolean) => {
+        localStorage.removeItem("dsh:live-run");
+        setActiveRuns((prev) => {
+          const n = { ...prev };
+          delete n[convId];
+          return n;
+        });
+        setRunPhase((prev) => {
+          const n = { ...prev };
+          delete n[convId];
+          return n;
+        });
+        // Persist the re-attached turn exactly like a normal run would have.
+        // Derive it from the BUFFER (not the React state): when the run ended
+        // during the reload, the state may not have flushed yet.
+        const folded = foldSnapshot();
+        const text = answer || folded.text;
+        const segments = folded.segs;
+        if (text.trim() || segments.some((s) => s.kind === "step")) {
+          await db.appendMessage(convId, "agent", text, {
+            segmentsJson: segments.length ? JSON.stringify(segments) : undefined,
+          });
+        }
+        setConvMsgs((prev) => {
+          const cur = prev[convId] ?? [];
+          if (!cur.length) return prev;
+          const next = [...cur];
+          next[next.length - 1] = { role: "agent", text, segments };
+          if (failed) {
+            next.push({ role: "agent", text: "⚠️ The run failed while the page was reloading." });
+          }
+          return { ...prev, [convId]: next };
+        });
+      };
+
+      if (terminal) {
+        // Finished during the reload — replay already showed the work; just
+        // finalise and persist.
+        await finish(terminal.kind === "Done" ? terminal.answer : "", terminal.kind === "Error");
+        return;
+      }
+      if (!live.includes(runId)) {
+        // No terminal event but not live either: the app itself restarted and
+        // the buffer is all that is left. Persist what we replayed.
+        await finish("", false);
+        return;
+      }
+
+      // 2) Still running — keep listening; deltas stream in live from here.
+      const answer = await db.resumeAgent(runId, {
+        onText: (d) => apply({ kind: "Text", delta: d }),
+        onStep: (s) => apply({ kind: "Step", index: s.index, name: s.name, input: s.input, done: s.done, ok: s.ok, result: s.result, path: s.path, old_text: s.old_text, new_text: s.new_text }),
+        onThink: (d) => apply({ kind: "Think", delta: d }),
+        onTasks: (t) => apply({ kind: "Tasks", tasks: t }),
+        onConfirm: (req) => setConfirmReqs((prev) => ({ ...prev, [req.run_id]: req })),
+      });
+      if (cancelled) return;
+      await finish(answer, false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -877,6 +1102,11 @@ export default function App() {
     // whatever the user is looking at while the run streams.
     const requestId = `req-${Date.now()}`;
     const startedAt = Date.now();
+    // Reload re-attach: remember which conversation this run streams into.
+    // Rust buffers every event (runs.rs), so after a page reload the boot
+    // effect replays the buffer and keeps listening — live output is no
+    // longer lost when the WebView refreshes mid-run.
+    localStorage.setItem("dsh:live-run", JSON.stringify({ runId: requestId, convId }));
     updateConvMsgs(convId, (prev) => [...prev, { role: "agent", text: "", segments: [] }]);
     setActiveRuns((prev) => ({ ...prev, [convId]: requestId }));
     // The run starts out "thinking"; the first prose delta flips it to
@@ -1133,6 +1363,7 @@ export default function App() {
         return next;
       });
     } finally {
+      localStorage.removeItem("dsh:live-run");
       setActiveRuns((prev) => {
         const next = { ...prev };
         delete next[convId];

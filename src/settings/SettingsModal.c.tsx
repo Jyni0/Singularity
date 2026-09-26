@@ -1,7 +1,6 @@
 import { useState, useEffect } from "react";
 import { motion } from "motion/react";
 import { Folder, Settings as SettingsIcon, Trash2, X } from "lucide-react";
-import * as db from "../core/db.r";
 import type { Model, Project, Provider, Theme, PermMode } from "../core/types.i";
 import { APP_VERSION, NO_PROJECT, THEME_LIST } from "../core/types.i";
 import { Combobox } from "../ui/Combobox.c";
@@ -10,14 +9,12 @@ import { ScrollArea, ScrollBox } from "../ui/ScrollArea.c";
 import { ModelsSettings } from "./ModelsSettings.c";
 import { TerminalSettings } from "./TerminalSettings.c";
 import { ProjectSelect, ProjectSettingsPanel } from "./ProjectSettings.c";
-import { Segmented, SettingRow, SettingsCard, Sep } from "./SettingsParts.c";
+import { SettingRow, SettingsCard, Sep } from "./SettingsParts.c";
 import { Switch } from "../ui/Switch.c";
 
 export type SettingsSection =
   | "general"
-  | "execution"
   | "permissions"
-  | "behavior"
   | "projects"
   | "project-settings"
   | "models"
@@ -85,44 +82,9 @@ export function SettingsModal({
   const sshSections: SettingsSection[] = ["general", "terminal", "about"];
   const effectiveSection = mode === "ssh" && !sshSections.includes(section) ? "general" : section;
   const [settingsProject, setSettingsProject] = useState<string | null>(initialProject ?? null);
-  const [sendMode, setSendMode] = useState("Queue");
-  const [turboMode, setTurboMode] = useState("Turbo Mode");
-  const [reviewPolicy, setReviewPolicy] = useState("Always Ask");
-  const [autonomy, setAutonomy] = useState("Medium");
-  const [stopOnError, setStopOnError] = useState(true);
-  const [fsAccess, setFsAccess] = useState("workspace");
   const [name, setName] = useState("");
   /** Inline delete confirmation in the Manage Projects list. */
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
-
-  /** Every settings value is persisted to SQLite on edit and restored on open,
-   * so nothing the user configures here is lost between launches. */
-  const persistSetting = (key: string, value: string) => {
-    void db.setSetting(key, value);
-  };
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const entries = await Promise.all([
-        db.getSetting("send_mode"),
-        db.getSetting("turbo_mode"),
-        db.getSetting("review_policy"),
-        db.getSetting("autonomy"),
-        db.getSetting("stop_on_error"),
-        db.getSetting("fs_access"),
-      ]);
-      if (cancelled) return;
-      if (entries[0]) setSendMode(entries[0]);
-      if (entries[1]) setTurboMode(entries[1]);
-      if (entries[2]) setReviewPolicy(entries[2]);
-      if (entries[3]) setAutonomy(entries[3]);
-      if (entries[4] !== null) setStopOnError(entries[4] === "1");
-      if (entries[5]) setFsAccess(entries[5]);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -147,8 +109,6 @@ export function SettingsModal({
       ? [
           { id: "general", label: "General" },
           { id: "models", label: "Models" },
-          { id: "execution", label: "Execution" },
-          { id: "behavior", label: "Agent Behavior" },
         ]
       : [
           { id: "general", label: "General" },
@@ -174,8 +134,6 @@ export function SettingsModal({
   const titles: Record<SettingsSection, [string, string]> = {
     general: ["General", "Appearance, theme and workspace defaults"],
     models: ["Models", "Connect providers and manage the models they expose"],
-    execution: ["Execution", "How agent tasks are queued and run"],
-    behavior: ["Agent Behavior", "Autonomy, safety and review policies"],
     permissions: ["Global Permissions", "Tool and filesystem access rules"],
     projects: ["Manage Projects", "Create and organize project folders"],
     "project-settings": ["Project Settings", "Rename, permissions and delete for one project"],
@@ -263,20 +221,9 @@ export function SettingsModal({
                   />
                 </div>
               </SettingRow>
-              {/* Send Behavior is an agent-chat setting — agent mode only. */}
+              {/* Debug Mode is an agent-chat setting — agent mode only. */}
               {mode === "agent" && (
                 <>
-                  <Sep />
-                  <SettingRow title="Send Behavior" hint="How submitted prompts are handled">
-                    <Segmented
-                      options={["Queue", "Send Immediately"]}
-                      value={sendMode}
-                      onChange={(v) => {
-                        setSendMode(v);
-                        persistSetting("send_mode", v);
-                      }}
-                    />
-                  </SettingRow>
                   <Sep />
                   <SettingRow
                     title="Debug Mode"
@@ -305,74 +252,6 @@ export function SettingsModal({
 
           {effectiveSection === "terminal" && <TerminalSettings />}
 
-          {effectiveSection === "execution" && (
-            <SettingsCard>
-              <SettingRow title="Run Mode" hint="Auto-pilot vs supervised execution">
-                <div className="w-[240px]">
-                  <Combobox
-                    searchable={false}
-                    value={turboMode}
-                    onChange={(v) => {
-                      setTurboMode(v);
-                      persistSetting("turbo_mode", v);
-                    }}
-                    options={[
-                      { value: "Turbo Mode", label: "Turbo Mode" },
-                      { value: "Safe Mode", label: "Safe Mode" },
-                    ]}
-                  />
-                </div>
-              </SettingRow>
-              <Sep />
-              <SettingRow title="Artifact Review Policy" hint="When diffs require human approval">
-                <div className="w-[240px]">
-                  <Combobox
-                    searchable={false}
-                    value={reviewPolicy}
-                    onChange={(v) => {
-                      setReviewPolicy(v);
-                      persistSetting("review_policy", v);
-                    }}
-                    options={[
-                      { value: "Always Ask", label: "Always Ask" },
-                      { value: "Auto-accept", label: "Auto-accept" },
-                      { value: "Reject by default", label: "Reject by default" },
-                    ]}
-                  />
-                </div>
-              </SettingRow>
-              <Sep />
-              <SettingRow title="Workspace" hint="Root folder opened for agents">
-                <button className={SBUTTON}>Open</button>
-              </SettingRow>
-            </SettingsCard>
-          )}
-
-          {effectiveSection === "behavior" && (
-            <SettingsCard>
-              <SettingRow title="Autonomy Level" hint="How much freedom agents get">
-                <Segmented
-                  options={["Low", "Medium", "High"]}
-                  value={autonomy}
-                  onChange={(v) => {
-                    setAutonomy(v);
-                    persistSetting("autonomy", v);
-                  }}
-                />
-              </SettingRow>
-              <Sep />
-              <SettingRow title="Stop on Error" hint="Halt the pipeline when a step fails">
-                <Switch
-                  on={stopOnError}
-                  onChange={(next) => {
-                    setStopOnError(next);
-                    persistSetting("stop_on_error", next ? "1" : "0");
-                  }}
-                />
-              </SettingRow>
-            </SettingsCard>
-          )}
-
           {effectiveSection === "permissions" && (
             <SettingsCard>
               <SettingRow
@@ -384,24 +263,6 @@ export function SettingsModal({
                   onChange={onGlobalAutoRun}
                   ariaLabel="toggle global auto-run"
                 />
-              </SettingRow>
-              <Sep />
-              <SettingRow title="Filesystem Access" hint="Scope of writable paths">
-                <div className="w-[240px]">
-                  <Combobox
-                    searchable={false}
-                    value={fsAccess}
-                    onChange={(v) => {
-                      setFsAccess(v);
-                      persistSetting("fs_access", v);
-                    }}
-                    options={[
-                      { value: "workspace", label: "Workspace only" },
-                      { value: "full", label: "Full access" },
-                      { value: "none", label: "Read-only" },
-                    ]}
-                  />
-                </div>
               </SettingRow>
             </SettingsCard>
           )}

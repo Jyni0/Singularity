@@ -67,6 +67,7 @@ export function toolLabel(step: db.AgentStepEvent): string {
     write_file: "Write",
     edit_file: "Edit",
     apply_patch: "Patch",
+    plan: "Plan",
     list_dir: "List",
     grep: "Search",
     run_command: "Run",

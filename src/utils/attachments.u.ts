@@ -7,10 +7,13 @@
  */
 import type { Attachment } from "../core/types.i";
 
-/** Refuse anything larger than this — it would blow up the request. */
-export const MAX_BYTES = 8 * 1024 * 1024;
-/** Text files are inlined whole, so keep them modest. */
-export const MAX_TEXT_BYTES = 300 * 1024;
+/**
+ * No client-side size cap — the user decides what to attach. The provider is
+ * the one that ultimately rejects an oversized payload (an HTTP error the
+ * chat surfaces normally). Constants stay exported for old references.
+ */
+export const MAX_BYTES = Number.POSITIVE_INFINITY;
+export const MAX_TEXT_BYTES = Number.POSITIVE_INFINITY;
 
 export const TEXT_EXTENSIONS = new Set([
   "txt", "md", "markdown", "json", "yaml", "yml", "toml", "ini", "cfg", "env",
@@ -53,11 +56,6 @@ export async function toAttachments(
   const rejected: string[] = [];
 
   for (const file of files) {
-    if (file.size > MAX_BYTES) {
-      rejected.push(`${file.name} is larger than 8 MB`);
-      continue;
-    }
-
     const isImage = file.type.startsWith("image/");
     const isText = file.type.startsWith("text/") || TEXT_EXTENSIONS.has(extension(file.name));
 
@@ -72,10 +70,6 @@ export async function toAttachments(
           size: file.size,
         });
       } else if (isText) {
-        if (file.size > MAX_TEXT_BYTES) {
-          rejected.push(`${file.name} is too large to inline (300 KB limit)`);
-          continue;
-        }
         attachments.push({
           id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           name: file.name,

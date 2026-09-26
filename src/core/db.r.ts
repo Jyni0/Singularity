@@ -1258,6 +1258,139 @@ export async function runAgent(
   }
 }
 
+/* ---------- Reload re-attach ----------
+   Agent runs live in Rust and keep going when the WebView reloads, but every
+   event emitted before the reload was lost — the user saw an empty chat even
+   though work was streaming. runs.rs now buffers each run's output; on boot
+   the frontend asks which runs are still live, replays their buffers and
+   keeps listening until done. */
+
+/** One buffered event of a live run (mirror of Rust runs::RunEvent). */
+export type RunEvent =
+  | { kind: "Text"; delta: string }
+  | { kind: "Think"; delta: string }
+  | {
+      kind: "Step";
+      index: number;
+      name: string;
+      input: string;
+      done: boolean;
+      ok: boolean;
+      result: string;
+      path?: string;
+      old_text?: string;
+      new_text?: string;
+    }
+  | { kind: "Tasks"; tasks: TaskState[] }
+  /** A command waiting for Allow/Deny — re-shown after a reload. */
+  | { kind: "Confirm"; command: string; cwd: string }
+  /** Terminal markers, present only in a finished run's buffer. */
+  | { kind: "Done"; answer: string }
+  | { kind: "Error"; message: string };
+
+/** Run ids still executing in Rust (they survive a WebView reload). */
+export async function liveRuns(): Promise<string[]> {
+  if (!inTauri) return [];
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke<string[]>("agent_live_runs");
+  } catch {
+    return [];
+  }
+}
+
+/** Buffered transcript of a live run — replay it to rebuild the chat. */
+export async function agentSnapshot(runId: string): Promise<RunEvent[]> {
+  if (!inTauri) return [];
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return (await invoke<RunEvent[] | null>("agent_snapshot", { runId })) ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Re-attaches to a run that is STILL executing in Rust after a reload.
+ * Unlike runAgent it never invokes agent_run — the run already exists; this
+ * just listens to its events and resolves with the final answer.
+ */
+export function resumeAgent(
+  runId: string,
+  handlers: {
+    onText: (delta: string) => void;
+    onStep: (step: AgentStepEvent) => void;
+    onThink?: (delta: string) => void;
+    onTasks?: (tasks: TaskState[]) => void;
+    /** The re-attached run may ask for command permission — without this the
+     *  run would hang forever waiting for an Allow/Deny nobody can see. */
+    onConfirm?: (req: ConfirmRequest) => void;
+  }
+): Promise<string> {
+  if (!inTauri) return Promise.resolve("");
+  return new Promise<string>((resolve) => {
+    let full = "";
+    let settled = false;
+    const offs: Array<() => void> = [];
+    const stop = (answer: string) => {
+      if (settled) return;
+      settled = true;
+      offs.forEach((off) => off());
+      resolve(answer || full);
+    };
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      offs.push(
+        await listen<{ run_id: string; delta: string }>("agent://text", (e) => {
+          if (e.payload.run_id !== runId) return;
+          full += e.payload.delta;
+          handlers.onText(e.payload.delta);
+        })
+      );
+      offs.push(
+        await listen<AgentStepEvent & { run_id: string }>("agent://step", (e) => {
+          if (e.payload.run_id !== runId) return;
+          handlers.onStep(e.payload);
+        })
+      );
+      offs.push(
+        await listen<{ run_id: string; delta: string }>("agent://think", (e) => {
+          if (e.payload.run_id !== runId) return;
+          handlers.onThink?.(e.payload.delta);
+        })
+      );
+      offs.push(
+        await listen<{ run_id: string; tasks: TaskState[] }>("agent://tasks", (e) => {
+          if (e.payload.run_id !== runId) return;
+          handlers.onTasks?.(e.payload.tasks);
+        })
+      );
+      offs.push(
+        await listen<ConfirmRequest>("agent://confirm", (e) => {
+          if (e.payload.run_id !== runId) return;
+          handlers.onConfirm?.(e.payload);
+        })
+      );
+      offs.push(
+        await listen<{ run_id: string; answer: string }>("agent://done", (e) => {
+          if (e.payload.run_id !== runId) return;
+          stop(e.payload.answer);
+        })
+      );
+      offs.push(
+        await listen<{ run_id: string; message: string }>("agent://error", (e) => {
+          if (e.payload.run_id !== runId) return;
+          stop("");
+        })
+      );
+      // The run may have finished BETWEEN the snapshot call and these
+      // listeners — check once more so we never hang forever.
+      const still = await liveRuns();
+      if (!still.includes(runId)) stop("");
+    })();
+  });
+}
+
 /** Sends the user's Allow/Deny decision for a pending command back to Rust. */
 export async function confirmCommand(runId: string, approve: boolean): Promise<void> {
   if (!inTauri) return;

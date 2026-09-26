@@ -5225,6 +5225,7 @@ version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
+ "encoding_rs",
  "futures-util",
  "keyring",
  "rand 0.8.8",

@@ -28,6 +28,18 @@ pub fn is_requested(run_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolves the moment run_id is cancelled. Use with tokio::select! so a
+/// blocking await (HTTP send, JSON read, a silent SSE stream) is interrupted
+/// IMMEDIATELY when the user presses Stop — not at the next chunk boundary.
+pub async fn cancel_signal(run_id: &str) {
+    loop {
+        if is_requested(run_id) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    }
+}
+
 /// Forgets the flag once a run has finished, so ids never accumulate.
 pub fn clear(run_id: &str) {
     if let Some(s) = CANCELLED.lock().unwrap().as_mut() {

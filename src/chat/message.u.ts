@@ -16,6 +16,23 @@ export function collectSteps(msgs: Msg[]): db.AgentStepEvent[] {
 }
 
 /** Turns a stored row back into a renderable message (duration + photos + steps). */
+/** A stored turn can hold statuses that only make sense live: steps the run
+ *  never finished (done=false) and tasks left "running" when the user stopped
+ *  the run. Freeze them on load so nothing animates forever. */
+function freezeStatus(segments: Segment[] | undefined): Segment[] | undefined {
+  if (!segments) return segments;
+  return segments.map((s) => {
+    if (s.kind === "step" && !s.step.done) return { kind: "step", step: { ...s.step, done: true } };
+    if (s.kind === "tasks") {
+      return {
+        kind: "tasks",
+        tasks: s.tasks.map((t) => (t.status === "running" ? { ...t, status: "pending" } : t)),
+      };
+    }
+    return s;
+  });
+}
+
 export function storedToMsg(m: db.StoredMessage): Msg {
   let images: db.StoredImage[] | undefined;
   if (m.images && m.images !== "[]") {
@@ -35,9 +52,7 @@ export function storedToMsg(m: db.StoredMessage): Msg {
     try {
       const parsed = JSON.parse(m.segments);
       if (Array.isArray(parsed) && parsed.length) {
-        segments = (parsed as Segment[]).map((s) =>
-          s.kind === "step" && !s.step.done ? { kind: "step", step: { ...s.step, done: true } } : s
-        );
+        segments = freezeStatus(parsed as Segment[]);
       }
     } catch {
       /* stored before segments existed — fall back to plain text */

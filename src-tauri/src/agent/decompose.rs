@@ -414,12 +414,14 @@ pub(super) async fn run_decomposed(
     let plan = match plan_subtasks(app, run_id, req, &user_prompt).await {
         Some(p) if !is_cancelled(run_id) => p,
         _ => {
-            // Simple request (or planning failed): normal single loop, no
-            // tokens wasted on ceremony.
+            // Simple request, or planning FAILED: either way the normal single
+            // loop runs. The planner card already stated which — a confident
+            // "Single-step request" under a red "Planner failed" card was the
+            // contradiction the user saw.
             if is_cancelled(run_id) {
                 return cancelled_result(String::new());
             }
-            emit_text(app, run_id, "Single-step request — running directly.\n\n");
+            emit_text(app, run_id, "Continuing as a single run.\n\n");
             return run_protocol(app, run_id, req, system, root, turns).await;
         }
     };

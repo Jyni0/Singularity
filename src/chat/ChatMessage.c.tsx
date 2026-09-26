@@ -99,7 +99,9 @@ function StepGroup({
                 input: s.step.input,
                 result: s.step.result,
                 ok: s.step.ok,
-                running: !s.step.done,
+                // A stopped/reloaded turn leaves steps at done=false forever —
+                // only a LIVE turn may show a spinner.
+                running: !!streaming && !s.step.done,
                 onInspect: () => onInspectStep?.(s.step),
               }}
             />
@@ -159,6 +161,26 @@ export function ChatMessage({
   /** Opens this photo as its own closeable tab in the side panel. */
   onInspectImage?: (image: db.StoredImage) => void;
 }) {
+  // When did this turn last visibly change? Drives the activity indicator:
+  // ANY new segment content counts, so the pulse disappears while tokens,
+  // reasoning or tool results are arriving and returns when the run goes
+  // quiet (thinking, a long request) — proof of life either way.
+  const lastChange = useRef(Date.now());
+  // Rough "has anything visible changed" fingerprint: prose length, tool
+  // result length, task progress and usage counters all count as activity.
+  const signature =
+    (segments?.length ?? 0) * 1_000_003 +
+    (text?.length ?? 0) +
+    (segments?.reduce((n, s) => {
+      if (s.kind === "text" || s.kind === "think") return n + s.text.length;
+      if (s.kind === "step") return n + (s.step.result?.length ?? 0) * 7 + (s.step.done ? 1 : 0) * 13;
+      if (s.kind === "tasks") return n + s.tasks.filter((t) => t.status === "done" || t.status === "error").length * 101;
+      if (s.kind === "usage") return n + (s.usage.completion_tokens ?? 0) * 3;
+      return n;
+    }, 0) ?? 0);
+  useEffect(() => {
+    lastChange.current = Date.now();
+  }, [signature, role]);
   if (role === "user") {
     return (
       <div className="flex flex-col items-end gap-1.5">
@@ -256,19 +278,10 @@ export function ChatMessage({
           }
           return null;
         })}
-        {/* Live run, nothing visibly growing at the tail (a tool spinner or
-            freshly streamed prose is its own progress) — show the pulse so
-            the screen is never "frozen" while the model thinks. */}
-        {streaming && (() => {
-          const last = segments[segments.length - 1];
-          const tailActive =
-            last?.kind === "text"
-              ? last.text.trim().length > 0
-              : last?.kind === "step"
-                ? !last.step.done
-                : false;
-          return tailActive ? null : <WorkingIndicator label="Working…" />;
-        })()}
+        {/* Live run, nothing changed for a moment — show the pulse with a
+            ticking timer so the screen is never "frozen" while the model
+            thinks or the provider is slow. */}
+        <LiveTail streaming={streaming} lastChange={lastChange} />
         {/* Generation time — shown at the END of the finished turn. */}
         <DurationFooter streaming={streaming} durationMs={durationMs} />
       </div>
@@ -290,6 +303,34 @@ export function ChatMessage({
   );
 }
 
+/**
+ * Live "the model is doing something" line. Driven by ACTIVITY — the time
+ * since the turn's segments last changed — not by "is the tail text
+ * non-empty". Static prose (a status line the agent already wrote) counted
+ * as progress, so a thinking model that had not emitted a token for two
+ * minutes showed nothing at all ("толи делает толи стоит на месте хз").
+ * The ticking elapsed figure is the proof of life.
+ */
+function LiveTail({
+  streaming,
+  lastChange,
+}: {
+  streaming?: boolean;
+  /** Ref, not a value: this component ticks on its own, so it must read the
+   *  latest change time rather than a snapshot from the last parent render. */
+  lastChange: { current: number };
+}) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!streaming) return;
+    const id = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [streaming]);
+  if (!streaming) return null;
+  const quietMs = Date.now() - lastChange.current;
+  if (quietMs < 2000) return null;
+  return <WorkingIndicator label={"Working… " + formatDuration(quietMs)} />;
+}
 /* ---------- Live activity indicator ---------- */
 
 /**

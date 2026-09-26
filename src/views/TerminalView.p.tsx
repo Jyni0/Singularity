@@ -264,11 +264,6 @@ export function TerminalView({
           error) — they never occupy layout space. */}
       {/* Detected-OS badge floats top-left (Rust probes it on connect).
           Logo only — no OS name text over the terminal. */}
-      {server.os && (
-        <div className="pointer-events-none absolute left-3 top-3 z-10 flex items-center rounded-full border border-[var(--border)] bg-[var(--bg-surface)]/80 p-1 shadow-[var(--shadow-popup)] backdrop-blur">
-          <OsLogo os={server.os} seed={server.id} name={server.name} size={16} />
-        </div>
-      )}
       {status === "connecting" && (
         <div className="pointer-events-none absolute left-1/2 top-3 z-10 flex -translate-x-1/2 items-center gap-2 rounded-full border border-[var(--border)] bg-[var(--bg-surface)]/95 px-3.5 py-1.5 text-[12px] text-[var(--text-muted)] shadow-[var(--shadow-popup)] backdrop-blur">
           <LoaderCircle size={12} className="animate-spin" />

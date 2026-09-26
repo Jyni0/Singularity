@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, ChevronDown, Search, X } from "lucide-react";
+import { OverlayScroll } from "./ScrollArea.c";
 
 /** One selectable entry. */
 export interface ComboboxOption {
@@ -170,7 +171,7 @@ export function Combobox({
               )}
             </div>
           )}
-          <div ref={listRef} tabIndex={-1} className="max-h-52 overflow-y-auto py-1 outline-none">
+          <OverlayScroll innerRef={listRef} tabIndex={-1} className="max-h-52 overflow-y-auto py-1">
             {filtered.length === 0 ? (
               <div className="px-3 py-2 text-[11.5px] text-[var(--text-dim)]">{emptyText}</div>
             ) : (
@@ -193,7 +194,7 @@ export function Combobox({
                 </button>
               ))
             )}
-          </div>
+          </OverlayScroll>
         </div>
       )}
     </div>

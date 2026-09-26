@@ -939,7 +939,8 @@ export async function streamChat(
   requestId: string,
   provider: ProviderConfig,
   turns: ChatTurn[],
-  onDelta: (delta: string) => void
+  onDelta: (delta: string) => void,
+  onUsage?: (u: RunUsage) => void
 ): Promise<string> {
   if (!inTauri) {
     throw new Error("Model calls need the desktop shell (npm run tauri:dev)");
@@ -948,11 +949,30 @@ export async function streamChat(
   const { listen } = await import("@tauri-apps/api/event");
 
   let full = "";
-  const unlisten = await listen<{ request_id: string; delta: string }>("chat://delta", (e) => {
-    if (e.payload.request_id !== requestId) return;
-    full += e.payload.delta;
-    onDelta(e.payload.delta);
-  });
+  // chat://usage reports prompt/completion/cached tokens. Anthropic and Gemini
+  // send it in two pieces (prompt first, completion later), so the caller
+  // accumulates instead of replacing.
+  const listeners = await Promise.all([
+    listen<{ request_id: string; delta: string }>("chat://delta", (e) => {
+      if (e.payload.request_id !== requestId) return;
+      full += e.payload.delta;
+      onDelta(e.payload.delta);
+    }),
+    listen<{
+      request_id: string;
+      prompt_tokens: number;
+      completion_tokens: number;
+      cached_tokens: number;
+    }>("chat://usage", (e) => {
+      if (e.payload.request_id !== requestId) return;
+      onUsage?.({
+        run_id: requestId,
+        prompt_tokens: e.payload.prompt_tokens,
+        completion_tokens: e.payload.completion_tokens,
+        cached_tokens: e.payload.cached_tokens,
+      });
+    }),
+  ]);
 
   try {
     await invoke("chat_stream", { requestId, provider, turns });
@@ -962,7 +982,7 @@ export async function streamChat(
     if (isStopError(e instanceof Error ? e.message : String(e))) return full;
     throw e;
   } finally {
-    unlisten();
+    listeners.forEach((off) => off());
   }
 }
 
@@ -1019,6 +1039,21 @@ export interface TaskState {
   title: string;
   status: "pending" | "running" | "done" | "error" | string;
   summary?: string;
+}
+
+/**
+ * Cumulative token accounting of one run (agent://usage / chat://usage) —
+ * what the Debug mode HUD shows: totals across every round of the run, with
+ * prompt-cache hits broken out.
+ */
+export interface RunUsage {
+  run_id: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  /** Prompt tokens served from the provider's cache. */
+  cached_tokens: number;
+  /** Wall time of the run so far, ms. */
+  elapsed_ms?: number;
 }
 
 export interface AgentStepEvent {
@@ -1170,6 +1205,8 @@ export async function runAgent(
     onConfirm?: (req: ConfirmRequest) => void;
     /** Task-list updates from a decomposed run (plan → statuses → merge). */
     onTasks?: (tasks: TaskState[]) => void;
+    /** Cumulative token usage — the Debug mode HUD. */
+    onUsage?: (usage: RunUsage) => void;
   }
 ): Promise<string> {
   if (!inTauri) {
@@ -1202,6 +1239,10 @@ export async function runAgent(
     listen<{ run_id: string; tasks: TaskState[] }>("agent://tasks", (e) => {
       if (e.payload.run_id !== runId) return;
       handlers.onTasks?.(e.payload.tasks);
+    }),
+    listen<RunUsage>("agent://usage", (e) => {
+      if (e.payload.run_id !== runId) return;
+      handlers.onUsage?.(e.payload);
     }),
   ]);
 

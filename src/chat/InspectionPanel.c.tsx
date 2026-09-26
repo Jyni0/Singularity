@@ -12,12 +12,16 @@ import type { Msg, PanelOpen, PanelTabSpec } from "./message.i";
 import { collectSteps } from "./message.u";
 import { computeDiff } from "../utils/diff.u";
 import type * as db from "../core/db.r";
+import { OverlayScroll } from "../ui/ScrollArea.c";
 
 /** Renders a file's diff, reused by the file tab. */
 export function FileDiffBody({ step }: { step: db.AgentStepEvent }) {
   const lines = computeDiff(step.old_text ?? "", step.new_text ?? "");
   return (
-    <div className="overflow-auto bg-[var(--bg-app)] font-mono text-[11px] leading-[1.55]">
+    <OverlayScroll
+      wrapperClassName="min-h-0 flex-1"
+      className="h-full overflow-auto bg-[var(--bg-app)] font-mono text-[11px] leading-[1.55]"
+    >
       {lines.map((l, i) => (
         <div
           key={i}
@@ -46,7 +50,7 @@ export function FileDiffBody({ step }: { step: db.AgentStepEvent }) {
           <span className="ml-1.5 min-w-0">{l.text || " "}</span>
         </div>
       ))}
-    </div>
+    </OverlayScroll>
   );
 }
 
@@ -68,13 +72,16 @@ function TabBody({ tab, msgs }: { tab: PanelTabSpec; msgs: Msg[] }) {
 
   if (tab.type === "image") {
     return (
-      <div className="flex min-h-0 flex-1 items-start justify-center overflow-auto p-3">
+      <OverlayScroll
+        wrapperClassName="min-h-0 flex-1"
+        className="flex h-full items-start justify-center overflow-auto p-3"
+      >
         <img
           src={tab.image.data_url}
           alt={tab.image.name}
           className="max-w-full rounded-lg border border-[var(--border)] object-contain"
         />
-      </div>
+      </OverlayScroll>
     );
   }
 
@@ -98,7 +105,7 @@ function TabBody({ tab, msgs }: { tab: PanelTabSpec; msgs: Msg[] }) {
             {step.path}
           </span>
         </div>
-        <div className="min-h-0 flex-1 overflow-auto">
+        <div className="flex min-h-0 flex-1 flex-col">
           <FileDiffBody step={step} />
         </div>
       </div>
@@ -121,9 +128,11 @@ function TabBody({ tab, msgs }: { tab: PanelTabSpec; msgs: Msg[] }) {
         <code className="block shrink-0 truncate border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 py-1.5 font-mono text-[11px] text-[var(--text-main)]" title={step.input}>
           {step.input}
         </code>
-        <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-all bg-[var(--bg-app)] px-3 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
-          {step.done ? step.result : "running\u2026"}
-        </pre>
+        <OverlayScroll wrapperClassName="min-h-0 flex-1" className="h-full overflow-auto bg-[var(--bg-app)]">
+          <pre className="whitespace-pre-wrap break-all px-3 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
+            {step.done ? step.result : "running\u2026"}
+          </pre>
+        </OverlayScroll>
       </div>
     );
   }
@@ -134,9 +143,11 @@ function TabBody({ tab, msgs }: { tab: PanelTabSpec; msgs: Msg[] }) {
       <code className="block shrink-0 truncate border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 py-1.5 font-mono text-[11px] text-[var(--text-main)]" title={step.input}>
         {step.name}: {step.input}
       </code>
-      <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-all bg-[var(--bg-app)] px-3 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
-        {step.done ? step.result : "running\u2026"}
-      </pre>
+      <OverlayScroll wrapperClassName="min-h-0 flex-1" className="h-full overflow-auto bg-[var(--bg-app)]">
+        <pre className="whitespace-pre-wrap break-all px-3 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
+          {step.done ? step.result : "running\u2026"}
+        </pre>
+      </OverlayScroll>
     </div>
   );
 }
@@ -178,7 +189,10 @@ export function InspectionPanel({
       <div className="panel-resizer" onMouseDown={onResizeStart} />
 
       {/* Closeable tabs across the top - one per opened item. */}
-      <div className="no-native-scrollbar flex shrink-0 items-center gap-1 overflow-x-auto border-b border-[var(--border)] px-2 py-1.5">
+      <OverlayScroll
+        wrapperClassName="shrink-0 border-b border-[var(--border)]"
+        className="flex items-center gap-1 overflow-x-auto px-2 py-1.5"
+      >
         {panel.tabs.map((t) => {
           const isActive = active?.id === t.id;
           return (
@@ -213,7 +227,7 @@ export function InspectionPanel({
         <button className={`${ICON_BTN} ml-auto`} onClick={onCloseAll} title="Close all tabs">
           <X size={14} />
         </button>
-      </div>
+      </OverlayScroll>
 
       {active ? (
         <TabBody tab={active} msgs={msgs} />

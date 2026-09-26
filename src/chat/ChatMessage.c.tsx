@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ArrowUp, Check, ChevronDown, ChevronRight, Circle, ListChecks, Loader2, XCircle } from "lucide-react";
+import { ArrowUp, Bug, Check, ChevronDown, ChevronRight, Circle, ListChecks, Loader2, XCircle } from "lucide-react";
 import * as db from "../core/db.r";
 import { formatDuration } from "../utils/format.u";
 import { Markdown, ToolCall, ThinkBlock } from "./Markdown.c";
@@ -36,6 +36,7 @@ export function ChatMessage({
   streaming,
   durationMs,
   images,
+  debugMode,
   onInspectStep,
   onInspectImage,
 }: {
@@ -48,6 +49,8 @@ export function ChatMessage({
   durationMs?: number;
   /** Photos attached to the message — clickable, open in the side panel. */
   images?: db.StoredImage[];
+  /** Debug mode: render the live token HUD (speed / tokens / cache / time). */
+  debugMode?: boolean;
   /** Opens this step as its own closeable tab in the side panel. */
   onInspectStep?: (step: db.AgentStepEvent) => void;
   /** Opens this photo as its own closeable tab in the side panel. */
@@ -110,6 +113,13 @@ export function ChatMessage({
           if (seg.kind === "tasks") {
             return <TaskList key={"tasks" + i} tasks={seg.tasks} />;
           }
+          if (seg.kind === "usage") {
+            // Debug mode only — the HUD lives inside the transcript so it stays
+            // attached to the turn it measured.
+            return debugMode ? (
+              <UsageHud key={"u" + i} usage={seg.usage} streaming={!!streaming} />
+            ) : null;
+          }
           if (seg.kind === "think") {
             return seg.text.trim() ? (
               <ThinkBlock
@@ -133,6 +143,59 @@ export function ChatMessage({
       <Markdown text={text} />
       {/* Generation time — shown at the END of the finished turn. */}
       <DurationFooter streaming={streaming} durationMs={durationMs} />
+    </div>
+  );
+}
+
+/* ---------- Debug mode: live token HUD ---------- */
+
+/** One metric cell of the debug HUD. */
+function HudCell({ label, value, title }: { label: string; value: string; title?: string }) {
+  return (
+    <span className="flex items-baseline gap-1" title={title}>
+      <span className="text-[9.5px] uppercase tracking-wide text-[var(--text-dim)]">{label}</span>
+      <span className="font-mono text-[10.5px] text-[var(--text-muted)]">{value}</span>
+    </span>
+  );
+}
+
+/**
+ * Real-time inference statistics of the turn: generation speed (tok/s),
+ * token spend (prompt + completion), prompt-cache hit rate and how long the
+ * model has been generating. Visible only in Debug mode.
+ */
+export function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?: boolean }) {
+  const secs = (usage.elapsed_ms ?? 0) / 1000;
+  const tps = secs > 0.5 ? usage.completion_tokens / secs : 0;
+  const cacheRate =
+    usage.prompt_tokens + usage.cached_tokens > 0
+      ? Math.round((usage.cached_tokens / (usage.prompt_tokens + usage.cached_tokens)) * 100)
+      : 0;
+  const fmt = (n: number) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(Math.round(n)));
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-[var(--border-soft)] bg-[var(--bg-input)] px-2.5 py-1.5">
+      <Bug size={11} className="shrink-0 text-[var(--accent)]" />
+      <HudCell label="speed" value={tps > 0 ? tps.toFixed(1) + " tok/s" : "—"} title="Completion tokens per second" />
+      <HudCell
+        label="tokens"
+        value={fmt(usage.prompt_tokens) + " in · " + fmt(usage.completion_tokens) + " out"}
+        title={"Prompt: " + usage.prompt_tokens + " · Completion: " + usage.completion_tokens}
+      />
+      <HudCell
+        label="cache"
+        value={cacheRate + "%"}
+        title={"Cached prompt tokens: " + usage.cached_tokens + " of " + (usage.prompt_tokens + usage.cached_tokens)}
+      />
+      <HudCell
+        label="time"
+        value={secs > 0 ? secs.toFixed(1) + "s" : "—"}
+        title="Wall time of the generation so far"
+      />
+      {streaming && (
+        <span className="flex items-center gap-1 text-[9.5px] uppercase tracking-wide text-[var(--accent)]">
+          <Loader2 size={9} className="animate-spin" /> live
+        </span>
+      )}
     </div>
   );
 }

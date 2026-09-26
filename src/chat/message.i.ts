@@ -11,7 +11,9 @@ export type Segment =
   | { kind: "think"; text: string }
   | { kind: "text"; text: string }
   | { kind: "step"; step: db.AgentStepEvent }
-  | { kind: "tasks"; tasks: db.TaskState[] };
+  | { kind: "tasks"; tasks: db.TaskState[] }
+  /** Debug-mode token accounting of this turn (live while streaming). */
+  | { kind: "usage"; usage: db.RunUsage };
 
 export interface Msg {
   role: "user" | "agent";

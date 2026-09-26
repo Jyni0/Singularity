@@ -37,6 +37,7 @@ import {
 } from "../core/types.i";
 import * as db from "../core/db.r";
 import { Switch } from "../ui/Switch.c";
+import { ScrollBox } from "../ui/ScrollArea.c";
 
 const SBUTTON =
   "flex h-[30px] shrink-0 items-center justify-center gap-1.5 rounded-md bg-[var(--bg-elevated)] px-3 text-[12px] text-[var(--text-main)] transition-colors hover:bg-[var(--bg-input)] disabled:cursor-not-allowed disabled:opacity-50";
@@ -849,7 +850,7 @@ function ProviderCard({
                   <span className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
                     Models
                   </span>
-                  <div className="flex max-h-[320px] flex-col gap-0.5 overflow-y-auto pr-1">
+                  <ScrollBox className="flex max-h-[320px] flex-col gap-0.5 pr-1">
                     {mine.map((m) => (
                       <div
                         key={m.id}
@@ -868,7 +869,7 @@ function ProviderCard({
                         </button>
                       </div>
                     ))}
-                  </div>
+                  </ScrollBox>
                 </div>
               )}
 

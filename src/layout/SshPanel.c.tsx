@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion } from "motion/react";
 import {
   X,
@@ -17,6 +17,8 @@ import * as db from "../core/db.r";
 import type { SshKey, SshScript, SshServer } from "../core/types.i";
 import { ScrollArea } from "../ui/ScrollArea.c";
 import { Combobox } from "../ui/Combobox.c";
+import { useOverlayThumb } from "../hooks/useOverlayThumb.h";
+import { Thumb } from "../ui/Thumb.c";
 
 /**
  * SshPanel — the docked right-hand sidebar of SSH Client mode.
@@ -37,6 +39,25 @@ const FIELD =
 const LABEL = "mb-1.5 block text-[11px] font-medium text-[var(--text-muted)]";
 const AREA =
   "w-full resize-none rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 font-mono text-[11px] leading-[1.5] text-[var(--text-main)] outline-none transition-colors focus:border-[var(--accent)]";
+
+/**
+ * PEM-key textarea with the app's OWN scrollbar: the native bar is hidden
+ * globally (styles.css) and the overlay thumb is drawn on top — the same
+ * look as every other scrollable surface (creds, scripts, the prompt box).
+ */
+function AreaField({
+  className = AREA,
+  ...rest
+}: React.TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  const thumb = useOverlayThumb(ref);
+  return (
+    <div className="relative">
+      <textarea ref={ref} className={className} {...rest} />
+      <Thumb thumb={thumb} />
+    </div>
+  );
+}
 
 /** Termius-style section divider: small-caps label over a hairline. */
 function Section({ title, children }: { title: string; children?: React.ReactNode }) {
@@ -584,7 +605,7 @@ function KeyForm({
           {generated.private_key && (
             <div>
               <label className={LABEL}>Private key — shown only here, this once</label>
-              <textarea
+              <AreaField
                 className={AREA + " h-28"}
                 readOnly
                 value={generated.private_key}
@@ -594,7 +615,7 @@ function KeyForm({
           )}
           <div>
             <label className={LABEL}>Public key — put it on the server (authorized_keys)</label>
-            <textarea
+            <AreaField
               className={AREA + " h-24"}
               readOnly
               value={generated.public_key}
@@ -683,7 +704,7 @@ function KeyForm({
                 <LoaderCircle size={13} className="animate-spin" /> Decrypting…
               </div>
             ) : (
-              <textarea
+              <AreaField
                 className={AREA + " h-32"}
                 value={privateKey}
                 onChange={(e) => setPrivateKey(e.target.value)}
@@ -714,7 +735,7 @@ function KeyForm({
             <label className={LABEL}>Public key — derived automatically</label>
             {publicKey ? (
               <>
-                <textarea className={AREA + " h-16"} readOnly value={publicKey} onFocus={(e) => e.currentTarget.select()} />
+                <AreaField className={AREA + " h-16"} readOnly value={publicKey} onFocus={(e) => e.currentTarget.select()} />
                 <div className="mt-1.5 flex items-center gap-2">
                   <button
                     type="button"
@@ -821,7 +842,7 @@ function ScriptForm({
         </div>
         <div>
           <label className={LABEL}>Command</label>
-          <textarea
+          <AreaField
             className={AREA + " h-44 text-[12px]"}
             value={content}
             onChange={(e) => setContent(e.target.value)}

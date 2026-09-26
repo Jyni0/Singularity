@@ -1,9 +1,20 @@
 import { useState, useEffect } from "react";
 
-export type ThumbState = { top: number; height: number; visible: boolean };
+export type ThumbState = {
+  /** Vertical thumb (right edge). */
+  top: number;
+  height: number;
+  visible: boolean;
+  /** Horizontal thumb (bottom edge) — for overflow-x surfaces. */
+  left: number;
+  width: number;
+  hVisible: boolean;
+};
+
+const EMPTY: ThumbState = { top: 0, height: 0, visible: false, left: 0, width: 0, hVisible: false };
 
 export function useOverlayThumb(elRef: React.RefObject<HTMLElement | null>) {
-  const [thumb, setThumb] = useState<ThumbState>({ top: 0, height: 0, visible: false });
+  const [thumb, setThumb] = useState<ThumbState>(EMPTY);
 
   useEffect(() => {
     const el = elRef.current;
@@ -13,13 +24,28 @@ export function useOverlayThumb(elRef: React.RefObject<HTMLElement | null>) {
     let hovering = false;
 
     const update = (active = false) => {
-      const { scrollHeight, clientHeight, scrollTop } = el;
+      const { scrollHeight, clientHeight, scrollTop, scrollWidth, clientWidth, scrollLeft } = el;
+      const show = active || hovering;
+      // Vertical
       const ratio = clientHeight / Math.max(scrollHeight, 1);
       const needBar = scrollHeight > clientHeight + 1;
       const height = Math.max(ratio * clientHeight, 28);
       const maxTop = clientHeight - height;
       const top = ratio >= 1 ? 0 : (scrollTop / (scrollHeight - clientHeight)) * maxTop;
-      setThumb({ top, height, visible: needBar && (active || hovering) });
+      // Horizontal
+      const hRatio = clientWidth / Math.max(scrollWidth, 1);
+      const needHBar = scrollWidth > clientWidth + 1;
+      const width = Math.max(hRatio * clientWidth, 28);
+      const maxLeft = clientWidth - width;
+      const left = hRatio >= 1 ? 0 : (scrollLeft / (scrollWidth - clientWidth)) * maxLeft;
+      setThumb({
+        top,
+        height,
+        visible: needBar && show,
+        left,
+        width,
+        hVisible: needHBar && show,
+      });
     };
 
     const onScroll = () => {

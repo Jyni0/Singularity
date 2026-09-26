@@ -8,6 +8,7 @@
  * over how a shell command is presented (with its own copy button).
  */
 import { useState, type ReactNode } from "react";
+import { ScrollBox } from "../ui/ScrollArea.c";
 import {
   Brain,
   Check,
@@ -129,11 +130,13 @@ export function CodeBlock({ code, lang }: { code: string; lang: string }) {
           {copied ? "Copied" : "Copy"}
         </button>
       </div>
-      <pre className="overflow-x-auto px-3 py-2.5">
-        <code className="whitespace-pre font-mono text-[12px] leading-[1.6] text-[var(--text-main)]">
-          {code}
-        </code>
-      </pre>
+      <ScrollBox className="overflow-x-auto px-3 py-2.5">
+        <pre>
+          <code className="whitespace-pre font-mono text-[12px] leading-[1.6] text-[var(--text-main)]">
+            {code}
+          </code>
+        </pre>
+      </ScrollBox>
     </div>
   );
 }
@@ -267,7 +270,7 @@ export function Table({ rows, keyPrefix }: { rows: string[]; keyPrefix: string }
   const [header, ...body] = rows;
 
   return (
-    <div className="my-2 overflow-x-auto rounded-lg border border-[var(--border)]">
+    <ScrollBox className="my-2 overflow-x-auto rounded-lg border border-[var(--border)]">
       <table className="w-full border-collapse text-[12px]">
         <thead>
           <tr className="bg-[var(--bg-input)]">
@@ -296,7 +299,7 @@ export function Table({ rows, keyPrefix }: { rows: string[]; keyPrefix: string }
           ))}
         </tbody>
       </table>
-    </div>
+    </ScrollBox>
   );
 }
 
@@ -453,12 +456,12 @@ export function ThinkBlock({
       </button>
 
       {open && (
-        <div className="max-h-[280px] overflow-auto border-t border-[var(--border)] bg-[var(--bg-input)] px-3 py-2">
+        <ScrollBox className="max-h-[280px] overflow-auto border-t border-[var(--border)] bg-[var(--bg-input)] px-3 py-2">
           {/* Reasoning is prose, not markdown the model meant for the user. */}
           <p className="whitespace-pre-wrap text-[12px] leading-[1.6] text-[var(--text-muted)]">
             {text}
           </p>
-        </div>
+        </ScrollBox>
       )}
     </div>
   );

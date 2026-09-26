@@ -160,6 +160,38 @@
   display: none;
 }
 
+/* Textareas (PEM keys, scripts, the prompt) scroll internally — the native
+   bar is hidden and the overlay thumb is drawn by React on top instead. */
+textarea {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+textarea::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+/* xterm.js keeps its own scroll viewport; repaint its bar to look exactly
+   like the app's overlay thumb (same width, radius and translucency). */
+.xterm .xterm-viewport {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(128, 128, 128, 0.3) transparent;
+}
+.xterm .xterm-viewport::-webkit-scrollbar {
+  width: 6px;
+}
+.xterm .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+.xterm .xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.3);
+  border-radius: 9999px;
+}
+.xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: rgba(128, 128, 128, 0.55);
+}
+
 /* Custom overlay scrollbar thumb — hugs the very right edge (1px inset) */
 .scroll-thumb {
   position: absolute;
@@ -172,6 +204,14 @@
 }
 .scroll-thumb:hover,
 .scroll-thumb--active { background: rgba(128, 128, 128, 0.55); }
+/* Horizontal variant — hugs the bottom edge (1px inset). */
+.scroll-thumb--h {
+  right: auto;
+  top: auto;
+  bottom: 1px;
+  height: 6px;
+  width: auto;
+}
 
 /* ---- Extended palette — editor-classic themes ----
    Each block is COMPLETE (all tokens): hover/row tokens live with the

@@ -196,12 +196,17 @@ export function SshSidebar({
                       }
                       onClick={() => onSelectConn(c.id)}
                     >
-                      {/* OS logo of the server this connection belongs to */}
-                      {srv && <OsLogo os={srv.os} seed={srv.id} name={srv.name} size={16} />}
+                      {/* Terminal rows are identified by the SERVER LOGO (no
+                          console icon — it duplicated the logo); SFTP rows by
+                          the folder icon (no logo). */}
                       {isSftp ? (
                         <FolderOpen size={13} strokeWidth={1.5} className="shrink-0 text-[var(--accent)]" />
                       ) : (
-                        <TerminalSquare size={13} strokeWidth={1.5} className="shrink-0 text-[var(--accent)]" />
+                        srv ? (
+                          <OsLogo os={srv.os} seed={srv.id} name={srv.name} size={16} />
+                        ) : (
+                          <TerminalSquare size={13} strokeWidth={1.5} className="shrink-0 text-[var(--accent)]" />
+                        )
                       )}
                       <span className="truncate">{label}</span>
                     </button>

@@ -262,11 +262,11 @@ export function TerminalView({
       {/* No navbar: the console IS the page. Only transient states float
           over the terminal as small pills (connecting / session closed /
           error) — they never occupy layout space. */}
-      {/* Detected-OS badge floats top-left (Rust probes it on connect). */}
+      {/* Detected-OS badge floats top-left (Rust probes it on connect).
+          Logo only — no OS name text over the terminal. */}
       {server.os && (
-        <div className="pointer-events-none absolute left-3 top-3 z-10 flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--bg-surface)]/80 py-1 pl-1.5 pr-2.5 shadow-[var(--shadow-popup)] backdrop-blur">
-          <OsLogo os={server.os} seed={server.id} name={server.name} size={14} />
-          <span className="text-[10.5px] font-medium capitalize text-[var(--text-muted)]">{server.os}</span>
+        <div className="pointer-events-none absolute left-3 top-3 z-10 flex items-center rounded-full border border-[var(--border)] bg-[var(--bg-surface)]/80 p-1 shadow-[var(--shadow-popup)] backdrop-blur">
+          <OsLogo os={server.os} seed={server.id} name={server.name} size={16} />
         </div>
       )}
       {status === "connecting" && (

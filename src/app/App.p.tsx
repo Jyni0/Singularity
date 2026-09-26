@@ -106,6 +106,9 @@ export default function App() {
   const [agentMode] = useState(() => localStorage.getItem("agent_mode") !== "off");
   /** Global command permission — the default for projects set to "As default". */
   const [globalAutoRun, setGlobalAutoRun] = useState(false);
+  /** Debug mode: live token/speed/cache HUD inside the chat transcript.
+   *  Persisted as the "debug_mode" setting. */
+  const [debugMode, setDebugMode] = useState(false);
   /** Last picked model, restored on launch so the chat remembers its choice. */
   const [pickedModel, setPickedModel] = useState<{ gatewayId: string; modelId: string } | null>(
     null
@@ -415,13 +418,16 @@ export default function App() {
 
       // Restore user settings persisted in SQLite (falls back to localStorage
       // values from older versions, then to defaults).
-      const [globalAuto, picked, savedTheme, savedPanelW, savedSshPanelW] = await Promise.all([
-        db.getSetting("global_auto_run"),
-        db.getSetting("picked_model"),
-        db.getSetting("theme"),
-        db.getSetting("panel_width"),
-        db.getSetting("ssh_panel_width"),
-      ]);
+      const [globalAuto, picked, savedTheme, savedPanelW, savedSshPanelW, savedDebug] =
+        await Promise.all([
+          db.getSetting("global_auto_run"),
+          db.getSetting("picked_model"),
+          db.getSetting("theme"),
+          db.getSetting("panel_width"),
+          db.getSetting("ssh_panel_width"),
+          db.getSetting("debug_mode"),
+        ]);
+      if (!cancelled && savedDebug !== null) setDebugMode(savedDebug === "1");
       if (!cancelled && savedPanelW) {
         const w = Number(savedPanelW);
         if (Number.isFinite(w)) setPanelWidth(Math.min(Math.max(w, PANEL_MIN_W), PANEL_MAX_W));
@@ -924,6 +930,43 @@ export default function App() {
       });
     };
 
+    /**
+     * Debug-mode usage updates: one "usage" segment per turn.
+     *
+     * accumulate differs per path: the AGENT loop re-sends the cumulative
+     * total on every event (replace), while the plain chat stream reports
+     * Anthropic/Gemini usage in pieces — prompt first, completion later (sum).
+     */
+    const appendUsage = (u: db.RunUsage, accumulate: boolean) => {
+      updateConvMsgs(convId, (prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (!last || last.role !== "agent") return prev;
+
+        const segs = [...(last.segments ?? [])];
+        const at = segs.findIndex((s) => s.kind === "usage");
+        const prevU =
+          at >= 0 ? (segs[at] as { kind: "usage"; usage: db.RunUsage }).usage : null;
+        const merged: db.RunUsage =
+          accumulate && prevU
+            ? {
+                run_id: u.run_id,
+                prompt_tokens: prevU.prompt_tokens + u.prompt_tokens,
+                completion_tokens: prevU.completion_tokens + u.completion_tokens,
+                cached_tokens: prevU.cached_tokens + u.cached_tokens,
+                elapsed_ms: u.elapsed_ms ?? prevU.elapsed_ms,
+              }
+            : { ...u, elapsed_ms: u.elapsed_ms ?? prevU?.elapsed_ms };
+        if (at >= 0) {
+          segs[at] = { kind: "usage", usage: merged };
+        } else {
+          segs.push({ kind: "usage", usage: merged });
+        }
+        next[next.length - 1] = { ...last, segments: segs };
+        return next;
+      });
+    };
+
     /** Task-list updates from a decomposed run: one "tasks" segment that is
      *  replaced in place as subtasks move pending → running → done/error. */
     const appendTasks = (tasks: db.TaskState[]) => {
@@ -1008,6 +1051,8 @@ export default function App() {
               onStep: appendStep,
               onThink: appendThink,
               onTasks: appendTasks,
+              // Agent events are already cumulative — replace, do not sum.
+              onUsage: (u) => appendUsage(u, false),
               // Parked per run id: a background run's request stays available
               // and reappears the moment the user opens that chat.
               onConfirm: (req) =>
@@ -1032,7 +1077,10 @@ export default function App() {
                 "Answer concisely and prefer concrete, runnable steps.",
             },
             historyTurns,
-            appendDelta
+            appendDelta,
+            // Plain chat reports usage in pieces (prompt, then completion) —
+            // accumulate. elapsed_ms isn't in those events, so measure here.
+            (u) => appendUsage({ ...u, elapsed_ms: Date.now() - startedAt }, true)
           );
 
       const elapsed = Date.now() - startedAt;
@@ -1446,6 +1494,7 @@ export default function App() {
                             streaming={streaming && i === draftMsgs.length - 1}
                             durationMs={m.durationMs}
                             images={m.images}
+                            debugMode={debugMode}
                             onInspectStep={(step) => {
                               // Every step opens as its OWN closeable panel tab:
                               // a file change shows its diff, a command its full
@@ -1643,6 +1692,11 @@ export default function App() {
               onGlobalAutoRun={(next) => {
                 setGlobalAutoRun(next);
                 void db.setSetting("global_auto_run", next ? "1" : "0");
+              }}
+              debugMode={debugMode}
+              onDebugMode={(next) => {
+                setDebugMode(next);
+                void db.setSetting("debug_mode", next ? "1" : "0");
               }}
               initialProject={settingsProject}
               initialSection={settingsSection}

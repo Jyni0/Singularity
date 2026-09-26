@@ -40,6 +40,8 @@ export function SettingsModal({
   onModelsChanged,
   globalAutoRun,
   onGlobalAutoRun,
+  debugMode,
+  onDebugMode,
   initialProject,
   initialSection,
   mode = "agent",
@@ -61,6 +63,9 @@ export function SettingsModal({
   onModelsChanged: (next: Model[]) => void;
   globalAutoRun: boolean;
   onGlobalAutoRun: (next: boolean) => void;
+  /** Debug mode: live token/speed/cache/time HUD inside the chat. */
+  debugMode: boolean;
+  onDebugMode: (next: boolean) => void;
   /** Pre-selected project of the "Project Settings" tab (from the sidebar menu). */
   initialProject?: string | null;
   /** Tab to land on — "Project Settings" opens it directly. */
@@ -270,6 +275,17 @@ export function SettingsModal({
                         setSendMode(v);
                         persistSetting("send_mode", v);
                       }}
+                    />
+                  </SettingRow>
+                  <Sep />
+                  <SettingRow
+                    title="Debug Mode"
+                    hint="Live stats in chat: tokens/sec, token spend, cache rate, time"
+                  >
+                    <Switch
+                      on={debugMode}
+                      onChange={onDebugMode}
+                      ariaLabel="toggle debug mode"
                     />
                   </SettingRow>
                 </>

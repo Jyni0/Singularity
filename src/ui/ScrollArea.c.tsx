@@ -48,4 +48,37 @@ export function ScrollBox({
   );
 }
 
+/**
+ * Fully flexible scroll wrapper — YOU own the overflow classes (overflow-auto,
+ * overflow-x-auto, min-h-0 flex-1 …). The native bar is hidden and the app's
+ * overlay thumb is drawn instead, so every scrollable surface in the app
+ * scrolls the same way. wrapperClassName styles the positioned box (use it
+ * for flex sizing like "min-h-0 flex-1").
+ */
+export function OverlayScroll({
+  children,
+  className = "",
+  wrapperClassName = "",
+  tabIndex,
+  innerRef,
+}: {
+  children: React.ReactNode;
+  className?: string;
+  wrapperClassName?: string;
+  tabIndex?: number;
+  innerRef?: React.RefObject<HTMLDivElement>;
+}) {
+  const localRef = useRef<HTMLDivElement>(null);
+  const ref = innerRef ?? localRef;
+  const thumb = useOverlayThumb(ref);
+  return (
+    <div className={"relative " + wrapperClassName}>
+      <div ref={ref} tabIndex={tabIndex} className={"no-native-scrollbar outline-none " + className}>
+        {children}
+      </div>
+      <Thumb thumb={thumb} />
+    </div>
+  );
+}
+
 /* ---------- Types (domain types live in ./types) ---------- */

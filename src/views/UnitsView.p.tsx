@@ -20,6 +20,8 @@ import {
 import * as db from "../core/db.r";
 import type { SshKey, SshScript, SshServer, UnitsTab } from "../core/types.i";
 import { Modal } from "../ui/Modal.c";
+import { OverlayScroll } from "../ui/ScrollArea.c";
+import { Combobox } from "../ui/Combobox.c";
 import { OsLogo } from "../ui/OsLogo.c";
 
 /**
@@ -210,14 +212,16 @@ export function UnitsView({
       {/* Script run result (output viewer — not an edit dialog) */}
       {scriptResult && (
         <Modal title={scriptResult.ok ? scriptResult.name : scriptResult.name + " — failed"} onClose={() => setScriptResult(null)}>
-          <pre
-            className={
-              "max-h-[45vh] overflow-auto whitespace-pre-wrap rounded-lg bg-[var(--bg-input)] p-3 font-mono text-[12px] leading-[1.5] " +
-              (scriptResult.ok ? "text-[var(--text-main)]" : "text-[var(--diff-del)]")
-            }
-          >
-            {scriptResult.text}
-          </pre>
+          <OverlayScroll className="max-h-[45vh] overflow-auto rounded-lg bg-[var(--bg-input)]">
+            <pre
+              className={
+                "whitespace-pre-wrap p-3 font-mono text-[12px] leading-[1.5] " +
+                (scriptResult.ok ? "text-[var(--text-main)]" : "text-[var(--diff-del)]")
+              }
+            >
+              {scriptResult.text}
+            </pre>
+          </OverlayScroll>
         </Modal>
       )}
     </motion.div>
@@ -492,18 +496,19 @@ function ScriptGrid({
                 {s.content.split("\n")[0]}
               </span>
             </span>
-            <span className="flex shrink-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
-              <select
-                className="h-7 max-w-[140px] cursor-pointer rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-1.5 text-[11.5px] text-[var(--text-main)] outline-none"
-                value={effectiveTarget}
-                onChange={(e) => setTarget(e.target.value)}
-                title="Run on server"
-              >
-                {servers.length === 0 && <option value="">No servers</option>}
-                {servers.map((srv) => (
-                  <option key={srv.id} value={srv.id}>{srv.name}</option>
-                ))}
-              </select>
+            <span className="flex w-[150px] shrink-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+              {/* Run-on picker: the app's Combobox (custom popup + custom
+                  scrollbar) instead of the OS-native select. */}
+              <span className="min-w-0 flex-1 [&_button]:h-7 [&_button]:px-2 [&_button]:text-[11.5px]">
+                <Combobox
+                  searchable={false}
+                  value={effectiveTarget}
+                  onChange={setTarget}
+                  placeholder={servers.length === 0 ? "No servers" : "Run on…"}
+                  emptyText="No servers"
+                  options={servers.map((srv) => ({ value: srv.id, label: srv.name }))}
+                />
+              </span>
               <button
                 className="flex h-7 items-center gap-1.5 rounded-full bg-[var(--accent)] px-3 text-[12px] font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
                 disabled={!effectiveTarget || runningScript === s.id}

@@ -14,6 +14,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Monitor, Power, CircleDot } from "lucide-react";
+import { ScrollBox } from "../ui/ScrollArea.c";
 
 interface RunRow {
   run_id: string;
@@ -80,7 +81,7 @@ export function TrayMenu() {
       <div className="mx-1.5 border-t border-white/[0.07]" />
 
       {/* Live agents — one compact row each; scrolls past four. */}
-      <div className="max-h-[124px] overflow-y-auto py-1">
+      <ScrollBox className="max-h-[124px] py-1">
         {state.runs.length === 0 ? (
           <div className="px-2 text-[11px] leading-[22px] text-[#71717A]">No agents running</div>
         ) : (
@@ -98,7 +99,7 @@ export function TrayMenu() {
             ))}
           </>
         )}
-      </div>
+      </ScrollBox>
 
       <div className="mx-1.5 border-t border-white/[0.07]" />
 

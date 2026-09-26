@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "motion/react";
 import { Zap, ChevronDown, ChevronRight, Check } from "lucide-react";
 import { Gateway } from "../core/types.i";
 import { CHIP, MENU_ITEM } from "../ui/tokens.s";
+import { OverlayScroll } from "../ui/ScrollArea.c";
 
 export function ModelSelector({
   gateways,
@@ -85,19 +86,22 @@ export function ModelSelector({
                       exit={{ opacity: 0, x: -6 }}
                       transition={{ duration: 0.12, ease: "easeOut" }}
                     >
-                      {g.models.map((m) => (
-                        <button
-                          key={m.id}
-                          className={`${MENU_ITEM} ${g.id === gw.id && m.id === model.id ? "bg-[var(--hover-bg)]" : ""}`}
-                          onClick={() => {
-                            onSelect(g.id, m.id);
-                            setOpen(false);
-                            setHoveredGw(null);
-                          }}
-                        >
-                          <span className="font-mono">{m.name}</span>
-                        </button>
-                      ))}
+                      {/* Long model lists scroll with the app's own bar. */}
+                      <OverlayScroll className="flex max-h-[300px] flex-col gap-0.5">
+                        {g.models.map((m) => (
+                          <button
+                            key={m.id}
+                            className={`${MENU_ITEM} ${g.id === gw.id && m.id === model.id ? "bg-[var(--hover-bg)]" : ""}`}
+                            onClick={() => {
+                              onSelect(g.id, m.id);
+                              setOpen(false);
+                              setHoveredGw(null);
+                            }}
+                          >
+                            <span className="font-mono">{m.name}</span>
+                          </button>
+                        ))}
+                      </OverlayScroll>
                     </motion.div>
                   )}
                 </AnimatePresence>

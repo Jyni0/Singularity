@@ -9,7 +9,7 @@
 //! Usage: `let _permit = limiter::acquire(key, rpm, concurrency).await;` —
 //! the permit releases automatically when it drops (request finished).
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 

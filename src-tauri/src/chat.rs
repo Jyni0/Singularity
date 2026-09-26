@@ -129,6 +129,18 @@ fn thinking_budget_anthropic(effort: &str) -> Option<u32> {
     }
 }
 
+/// Token usage of a chat stream, pushed to the Debug HUD (chat://usage).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChatUsage {
+    pub request_id: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cached_tokens: u64,
+}
+
+fn emit_usage(app: &AppHandle, u: &ChatUsage) {
+    let _ = app.emit("chat://usage", u);
+}
 /* ---------- Public entry point ---------- */
 
 /// Streams a completion, emitting `chat://delta`, `chat://done` and
@@ -179,6 +191,19 @@ struct GeminiStreamChunk {
     candidates: Option<Vec<GeminiCandidate>>,
     #[serde(rename = "promptFeedback")]
     prompt_feedback: Option<GeminiPromptFeedback>,
+    /// Cumulative token counts — the final chunk carries the totals.
+    #[serde(rename = "usageMetadata")]
+    usage_metadata: Option<GeminiUsage>,
+}
+
+#[derive(Deserialize)]
+struct GeminiUsage {
+    #[serde(rename = "promptTokenCount", default)]
+    prompt_token_count: u64,
+    #[serde(rename = "candidatesTokenCount", default)]
+    candidates_token_count: u64,
+    #[serde(rename = "cachedContentTokenCount", default)]
+    cached_content_token_count: u64,
 }
 
 #[derive(Deserialize)]
@@ -320,6 +345,18 @@ async fn stream_google(
                         return Err(format!("prompt blocked by Gemini ({reason})"));
                     }
                 }
+                // DEBUG HUD: Gemini reports cumulative usage; the totals ride
+                // on the final chunk (the one with a finishReason).
+                if let Some(u) = parsed.usage_metadata.as_ref() {
+                    if parsed.candidates.as_ref().and_then(|c| c.first()).and_then(|c| c.finish_reason.as_deref()).is_some() {
+                        emit_usage(app, &ChatUsage {
+                            request_id: request_id.to_string(),
+                            prompt_tokens: u.prompt_token_count,
+                            completion_tokens: u.candidates_token_count,
+                            cached_tokens: u.cached_content_token_count,
+                        });
+                    }
+                }
                 if let Some(cands) = parsed.candidates {
                     for c in cands {
                         if let Some(parts) = c.content.and_then(|x| x.parts) {
@@ -352,6 +389,14 @@ async fn stream_google(
 struct OpenAiStreamChunk {
     choices: Option<Vec<OpenAiChoice>>,
     error: Option<OpenAiError>,
+    /// Final-chunk usage (needs stream_options.include_usage).
+    #[serde(default)]
+    usage: Option<crate::agent::OpenAiUsage>,
+    /// Ollama reports token counts on the top level instead.
+    #[serde(default)]
+    prompt_eval_count: u64,
+    #[serde(default)]
+    eval_count: u64,
 }
 
 #[derive(Deserialize)]
@@ -422,6 +467,11 @@ async fn stream_openai(
         "messages": messages,
         "stream": true,
     });
+    // Ask for the final usage chunk (DEBUG HUD) — OpenAI-compatible only,
+    // Ollama reports counts without asking.
+    if provider.kind != "ollama" {
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
     // Only sent when the user picked something other than the provider default,
     // because many OpenAI-compatible servers reject an unknown `reasoning_effort`.
     if let Some(eff) = reasoning_effort(&provider.effort) {
@@ -482,6 +532,23 @@ async fn stream_openai(
             if let Some(err) = parsed.error {
                 return Err(err.message.unwrap_or_else(|| "provider error".into()));
             }
+            // DEBUG HUD: usage on the final chunk (or Ollama's top-level counts).
+            if let Some(u) = &parsed.usage {
+                emit_usage(app, &ChatUsage {
+                    request_id: request_id.to_string(),
+                    prompt_tokens: u.prompt_tokens,
+                    completion_tokens: u.completion_tokens,
+                    cached_tokens: u.prompt_tokens_details.as_ref().map(|d| d.cached_tokens).unwrap_or(0),
+                });
+            }
+            if parsed.prompt_eval_count > 0 || parsed.eval_count > 0 {
+                emit_usage(app, &ChatUsage {
+                    request_id: request_id.to_string(),
+                    prompt_tokens: parsed.prompt_eval_count,
+                    completion_tokens: parsed.eval_count,
+                    cached_tokens: 0,
+                });
+            }
             if let Some(choices) = parsed.choices {
                 for c in choices {
                     if let Some(delta) = c.delta {
@@ -510,6 +577,28 @@ struct AnthropicEvent {
     kind: Option<String>,
     delta: Option<AnthropicDelta>,
     error: Option<OpenAiError>,
+    /// message_start carries input tokens + cache hits; message_delta the output total.
+    message: Option<AnthropicMsgUsage>,
+    #[serde(default)]
+    usage: Option<AnthropicUsageBlock>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicMsgUsage {
+    #[serde(default)]
+    usage: Option<AnthropicUsageBlock>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicUsageBlock {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -630,6 +719,30 @@ async fn stream_anthropic(
             };
             if let Some(err) = parsed.error {
                 return Err(err.message.unwrap_or_else(|| "provider error".into()));
+            }
+            // DEBUG HUD: Anthropic usage — input on message_start, output on
+            // message_delta (cumulative for the stream).
+            if parsed.kind.as_deref() == Some("message_start") {
+                if let Some(u) = parsed.message.as_ref().and_then(|m| m.usage.as_ref()) {
+                    emit_usage(app, &ChatUsage {
+                        request_id: request_id.to_string(),
+                        prompt_tokens: u.input_tokens + u.cache_creation_input_tokens,
+                        completion_tokens: 0,
+                        cached_tokens: u.cache_read_input_tokens,
+                    });
+                }
+            }
+            if parsed.kind.as_deref() == Some("message_delta") {
+                if let Some(u) = parsed.usage.as_ref() {
+                    if u.output_tokens > 0 {
+                        emit_usage(app, &ChatUsage {
+                            request_id: request_id.to_string(),
+                            prompt_tokens: 0,
+                            completion_tokens: u.output_tokens,
+                            cached_tokens: 0,
+                        });
+                    }
+                }
             }
             // Text arrives as `content_block_delta` with a `text_delta` inside.
             if parsed.kind.as_deref() == Some("content_block_delta") {

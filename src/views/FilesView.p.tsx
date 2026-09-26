@@ -14,6 +14,7 @@ import {
 import * as db from "../core/db.r";
 import type { SftpEntry, SshServer } from "../core/types.i";
 import { OsLogo } from "../ui/OsLogo.c";
+import { OverlayScroll, ScrollArea } from "../ui/ScrollArea.c";
 
 /**
  * Files page — SFTP browser over the same pooled SSH connection
@@ -147,7 +148,10 @@ export function FilesView({
         >
           <Home size={12} />
         </button>
-        <span className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
+        <OverlayScroll
+          wrapperClassName="min-w-0 flex-1"
+          className="flex items-center gap-0.5 overflow-x-auto"
+        >
           {crumbs.map((c, i) => {
             const last = i === crumbs.length - 1;
             const cls = last
@@ -162,7 +166,7 @@ export function FilesView({
               </span>
             );
           })}
-        </span>
+        </OverlayScroll>
         <span className="flex shrink-0 items-center gap-1">
           <button className={headerBtn} onClick={() => void load(cwd)} title="Refresh">
             <RefreshCw size={12} />
@@ -216,7 +220,7 @@ export function FilesView({
         </div>
       )}
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <ScrollArea className="min-h-0 flex-1">
         {loading && entries.length === 0 ? (
           <div className="flex items-center justify-center gap-2 p-8 text-[13px] text-[var(--text-muted)]">
             <LoaderCircle size={14} className="animate-spin" /> Listing…
@@ -281,7 +285,7 @@ export function FilesView({
             </tbody>
           </table>
         )}
-      </div>
+      </ScrollArea>
     </motion.div>
   );
 }

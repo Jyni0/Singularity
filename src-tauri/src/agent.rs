@@ -35,6 +35,11 @@ fn is_cancelled(run_id: &str) -> bool {
     crate::cancel::is_requested(run_id)
 }
 
+/// Pushes aggregated token usage to the Debug HUD (agent://usage).
+fn emit_usage(app: &AppHandle, u: &RunUsage) {
+    let _ = app.emit("agent://usage", u);
+}
+
 /* ---------- Command approval ---------- */
 
 /// Pending approval requests, keyed by run id. The agent loop inserts a oneshot
@@ -1316,6 +1321,47 @@ struct StreamDelta {
 struct StreamChunk {
     choices: Option<Vec<StreamChoice>>,
     error: Option<ApiError>,
+    /// Final-chunk usage accounting (requires stream_options.include_usage).
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+    /// Ollama reports token counts on the top level instead.
+    #[serde(default)]
+    prompt_eval_count: u64,
+    #[serde(default)]
+    eval_count: u64,
+}
+
+/// Token accounting as reported by OpenAI-compatible providers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAiUsage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptTokensDetails {
+    /// Tokens served from the provider's prompt cache (cheaper, faster).
+    #[serde(default)]
+    pub cached_tokens: u64,
+}
+
+
+/// Aggregated usage of one run — what the Debug HUD displays.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunUsage {
+    pub run_id: String,
+    /// Sum of prompt tokens over all rounds of this run.
+    pub prompt_tokens: u64,
+    /// Sum of completion tokens over all rounds.
+    pub completion_tokens: u64,
+    /// Prompt tokens served from cache (Anthropic cache_read / OpenAI cached).
+    pub cached_tokens: u64,
+    /// Wall time of the run so far, ms — the frontend derives tokens/sec.
+    pub elapsed_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -1375,6 +1421,16 @@ async fn run_openai(
     let client = reqwest::Client::new();
     let mut final_text = String::new();
     let mut step_index = 0usize;
+    // DEBUG HUD: cumulative usage of the whole run (all rounds). Ollama reports
+    // usage under different field names, so keep both shapes handy.
+    let started_at = std::time::Instant::now();
+    let mut usage = RunUsage {
+        run_id: run_id.to_string(),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cached_tokens: 0,
+        elapsed_ms: 0,
+    };
 
     for _ in 0..MAX_STEPS {
         if is_cancelled(run_id) {
@@ -1398,6 +1454,11 @@ async fn run_openai(
             }),
             "stream": true,
         });
+        // Ask for the final usage chunk (OpenAI-compatible providers; harmless
+        // elsewhere — unknown fields are ignored).
+        if req.kind != "ollama" {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
         // Reasoning effort, only when the user picked a non-default level.
         if let Some(eff) = crate::chat::reasoning_effort(&req.effort) {
             body["reasoning_effort"] = json!(eff);
@@ -1458,6 +1519,23 @@ async fn run_openai(
                 };
                 if let Some(err) = parsed.error {
                     return Err(err.message.unwrap_or_else(|| "provider error".into()));
+                }
+                // DEBUG HUD usage accounting — providers that report it:
+                // OpenAI-compatible (final chunk), Ollama (every line).
+                if let Some(u) = &parsed.usage {
+                    usage.prompt_tokens += u.prompt_tokens;
+                    usage.completion_tokens += u.completion_tokens;
+                    if let Some(d) = &u.prompt_tokens_details {
+                        usage.cached_tokens += d.cached_tokens;
+                    }
+                    usage.elapsed_ms = started_at.elapsed().as_millis() as u64;
+                    emit_usage(app, &usage);
+                }
+                if parsed.prompt_eval_count > 0 || parsed.eval_count > 0 {
+                    usage.prompt_tokens += parsed.prompt_eval_count;
+                    usage.completion_tokens += parsed.eval_count;
+                    usage.elapsed_ms = started_at.elapsed().as_millis() as u64;
+                    emit_usage(app, &usage);
                 }
                 let Some(choices) = parsed.choices else { continue };
                 for choice in choices {
@@ -1787,6 +1865,31 @@ struct AnthropicStreamEvent {
     content_block: Option<AnthropicBlock>,
     delta: Option<AnthropicStreamDelta>,
     error: Option<ApiError>,
+    /// "message_start" carries the message with its initial usage block.
+    message: Option<AnthropicMessage>,
+    /// "message_delta" carries the round's cumulative output token count.
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicMessage {
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+/// Anthropic token accounting (prompt caching included).
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    /// Prompt-cache hits — billed at ~10% and served much faster.
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -1853,6 +1956,17 @@ async fn run_anthropic(
     let client = reqwest::Client::new();
     let mut final_text = String::new();
     let mut step_index = 0usize;
+    // DEBUG HUD: cumulative usage across the run's rounds. Anthropic reports
+    // input tokens + cache hits on "message_start" and the round's output
+    // total on "message_delta".
+    let started_at = std::time::Instant::now();
+    let mut usage = RunUsage {
+        run_id: run_id.to_string(),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cached_tokens: 0,
+        elapsed_ms: 0,
+    };
 
     // Anthropic requires max_tokens to exceed the thinking budget.
     let thinking_budget = match req.effort.as_str() {
@@ -1962,6 +2076,30 @@ async fn run_anthropic(
                 };
                 if let Some(err) = parsed.error {
                     return Err(err.message.unwrap_or_else(|| "provider error".into()));
+                }
+
+                // DEBUG HUD usage accounting:
+                // * message_start → input_tokens (+ cache_read_input_tokens)
+                // * message_delta → the round's cumulative output_tokens
+                match parsed.kind.as_deref() {
+                    Some("message_start") => {
+                        if let Some(u) = parsed.message.and_then(|m| m.usage) {
+                            usage.prompt_tokens += u.input_tokens + u.cache_creation_input_tokens;
+                            usage.cached_tokens += u.cache_read_input_tokens;
+                            usage.elapsed_ms = started_at.elapsed().as_millis() as u64;
+                            emit_usage(app, &usage);
+                        }
+                    }
+                    Some("message_delta") => {
+                        if let Some(u) = parsed.usage {
+                            if u.output_tokens > 0 {
+                                usage.completion_tokens += u.output_tokens;
+                                usage.elapsed_ms = started_at.elapsed().as_millis() as u64;
+                                emit_usage(app, &usage);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
 
                 match parsed.kind.as_deref() {

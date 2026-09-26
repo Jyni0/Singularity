@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { motion } from "motion/react";
-import { Zap, Shield, Send, X, Square, Mic, Loader2, Paperclip, FileText, ListChecks } from "lucide-react";
+import { Send, X, Square, Mic, Loader2, Paperclip, FileText, ListChecks } from "lucide-react";
 import * as db from "../core/db.r";
 import type { Project, Gateway, Attachment, Effort } from "../core/types.i";
 import { toAttachments, formatSize } from "../utils/attachments.u";
@@ -46,15 +46,28 @@ export function PromptBox({
   const [text, setText] = useState("");
   const [gatewayId, setGatewayId] = useState("");
   const [modelId, setModelId] = useState("");
-  const [turbo, setTurbo] = useState(true);
   const [effort, setEffort] = useState<Effort>(
     () => (localStorage.getItem("effort") as Effort) || "medium"
   );
   /** Task mode: the prompt is first split into a task list, then the subtasks
-   *  run in parallel (bounded by the provider's concurrency limit). */
+   *  run in parallel (bounded by the provider's concurrency limit). The state
+   *  lives in the DATABASE ("по базе") so it survives everything; localStorage
+   *  only seeds the first paint before the DB read lands. */
   const [decompose, setDecompose] = useState(
     () => localStorage.getItem("decompose") === "1"
   );
+  useEffect(() => {
+    let dead = false;
+    void db.getSetting("tasks_mode").then((v) => {
+      if (dead || v === null) return;
+      const on = v === "1";
+      setDecompose(on);
+      localStorage.setItem("decompose", on ? "1" : "0");
+    });
+    return () => {
+      dead = true;
+    };
+  }, []);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -297,14 +310,6 @@ export function PromptBox({
                   onPickModel?.({ gatewayId: g, modelId: m });
                 }}
               />
-              <span
-                className={CHIP_CTX}
-                onClick={() => setTurbo(!turbo)}
-                title="Turbo / Auto-Pilot vs Safe / Supervised"
-              >
-                {turbo ? <Zap size={12} strokeWidth={1.5} /> : <Shield size={12} strokeWidth={1.5} />}
-                {turbo ? "Turbo" : "Safe"}
-              </span>
               {/* Reasoning effort — low is fast, high thinks harder. */}
               <EffortChip effort={effort} onPick={pickEffort} />
               {/* Task decomposition: split the prompt into a task list and run
@@ -319,6 +324,7 @@ export function PromptBox({
                   const next = !decompose;
                   setDecompose(next);
                   localStorage.setItem("decompose", next ? "1" : "0");
+                  void db.setSetting("tasks_mode", next ? "1" : "0");
                 }}
                 title="Task mode: decompose the prompt into a task list and run subtasks in parallel"
               >

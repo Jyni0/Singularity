@@ -1,6 +1,7 @@
 //! Tool schema exposed to the model, the default system prompt, and the
 //! human-readable rendering of tool arguments for the UI.
 
+use super::context::one_line;
 use super::AgentRequest;
 use crate::tools;
 use serde_json::{json, Value};
@@ -171,6 +172,11 @@ pub(super) fn summarize(name: &str, args: &Value) -> String {
             let hunks = tools::parse_patch(get("diff")).len();
             format!("{} ({} hunks)", get("path"), hunks)
         }
+        // ssh_exec MUST be specific: with the path-only fallback every call
+        // looked identical ("ssh_exec()"), so two DIFFERENT remote commands
+        // tripped the repeat guard as "the same action".
+        "ssh_exec" => format!("{}: {}", get("server"), one_line(get("command"), 80)),
+        "list_dir" => get("path").to_string(),
         _ => get("path").to_string(),
     }
 }

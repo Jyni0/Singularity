@@ -168,6 +168,28 @@ pub(super) async fn plan_subtasks(
     parsed
 }
 
+/// Is a prompt worth spending a planner call on? Short conversational text
+/// ("Привет что там по серверу") is NEVER decomposition material — running the
+/// planner on it burned ~10s and two LLM calls just to answer "no plan", and
+/// the user watched pointless "Decomposing…" ceremony on a greeting.
+/// Structured = long enough (240+ chars) OR multi-line (3+ lines) OR carries
+/// explicit numbering markers.
+pub(super) fn prompt_needs_planning(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.chars().count() >= 240 {
+        return true;
+    }
+    if trimmed.lines().filter(|l| !l.trim().is_empty()).count() >= 3 {
+        return true;
+    }
+    ["1.", "1)", "- [ ]", "шаг 1", "step 1"]
+        .iter()
+        .any(|m| trimmed.to_lowercase().contains(m))
+}
+
 /// Lenient JSON-array extraction: models love wrapping arrays in prose or
 /// code fences, so take the outermost [ ... ] span and parse that.
 fn parse_task_json(text: &str) -> Option<Vec<(String, String)>> {
@@ -227,6 +249,23 @@ mod decompose_tests {
     fn empty_array_is_not_decomposable() {
         assert!(parse_task_json("[]").is_none());
         assert!(parse_task_json("no json here").is_none());
+    }
+
+    #[test]
+    fn short_chat_is_not_planning_material() {
+        assert!(!prompt_needs_planning("Привет что там по серверу"));
+        assert!(!prompt_needs_planning("ok"));
+        // Long-ish but still conversational single line: no structure, no plan.
+        assert!(!prompt_needs_planning("проверь баги в файле src/main.rs и почини их быстро но аккуратно пожалуйста"));
+    }
+
+    #[test]
+    fn long_or_structured_prompts_get_planned() {
+        let long: String = "почини ".chars().cycle().take(400).collect();
+        assert!(prompt_needs_planning(&long));
+        assert!(prompt_needs_planning("1. сделай A\n2. сделай B"));
+        assert!(prompt_needs_planning("step 1: read\nstep 2: fix"));
+        assert!(!prompt_needs_planning("   "));
     }
 
     #[test]

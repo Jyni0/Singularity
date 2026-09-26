@@ -8,8 +8,8 @@ use super::guard::{
 use super::prompt::{summarize, tool_specs};
 use super::{
     ask_confirm, cancelled_result, emit_step, emit_text, emit_think, emit_usage, inject_wrap_up,
-    is_cancelled, run_ssh_tool, AgentRequest, ApiError, PendingCall, RunUsage, MAX_STEPS,
-    WRAP_UP_AT,
+    is_cancelled, run_ssh_tool, send_with_retry, AgentRequest, ApiError, PendingCall, RunUsage,
+    MAX_STEPS, WRAP_UP_AT,
 };
 use crate::tools;
 use futures_util::StreamExt;
@@ -21,13 +21,13 @@ use tauri::AppHandle;
 /* ---------- Anthropic tool_use protocol ---------- */
 
 #[derive(Deserialize)]
-struct AnthropicStreamEvent {
+pub(super) struct AnthropicStreamEvent {
     #[serde(rename = "type")]
-    kind: Option<String>,
-    index: Option<usize>,
-    content_block: Option<AnthropicBlock>,
-    delta: Option<AnthropicStreamDelta>,
-    error: Option<ApiError>,
+    pub(super) kind: Option<String>,
+    pub(super) index: Option<usize>,
+    pub(super) content_block: Option<AnthropicBlock>,
+    pub(super) delta: Option<AnthropicStreamDelta>,
+    pub(super) error: Option<ApiError>,
     /// "message_start" carries the message with its initial usage block.
     message: Option<AnthropicMessage>,
     /// "message_delta" carries the round's cumulative output token count.
@@ -56,21 +56,21 @@ struct AnthropicUsage {
 }
 
 #[derive(Deserialize)]
-struct AnthropicBlock {
+pub(super) struct AnthropicBlock {
     #[serde(rename = "type")]
-    kind: Option<String>,
-    id: Option<String>,
-    name: Option<String>,
+    pub(super) kind: Option<String>,
+    pub(super) id: Option<String>,
+    pub(super) name: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct AnthropicStreamDelta {
+pub(super) struct AnthropicStreamDelta {
     #[serde(rename = "type")]
-    kind: Option<String>,
-    text: Option<String>,
-    partial_json: Option<String>,
+    pub(super) kind: Option<String>,
+    pub(super) text: Option<String>,
+    pub(super) partial_json: Option<String>,
     /// Extended thinking arrives as `thinking_delta` with the text here.
-    thinking: Option<String>,
+    pub(super) thinking: Option<String>,
 }
 
 pub(super) async fn run_anthropic(
@@ -197,14 +197,21 @@ pub(super) async fn run_anthropic(
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
         }
 
-        let mut request = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("anthropic-version", "2023-06-01")
-            .json(&body);
-        if !req.api_key.trim().is_empty() {
-            request = request.header("x-api-key", req.api_key.trim());
-        }
+        let body_final = body.clone();
+        let url_c = url.clone();
+        let key_c = req.api_key.trim().to_string();
+        let client_ref = &client;
+        let build = move || {
+            let mut r = client_ref
+                .post(&url_c)
+                .header("Content-Type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .json(&body_final);
+            if !key_c.is_empty() {
+                r = r.header("x-api-key", key_c.as_str());
+            }
+            r
+        };
 
         // Provider limits (RPM + concurrency), shared with every other call
         // path for this provider.
@@ -218,12 +225,14 @@ pub(super) async fn run_anthropic(
             return cancelled_result(final_text);
         }
 
-        // Stop interrupts the send immediately instead of waiting for the wire.
-        let res = tokio::select! {
-            r = request.send() => r.map_err(|e| format!("request failed: {e}"))?,
-            _ = crate::cancel::cancel_signal(run_id) => {
+        // Stop interrupts immediately; transient 429/5xx retry (visibly in
+        // chat) instead of ending the run — a single 502 used to kill it.
+        let res = match send_with_retry(app, run_id, build).await {
+            Ok(r) => r,
+            Err(e) if e.starts_with(crate::cancel::STOPPED) => {
                 return cancelled_result(final_text.clone());
             }
+            Err(e) => return Err(e),
         };
         let status = res.status();
         if !status.is_success() {

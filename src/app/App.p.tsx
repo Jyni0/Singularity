@@ -12,7 +12,7 @@ import { AuroraGlow } from "../ui/AuroraGlow.c";
 
 import type { Msg, PanelState, PanelTabSpec, Segment } from "../chat/message.i";
 import { storedToMsg, fileLabel, toolLabel } from "../chat/message.u";
-import { ChatMessage } from "../chat/ChatMessage.c";
+import { ChatMessage, TaskChips } from "../chat/ChatMessage.c";
 import { PromptBox } from "../chat/PromptBox.c";
 import { InspectionPanel } from "../chat/InspectionPanel.c";
 import { TitleBar } from "../layout/TitleBar.c";
@@ -61,6 +61,11 @@ export default function App() {
   const [convMsgs, setConvMsgs] = useState<Record<string, Msg[]>>({});
   const convMsgsRef = useRef(convMsgs);
   convMsgsRef.current = convMsgs;
+  /** Run ids whose re-attach this component has already claimed — StrictMode
+   *  double-mounts effects in dev, and replaying one buffer twice doubled the
+   *  text ("генерация пошла заново"). A Set survives remounts for the page's
+   *  lifetime, which is exactly the scope a boot re-attach needs. */
+  const claimedRuns = useRef(new Set<string>());
   /** convId → requestId of the generation currently running for it. */
   const [activeRuns, setActiveRuns] = useState<Record<string, string>>({});
   /**
@@ -161,6 +166,16 @@ export default function App() {
     : convMsgs[DRAFT_ID] ?? [];
   /** True while THIS conversation has a generation running. */
   const streaming = !!activeConv && !!activeRuns[activeConv.id];
+  /** Latest task board of the on-screen conversation — powers the chips strip
+   *  above the prompt box. Only shown while a run is live (a finished board
+   *  stays in the transcript; the strip is a "right now" indicator). */
+  const liveTasks = (() => {
+    if (!streaming) return [];
+    const msgs = activeConv ? convMsgs[activeConv.id] ?? [] : [];
+    const last = msgs[msgs.length - 1];
+    const seg = last?.segments?.slice().reverse().find((s) => s.kind === "tasks");
+    return seg && seg.kind === "tasks" ? seg.tasks : [];
+  })();
   /**
    * Aurora palette for the prompt box, derived from the on-screen chat's run:
    * red after a failed turn, indigo while it thinks, amber once text streams,
@@ -468,29 +483,48 @@ export default function App() {
       setProviders(nextProviders);
       setModels(nextModels);
 
-      // Open the most recent chat, whichever project it lives in.
-      const first = nextProjects.find((p) => p.conversations.length > 0);
-      const conv = first?.conversations[0];
-      if (first && conv) {
-        setActiveConv({ project: first.name, id: conv.id });
-        // A run that was live across the reload owns this conversation's
-        // buffer — the re-attach effect loads the stored rows AND appends the
-        // streaming draft; overwriting here would wipe the draft mid-stream.
-        const reattaching = (() => {
-          try {
-            const m = JSON.parse(localStorage.getItem("dsh:live-run") ?? "null");
-            return m?.convId === conv.id;
-          } catch {
-            return false;
-          }
-        })();
-        const stored = await db.loadMessages(conv.id);
-        if (!cancelled && stored.length && !reattaching) {
-          setConvMsgs((prev) => ({
-            ...prev,
-            [conv.id]: stored.map(storedToMsg),
-          }));
+      // Open the chat the user LAST OPENED (persisted per open); if it is
+      // gone (deleted) or there never was one — land on New Conversation
+      // instead of some arbitrary stored chat.
+      const lastId = localStorage.getItem("dsh:last-conv");
+      const reattachId = (() => {
+        try {
+          return (JSON.parse(localStorage.getItem("dsh:live-run") ?? "null") as { convId?: string } | null)?.convId ?? null;
+        } catch {
+          return null;
         }
+      })();
+      // A run that was live across the reload always wins — its re-attach
+      // effect owns that conversation's buffer.
+      const targetId = reattachId ?? lastId;
+      let owner = targetId ? nextProjects.find((p) => p.conversations.some((c) => c.id === targetId)) : undefined;
+      let conv = owner?.conversations.find((c) => c.id === targetId);
+      if (!conv) {
+        // Last-conv gone: fall back to the newest real conversation; if none
+        // exists at all, stay on the New Conversation screen.
+        const first = nextProjects.find((p) => p.conversations.length > 0);
+        conv = first?.conversations[0];
+        owner = first;
+      }
+      if (owner && conv) {
+        setActiveConv({ project: owner.name, id: conv.id });
+        setView("chat");
+        // The re-attach effect loads the stored rows AND appends the streaming
+        // draft for its conversation; overwriting here would wipe it mid-stream.
+        if (conv.id !== reattachId) {
+          const stored = await db.loadMessages(conv.id);
+          if (!cancelled && stored.length) {
+            setConvMsgs((prev) => ({
+              ...prev,
+              [conv!.id]: stored.map(storedToMsg),
+            }));
+          }
+        }
+      } else {
+        // Nothing to open — start at New Conversation.
+        setNewChatProject(NO_PROJECT);
+        setConvMsgs((prev) => ({ ...prev, [DRAFT_ID]: prev[DRAFT_ID] ?? [] }));
+        setView("new");
       }
     })();
     return () => {
@@ -522,6 +556,11 @@ export default function App() {
         return;
       }
       if (!runId || !convId) return;
+      // React StrictMode mounts effects twice in dev — without this claim the
+      // same buffer was replayed TWICE, doubling the text on screen and
+      // looking like the generation restarted.
+      if (claimedRuns.current.has(runId)) return;
+      claimedRuns.current.add(runId);
       const live = await db.liveRuns();
       const snapshot = await db.agentSnapshot(runId);
       if (cancelled) return;
@@ -846,6 +885,9 @@ export default function App() {
     setActiveConv({ project, id });
     setView("chat");
     setPanel({ kind: "none" });
+    // Boot opens the LAST OPENED chat — not some arbitrary "most recent" row
+    // that may not even exist anymore ("при запуске открывается несуществующий чат").
+    localStorage.setItem("dsh:last-conv", id);
     // A live run owns its buffer — loading over it would wipe the streaming
     // turn. Stored messages already arrived before the run started.
     if (activeRuns[id]) return;
@@ -1102,6 +1144,7 @@ export default function App() {
     // whatever the user is looking at while the run streams.
     const requestId = `req-${Date.now()}`;
     const startedAt = Date.now();
+    localStorage.setItem("dsh:last-conv", convId);
     // Reload re-attach: remember which conversation this run streams into.
     // Rust buffers every event (runs.rs), so after a page reload the boot
     // effect replays the buffer and keeps listening — live output is no
@@ -1362,6 +1405,37 @@ export default function App() {
         }
         return next;
       });
+      // SAVE WHAT WAS GENERATED. A Stop (or a dead provider) used to leave the
+      // partial turn on screen but NOT in the database — after a restart the
+      // work looked lost and the user re-sent the prompt from scratch. Read the
+      // live buffer via ref, drop ephemeral think segments, persist like a
+      // normal turn.
+      try {
+        const cur = convMsgsRef.current[convId] ?? [];
+        const partial = cur.find((m) => m.role === "agent" && m.text.trim() && !m.text.startsWith("⚠️"));
+        if (partial) {
+          const persisted = partial.segments?.filter((s) => s.kind !== "think");
+          const suffix = msg.includes("stopped") ? "  \n\n_(stopped — partial result saved)_" : "";
+          await db.appendMessage(convId, "agent", partial.text + suffix, {
+            durationMs: elapsed,
+            segmentsJson: persisted && persisted.length ? JSON.stringify(persisted) : undefined,
+          });
+          bumpConversationActivity(convId);
+        } else {
+          // No prose yet, but tools DID run (files may have been touched) —
+          // keep the action cards so the work is not invisible after restart.
+          const acted = cur.find((m) => m.role === "agent" && m.segments?.some((s) => s.kind === "step" && s.step.done));
+          if (acted && acted.segments) {
+            await db.appendMessage(convId, "agent", "", {
+              durationMs: elapsed,
+              segmentsJson: JSON.stringify(acted.segments.filter((s) => s.kind !== "think")),
+            });
+            bumpConversationActivity(convId);
+          }
+        }
+      } catch {
+        // Persistence must never mask the original error UI.
+      }
     } finally {
       localStorage.removeItem("dsh:live-run");
       setActiveRuns((prev) => {
@@ -1846,6 +1920,10 @@ export default function App() {
 
               {/* The column-wide aurora above IS the running indicator: its
                   palette shifts indigo → amber with the run phase. */}
+              {/* Live task strip: what is running RIGHT NOW, above the prompt.
+                  Collapsed = current task + progress; expanded = scrollable
+                  board (past ~5 tasks it scrolls instead of eating the screen). */}
+              {liveTasks.length > 0 && <TaskChips tasks={liveTasks} />}
               <PromptBox
                 onSend={(text, selection, attachments) => sendMessage(text, activeConv, selection, attachments)}
                 projects={projects}

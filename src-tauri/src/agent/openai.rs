@@ -9,8 +9,8 @@ use super::guard::{
 use super::prompt::{summarize, tool_specs};
 use super::{
     ask_confirm, cancelled_result, emit_step, emit_text, emit_think, emit_usage, inject_wrap_up,
-    is_cancelled, run_ssh_tool, AgentRequest, ApiError, PendingCall, RunUsage, MAX_STEPS,
-    WRAP_UP_AT,
+    is_cancelled, run_ssh_tool, send_with_retry, AgentRequest, ApiError, PendingCall, RunUsage,
+    MAX_STEPS, WRAP_UP_AT,
 };
 use crate::tools;
 use futures_util::StreamExt;
@@ -22,38 +22,38 @@ use tauri::AppHandle;
 /* ---------- OpenAI tool_calls protocol ---------- */
 
 #[derive(Deserialize)]
-struct ToolCallDelta {
-    index: Option<usize>,
-    id: Option<String>,
-    function: Option<FunctionDelta>,
+pub(super) struct ToolCallDelta {
+    pub(super) index: Option<usize>,
+    pub(super) id: Option<String>,
+    pub(super) function: Option<FunctionDelta>,
 }
 
 #[derive(Deserialize)]
-struct FunctionDelta {
-    name: Option<String>,
-    arguments: Option<String>,
+pub(super) struct FunctionDelta {
+    pub(super) name: Option<String>,
+    pub(super) arguments: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct StreamChoice {
-    delta: Option<StreamDelta>,
+pub(super) struct StreamChoice {
+    pub(super) delta: Option<StreamDelta>,
     #[serde(rename = "finish_reason")]
     _finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct StreamDelta {
-    content: Option<String>,
+pub(super) struct StreamDelta {
+    pub(super) content: Option<String>,
     /// DeepSeek and OpenAI o-series stream reasoning separately from content.
     reasoning_content: Option<String>,
     reasoning: Option<String>,
-    tool_calls: Option<Vec<ToolCallDelta>>,
+    pub(super) tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 #[derive(Deserialize)]
-struct StreamChunk {
-    choices: Option<Vec<StreamChoice>>,
-    error: Option<ApiError>,
+pub(super) struct StreamChunk {
+    pub(super) choices: Option<Vec<StreamChoice>>,
+    pub(super) error: Option<ApiError>,
     /// Final-chunk usage accounting (requires stream_options.include_usage).
     #[serde(default)]
     usage: Option<OpenAiUsage>,
@@ -181,13 +181,22 @@ pub(super) async fn run_openai(
             body["reasoning_effort"] = json!(eff);
         }
 
-        let mut request = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body);
-        if !req.api_key.trim().is_empty() {
-            request = request.bearer_auth(req.api_key.trim());
-        }
+        let body_final = body.clone();
+        let url_c = url.clone();
+        let key_c = req.api_key.trim().to_string();
+        // Borrow the client — the closure is rebuilt every round, and moving
+        // the client into it would leave later rounds without one.
+        let client_ref = &client;
+        let build = move || {
+            let mut r = client_ref
+                .post(&url_c)
+                .header("Content-Type", "application/json")
+                .json(&body_final);
+            if !key_c.is_empty() {
+                r = r.bearer_auth(key_c.as_str());
+            }
+            r
+        };
 
         // Provider limits (RPM + concurrency) — the permit lives until the
         // streamed response finishes, so in-flight accounting is exact.
@@ -201,12 +210,15 @@ pub(super) async fn run_openai(
             return cancelled_result(final_text);
         }
 
-        // Stop interrupts the send immediately instead of waiting for the wire.
-        let res = tokio::select! {
-            r = request.send() => r.map_err(|e| format!("request failed: {e}"))?,
-            _ = crate::cancel::cancel_signal(run_id) => {
+        // Stop interrupts the send immediately; transient 429/5xx get RETRIED
+        // (with the retry visible in chat) instead of killing the whole run —
+        // "provider returned 502" used to end generations outright.
+        let res = match send_with_retry(app, run_id, build).await {
+            Ok(r) => r,
+            Err(e) if e.starts_with(crate::cancel::STOPPED) => {
                 return cancelled_result(final_text.clone());
             }
+            Err(e) => return Err(e),
         };
         let status = res.status();
         if !status.is_success() {

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { AnimatePresence, motion } from "motion/react";
 import { ArrowUp, Bug, Check, ChevronDown, ChevronRight, Circle, ListChecks, Loader2, Wrench, XCircle } from "lucide-react";
 import * as db from "../core/db.r";
 import { formatDuration } from "../utils/format.u";
@@ -52,14 +53,23 @@ function StepGroup({
     if (!streaming) setOpen(false);
   }, [streaming]);
   // Live elapsed while streaming; the stored duration takes over when done.
+  // A turn that STOPPED or ERRORED never gets a stored duration — freeze the
+  // live clock at the moment streaming ended so the header still reads
+  // "Worked for 41s" instead of a bare "Worked".
   const startRef = useRef(Date.now());
+  const endRef = useRef<number | null>(null);
   const [, tick] = useState(0);
   useEffect(() => {
-    if (!streaming) return;
-    const id = setInterval(() => tick((n) => n + 1), 1000);
-    return () => clearInterval(id);
+    if (streaming) {
+      endRef.current = null;
+      const id = setInterval(() => tick((n) => n + 1), 1000);
+      return () => clearInterval(id);
+    }
+    if (endRef.current === null) endRef.current = Date.now();
   }, [streaming]);
-  const elapsed = streaming ? Date.now() - startRef.current : durationMs;
+  const elapsed = streaming
+    ? Date.now() - startRef.current
+    : (durationMs ?? (endRef.current !== null ? endRef.current - startRef.current : 0));
   const label = elapsed && elapsed > 0 ? "Worked for " + formatDuration(elapsed) : "Worked";
   const running = steps.some((s) => !s.step.done);
   return (
@@ -107,7 +117,10 @@ function StepGroup({
 function groupSegments(segments: Segment[]): (Segment | { group: Segment[] })[] {
   const out: (Segment | { group: Segment[] })[] = [];
   for (const seg of segments) {
-    if (seg.kind === "step") {
+    // The planner's own status card ("Plan — …") is NOT agent work: folding it
+    // into "Worked · 1 action" produced the confusing transcript the user
+    // complained about. It renders standalone below.
+    if (seg.kind === "step" && seg.step.name !== "plan") {
       const tail = out[out.length - 1];
       if (tail && "group" in tail) tail.group.push(seg);
       else out.push({ group: [seg] });
@@ -202,7 +215,7 @@ export function ChatMessage({
             );
           }
           if (seg.kind === "tasks") {
-            return <TaskList key={"tasks" + i} tasks={seg.tasks} />;
+            return <TaskList key={"tasks" + i} tasks={seg.tasks} live={!!streaming} />;
           }
           if (seg.kind === "usage") {
             // Debug mode only — the HUD lives inside the transcript so it stays
@@ -219,6 +232,23 @@ export function ChatMessage({
                 live={!!streaming && isLast}
               />
             ) : null;
+          }
+          // Standalone step (the planner's card): a normal ToolCall, not a
+          // "Worked" group — it is status, not labor.
+          if (seg.kind === "step") {
+            return (
+              <ToolCall
+                key={`s${i}`}
+                call={{
+                  name: seg.step.name,
+                  input: seg.step.input,
+                  result: seg.step.result,
+                  ok: seg.step.ok,
+                  running: !!streaming && !seg.step.done,
+                  onInspect: () => onInspectStep?.(seg.step),
+                }}
+              />
+            );
           }
           // Plain prose (steps were folded into groups above).
           if (seg.kind === "text") {
@@ -346,9 +376,16 @@ const TASK_VISUAL: Record<string, { icon: typeof Check; cls: string }> = {
  * The subtask list of a decomposed run — rendered in place inside the
  * transcript, updated live as tasks move pending → running → done/error.
  */
-export function TaskList({ tasks }: { tasks: db.TaskState[] }) {
+export function TaskList({ tasks, live }: { tasks: db.TaskState[]; live?: boolean }) {
   const done = tasks.filter((t) => t.status === "done").length;
   const failed = tasks.filter((t) => t.status === "error").length;
+  // A run that was stopped/finished can leave tasks stuck at "running" — the
+  // spinner must NOT keep animating forever ("при остановке не пропадает
+  // анимация"). Frozen turns render "running" as an interrupted outline.
+  const visual = (status: string) => {
+    if (status === "running" && !live) return { icon: Circle, cls: "text-[var(--text-dim)]" };
+    return TASK_VISUAL[status] ?? TASK_VISUAL.pending;
+  };
   return (
     <div className="selectable overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-surface)]">
       <div className="flex items-center gap-2 border-b border-[var(--border-soft)] px-3 py-2">
@@ -362,7 +399,7 @@ export function TaskList({ tasks }: { tasks: db.TaskState[] }) {
       </div>
       <div className="flex flex-col">
         {tasks.map((t) => {
-          const vis = TASK_VISUAL[t.status] ?? TASK_VISUAL.pending;
+          const vis = visual(t.status);
           const Icon = vis.icon;
           return (
             <div
@@ -385,6 +422,87 @@ export function TaskList({ tasks }: { tasks: db.TaskState[] }) {
           );
         })}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Compact task strip that lives ABOVE the prompt box while a decomposed run
+ * is working. Two states, one click apart:
+ *  - collapsed: a single row — current task title + live progress counter;
+ *  - expanded:  the whole board in a small panel that scrolls past ~5 tasks.
+ * The transcript TaskList stays the durable record; this is the always-
+ * visible "what is happening right now" indicator the user asked for.
+ */
+export function TaskChips({ tasks }: { tasks: db.TaskState[] }) {
+  const [open, setOpen] = useState(false);
+  const done = tasks.filter((t) => t.status === "done").length;
+  const failed = tasks.filter((t) => t.status === "error").length;
+  const current = tasks.find((t) => t.status === "running");
+  if (!tasks.length) return null;
+  return (
+    <div className="px-6 pb-1">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-2 rounded-lg py-1 text-left text-[11px] text-[var(--text-muted)] transition-colors hover:text-[var(--text-main)]"
+      >
+        {current ? (
+          <Loader2 size={12} className="shrink-0 animate-spin text-[var(--accent)]" />
+        ) : (
+          <ListChecks size={12} className="shrink-0 text-[var(--accent)]" />
+        )}
+        <span className="min-w-0 flex-1 truncate">
+          {current ? current.title : done + failed >= tasks.length ? "All tasks finished" : "Tasks"}
+        </span>
+        <span className="shrink-0 font-mono text-[10.5px] text-[var(--text-dim)]">
+          {done}/{tasks.length}{failed > 0 ? " · " + failed + " failed" : ""}
+        </span>
+        <ChevronRight
+          size={13}
+          className={"shrink-0 transition-transform " + (open ? "rotate-90" : "")}
+        />
+      </button>
+      <AnimatePresence initial={false}>
+        {open && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.18, ease: "easeOut" }}
+            className="overflow-hidden"
+          >
+            {/* Small by design: past ~5 tasks it scrolls instead of pushing
+                the prompt box off screen. */}
+            <div className="mb-1.5 max-h-[150px] overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--bg-surface)]/60 backdrop-blur-sm">
+              {tasks.map((t) => {
+                const vis = t.status === "running"
+                  ? { icon: Loader2, cls: "text-[var(--accent)] animate-spin" }
+                  : t.status === "done"
+                    ? { icon: Check, cls: "text-[var(--diff-add)]" }
+                    : t.status === "error"
+                      ? { icon: XCircle, cls: "text-[var(--diff-del)]" }
+                      : { icon: Circle, cls: "text-[var(--text-dim)]" };
+                const Icon = vis.icon;
+                return (
+                  <div key={t.id} className="flex items-center gap-2 border-b border-[var(--border-soft)] px-2.5 py-1 last:border-b-0">
+                    <Icon size={12} className={"shrink-0 " + vis.cls} />
+                    <span className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--text-main)]">
+                      <span className="mr-1 font-mono text-[10px] text-[var(--text-dim)]">{t.id}.</span>
+                      {t.title}
+                    </span>
+                    {t.summary && (
+                      <span className="hidden max-w-[40%] shrink-0 truncate text-[10px] text-[var(--text-dim)] sm:inline" title={t.summary}>
+                        {t.summary}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

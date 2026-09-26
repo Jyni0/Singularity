@@ -1,12 +1,12 @@
 //! Decomposed execution: parallel subtasks (bounded by the provider limits)
 //! plus the streamed merge round that sees every summary.
 
-use super::context::{one_line, prune_anthropic, prune_openai};
+use super::context::{prune_anthropic, prune_openai};
 use super::planner::{emit_tasks, plan_subtasks, TaskState};
 use super::prompt::{default_system, summarize, tool_specs};
 use super::{
     cancelled_result, emit_step, emit_text, is_cancelled, run_protocol, run_protocol_from,
-    run_ssh_tool, AgentRequest, MAX_STEPS,
+    run_ssh_tool, send_with_retry, AgentRequest, MAX_STEPS,
 };
 use crate::tools;
 use serde_json::{json, Value};
@@ -14,10 +14,10 @@ use std::path::Path;
 use std::sync::Mutex;
 use tauri::AppHandle;
 
-/// Runs ONE subtask to completion: a non-streaming tool loop. Parallel
-/// siblings each keep their own conversation; streaming all of them into the
-/// single UI text feed would interleave into noise — the final merge round
-/// streams, so the user still watches the answer appear.
+/// Runs ONE subtask to completion: a STREAMING tool loop. Parallel siblings
+/// each keep their own conversation; every text delta is attributed to its
+/// subtask ("▸ title …") so the single UI feed stays readable while tasks
+/// work, and the user watches output appear token by token.
 async fn run_subtask(
     app: &AppHandle,
     req: &AgentRequest,
@@ -67,7 +67,7 @@ async fn run_subtask(
                 "tools": tool_specs(req).as_array().map(|specs| specs.iter().map(|s| json!({
                     "name": s["name"], "description": s["description"], "input_schema": s["parameters"],
                 })).collect::<Vec<_>>()).unwrap_or_default(),
-                "stream": false,
+                "stream": true,
             })
         } else {
             json!({
@@ -77,7 +77,7 @@ async fn run_subtask(
                     "type": "function",
                     "function": { "name": s["name"], "description": s["description"], "parameters": s["parameters"] },
                 })).collect::<Vec<_>>()).unwrap_or_default(),
-                "stream": false,
+                "stream": true,
             })
         };
         if let Some(eff) = crate::chat::reasoning_effort(&req.effort) {
@@ -86,99 +86,89 @@ async fn run_subtask(
             }
         }
 
-        let mut request = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body);
-        if anthropic {
-            request = request.header("anthropic-version", "2023-06-01");
-            if !req.api_key.trim().is_empty() {
-                request = request.header("x-api-key", req.api_key.trim());
+        let body_final = body.clone();
+        let url_c = url.clone();
+        let key_c = req.api_key.trim().to_string();
+        let anthropic_c = anthropic;
+        let client_ref = &client;
+        let build = move || {
+            let mut r = client_ref
+                .post(&url_c)
+                .header("Content-Type", "application/json")
+                .json(&body_final);
+            if anthropic_c {
+                r = r.header("anthropic-version", "2023-06-01");
+                if !key_c.is_empty() {
+                    r = r.header("x-api-key", key_c.as_str());
+                }
+            } else if !key_c.is_empty() {
+                r = r.bearer_auth(key_c.as_str());
             }
-        } else if !req.api_key.trim().is_empty() {
-            request = request.bearer_auth(req.api_key.trim());
-        }
+            r
+        };
 
         // Every subtask request obeys the provider's RPM/concurrency limits —
         // the whole point of running tasks in parallel without tripping quota.
         let key = if req.provider_id.is_empty() { req.base_url.clone() } else { req.provider_id.clone() };
         let _permit = crate::limiter::acquire(&key, req.rate_limit_rpm, req.concurrency, run_id).await;
-        // Stop interrupts the send immediately instead of waiting for the wire.
-        let res = tokio::select! {
-            r = request.send() => r.map_err(|e| format!("subtask request failed: {e}"))?,
-            _ = crate::cancel::cancel_signal(run_id) => return Err(crate::cancel::STOPPED.to_string()),
-        };
+        // Transient gateway errors (502/503/429) retry instead of failing the
+        // subtask — one blip must not sink the whole decomposition.
+        let res = send_with_retry(app, run_id, build).await?;
         if !res.status().is_success() {
             let detail = res.text().await.unwrap_or_default();
             return Err(format!("subtask provider error: {}", trim_detail(&detail)));
         }
-        // Stop interrupts the body read immediately, like everywhere else.
-    let v: Value = tokio::select! {
-        r = res.json() => r.map_err(|e| format!("bad subtask response: {e}"))?,
-        _ = crate::cancel::cancel_signal(run_id) => return Err(crate::cancel::STOPPED.to_string()),
-    };
-
+        // STREAMING round: text appears token by token while the subtask
+        // works — Tasks mode is no longer silent until the round completes
+        // ("только по окончанию генерации ответ дает").
+        let (text, calls) = stream_subtask_round(app, run_id, res, anthropic, title).await?;
+        if !text.trim().is_empty() {
+            last_text = text.clone();
+        }
+        if calls.is_empty() {
+            return Ok(text);
+        }
         if anthropic {
-            let blocks = v["content"].as_array().cloned().unwrap_or_default();
-            let text: String = blocks.iter()
-                .filter(|b| b["type"].as_str() == Some("text"))
-                .filter_map(|b| b["text"].as_str())
-                .collect::<Vec<_>>().join("");
-            let uses: Vec<Value> = blocks.iter()
-                .filter(|b| b["type"].as_str() == Some("tool_use"))
-                .cloned().collect();
-            // LIVE progress: a subtask is non-streamed, so each round's text
-            // is shown as it lands — the chat is never silent while tasks work.
-            if !text.trim().is_empty() {
-                last_text = text.clone();
-                emit_text(app, run_id, format!("\n\n**▸ {}** {}\n", title, one_line(&text, 400)));
-            }
-            if uses.is_empty() {
-                return Ok(text);
-            }
             let mut asst = Vec::new();
             if !text.is_empty() {
                 asst.push(json!({ "type": "text", "text": text }));
             }
-            for u in &uses {
-                asst.push(json!({ "type": "tool_use", "id": u["id"], "name": u["name"], "input": u["input"] }));
+            for c in &calls {
+                let input: Value = serde_json::from_str(if c.args.trim().is_empty() { "{}" } else { &c.args })
+                    .unwrap_or(json!({}));
+                asst.push(json!({ "type": "tool_use", "id": c.id, "name": c.name, "input": input }));
             }
             messages.push(json!({ "role": "assistant", "content": asst }));
             let mut results = Vec::new();
-            for u in &uses {
-                let name = u["name"].as_str().unwrap_or("");
-                let args = u["input"].clone();
-                let r = execute_subtask_tool(app, req, root, run_id, step_index, name, &args).await;
+            for c in &calls {
+                let args: Value = serde_json::from_str(if c.args.trim().is_empty() { "{}" } else { &c.args })
+                    .unwrap_or(json!({}));
+                let r = execute_subtask_tool(app, req, root, run_id, step_index, &c.name, &args).await;
                 results.push(json!({
                     "type": "tool_result",
-                    "tool_use_id": u["id"],
+                    "tool_use_id": c.id,
                     "content": r.output,
                     "is_error": !r.ok,
                 }));
             }
             messages.push(json!({ "role": "user", "content": results }));
         } else {
-            let msg = &v["choices"][0]["message"];
-            let text = msg["content"].as_str().unwrap_or("").to_string();
-            let calls = msg["tool_calls"].as_array().cloned().unwrap_or_default();
-            // LIVE progress — same policy as the Anthropic branch.
-            if !text.trim().is_empty() {
-                last_text = text.clone();
-                emit_text(app, run_id, format!("\n\n**▸ {}** {}\n", title, one_line(&text, 400)));
-            }
-            if calls.is_empty() {
-                return Ok(text);
-            }
-            messages.push(msg.clone());
+            messages.push(json!({
+                "role": "assistant",
+                "content": text,
+                "tool_calls": calls.iter().map(|c| json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": if c.args.trim().is_empty() { "{}" } else { c.args.as_str() } },
+                })).collect::<Vec<_>>(),
+            }));
             for c in &calls {
-                let name = c["function"]["name"].as_str().unwrap_or("");
-                let args: Value = c["function"]["arguments"].as_str()
-                    .and_then(|s| serde_json::from_str(s).ok())
+                let args: Value = serde_json::from_str(if c.args.trim().is_empty() { "{}" } else { &c.args })
                     .unwrap_or(json!({}));
-                let r = execute_subtask_tool(app, req, root, run_id, step_index, name, &args).await;
+                let r = execute_subtask_tool(app, req, root, run_id, step_index, &c.name, &args).await;
                 messages.push(json!({
                     "role": "tool",
-                    "tool_call_id": c["id"],
+                    "tool_call_id": c.id,
                     "content": r.output,
                 }));
             }
@@ -196,6 +186,154 @@ async fn run_subtask(
         "(subtask hit the step limit; partial result)\n{}",
         last_text
     ))
+}
+
+/// One STREAMING round of a subtask: consumes the SSE response, emitting text
+/// as it arrives (prefixed once per round with the subtask title so parallel
+/// siblings stay attributable), and accumulates tool calls. Returns (text,
+/// calls) — same shape the old non-streaming parse produced.
+async fn stream_subtask_round(
+    app: &AppHandle,
+    run_id: &str,
+    res: reqwest::Response,
+    anthropic: bool,
+    title: &str,
+) -> Result<(String, Vec<super::PendingCall>), String> {
+    use futures_util::StreamExt;
+    use super::anthropic::{AnthropicBlock, AnthropicStreamDelta, AnthropicStreamEvent};
+    use super::openai::{FunctionDelta, StreamChunk, StreamDelta, ToolCallDelta};
+    use super::PendingCall;
+
+    let mut stream = res.bytes_stream();
+    let mut decoder = crate::utf8stream::StreamDecoder::new();
+    let mut buf = String::new();
+    let mut text = String::new();
+    let mut calls: Vec<PendingCall> = Vec::new();
+    // First text delta of the round announces WHICH subtask is talking.
+    let mut announced = false;
+
+    macro_rules! emit {
+        ($chunk:expr) => {{
+            if !$chunk.is_empty() {
+                if !announced {
+                    announced = true;
+                    emit_text(app, run_id, format!("\n\n**▸ {}** ", title));
+                }
+                text.push_str(&$chunk);
+                emit_text(app, run_id, $chunk.to_string());
+            }
+        }};
+    }
+
+    loop {
+        let chunk = tokio::select! {
+            c = stream.next() => match c {
+                Some(c) => c,
+                None => break,
+            },
+            _ = crate::cancel::cancel_signal(run_id) => {
+                drop(stream);
+                return Err(crate::cancel::STOPPED.to_string());
+            }
+        };
+        let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
+        buf.push_str(&decoder.push(&bytes));
+
+        while let Some(idx) = buf.find('\n') {
+            let line = buf[..idx].trim().to_string();
+            buf.drain(..idx + 1);
+            // Ollama NDJSON: no "data: " prefix — same as the main loop.
+            let Some(data) = line.strip_prefix("data: ").unwrap_or(&line).trim().into() else {
+                continue;
+            };
+            if data == "[DONE]" || data.is_empty() {
+                continue;
+            }
+            if anthropic {
+                let Ok(ev) = serde_json::from_str::<AnthropicStreamEvent>(data) else {
+                    continue;
+                };
+                if let Some(err) = ev.error {
+                    return Err(err.message.unwrap_or_else(|| "provider error".into()));
+                }
+                match ev.kind.as_deref() {
+                    Some("content_block_start") => {
+                        if let Some(AnthropicBlock { kind: Some(k), id, name }) = ev.content_block {
+                            if k == "tool_use" {
+                                let i = ev.index.unwrap_or(calls.len());
+                                while calls.len() <= i {
+                                    calls.push(PendingCall::default());
+                                }
+                                calls[i].id = id.unwrap_or_default();
+                                calls[i].name = name.unwrap_or_default();
+                            }
+                        }
+                    }
+                    Some("content_block_delta") => {
+                        if let Some(AnthropicStreamDelta { kind: Some(k), text: t, partial_json, .. }) = ev.delta {
+                            match k.as_str() {
+                                "text_delta" => {
+                                    if let Some(t) = t {
+                                        emit!(t);
+                                    }
+                                }
+                                "input_json_delta" => {
+                                    if let Some(j) = partial_json {
+                                        let i = ev.index.unwrap_or(0);
+                                        while calls.len() <= i {
+                                            calls.push(PendingCall::default());
+                                        }
+                                        calls[i].args.push_str(&j);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                let Ok(parsed) = serde_json::from_str::<StreamChunk>(data) else {
+                    continue;
+                };
+                if let Some(err) = parsed.error {
+                    return Err(err.message.unwrap_or_else(|| "provider error".into()));
+                }
+                let Some(choices) = parsed.choices else { continue };
+                for choice in choices {
+                    let Some(StreamDelta { content, tool_calls, .. }) = choice.delta else {
+                        continue;
+                    };
+                    if let Some(c) = content {
+                        emit!(c);
+                    }
+                    if let Some(partials) = tool_calls {
+                        for ToolCallDelta { index, id, function } in partials {
+                            let i = index.unwrap_or(calls.len());
+                            while calls.len() <= i {
+                                calls.push(PendingCall::default());
+                            }
+                            if let Some(id) = id {
+                                calls[i].id = id;
+                            }
+                            if let Some(FunctionDelta { name, arguments }) = function {
+                                if let Some(n) = name {
+                                    calls[i].name.push_str(&n);
+                                }
+                                if let Some(a) = arguments {
+                                    calls[i].args.push_str(&a);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if announced {
+        emit_text(app, run_id, "\n".to_string());
+    }
+    Ok((text, calls.into_iter().filter(|c| !c.name.is_empty()).collect()))
 }
 
 fn trim_detail(s: &str) -> String {
@@ -262,6 +400,13 @@ pub(super) async fn run_decomposed(
         .map(|t| t.text.clone())
         .unwrap_or_default();
     if user_prompt.trim().is_empty() {
+        return run_protocol(app, run_id, req, system, root, turns).await;
+    }
+
+    // SHORT prompts are never decomposition material — the planner call is
+    // skipped entirely (see prompt_needs_planning): no ceremony, no wasted
+    // seconds on "Привет что там по серверу".
+    if !crate::agent::planner::prompt_needs_planning(&user_prompt) {
         return run_protocol(app, run_id, req, system, root, turns).await;
     }
 

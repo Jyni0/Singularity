@@ -432,6 +432,76 @@ fn emit_step(app: &AppHandle, run_id: &str, index: usize, name: &str, input: Str
     );
 }
 
+/// Transient provider failures must not kill a whole run: "provider returned
+/// 502 Bad Gateway" ended generations that were one retry away from finishing.
+pub(super) fn is_transient_status(status: u16) -> bool {
+    status == 408 || status == 429 || (500..=504).contains(&status)
+}
+
+/// Send attempts for one round before giving up (1 try + 2 retries).
+pub(super) const RETRY_ATTEMPTS: usize = 3;
+
+/// Sends a provider request, retrying transient failures (429/5xx/connection
+/// resets) with a short backoff. The user SEES each retry in the chat instead
+/// of watching the run die. `build` creates a fresh RequestBuilder per
+/// attempt — reqwest builders are not Clone.
+pub(super) async fn send_with_retry(
+    app: &AppHandle,
+    run_id: &str,
+    build: impl Fn() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, String> {
+    let mut last_err = String::from("request failed");
+    for attempt in 0..RETRY_ATTEMPTS {
+        if is_cancelled(run_id) {
+            return Err(crate::cancel::STOPPED.to_string());
+        }
+        let res = tokio::select! {
+            r = build().send() => r,
+            _ = crate::cancel::cancel_signal(run_id) => {
+                return Err(crate::cancel::STOPPED.to_string());
+            }
+        };
+        match res {
+            Ok(r) => {
+                let status = r.status();
+                if status.is_success()
+                    || !is_transient_status(status.as_u16())
+                    || attempt + 1 == RETRY_ATTEMPTS
+                {
+                    return Ok(r);
+                }
+                last_err = format!("provider returned {status}");
+            }
+            Err(e) => {
+                if attempt + 1 == RETRY_ATTEMPTS {
+                    return Err(format!("request failed: {e}"));
+                }
+                last_err = format!("connection error: {e}");
+            }
+        }
+        // Backoff 1s, 2s — long enough for a gateway to recover, short enough
+        // to stay responsive. Stop still works while waiting.
+        let wait = std::time::Duration::from_millis(1000 * 2u64.pow(attempt as u32));
+        emit_text(
+            app,
+            run_id,
+            format!(
+                "\n\n⚠️ {last_err} — retrying in {}s ({}/{})…\n",
+                wait.as_secs(),
+                attempt + 1,
+                RETRY_ATTEMPTS
+            ),
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = crate::cancel::cancel_signal(run_id) => {
+                return Err(crate::cancel::STOPPED.to_string());
+            }
+        }
+    }
+    Err(last_err)
+}
+
 /// Runs the model's ssh_exec call through the shared SSH pool. The unit name
 /// from the model maps to a saved server id; credentials never leave Rust.
 /// Every attempt is audit-logged with actor "agent" (the Logs page shows it).
@@ -470,14 +540,14 @@ pub struct RunUsage {
 }
 
 #[derive(Deserialize)]
-struct ApiError {
-    message: Option<String>,
+pub(super) struct ApiError {
+    pub message: Option<String>,
 }
 
 /// One accumulated tool call. Arguments arrive split across chunks.
 #[derive(Default, Clone)]
-struct PendingCall {
-    id: String,
-    name: String,
-    args: String,
+pub(super) struct PendingCall {
+    pub id: String,
+    pub name: String,
+    pub args: String,
 }

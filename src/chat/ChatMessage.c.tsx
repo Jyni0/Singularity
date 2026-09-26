@@ -4,6 +4,7 @@ import * as db from "../core/db.r";
 import { formatDuration } from "../utils/format.u";
 import { Markdown, ToolCall, ThinkBlock } from "./Markdown.c";
 import { FileIcon } from "./FileIcon.c";
+import { GourabDock } from "./Gourab.c";
 import type { Segment } from "./message.i";
 
 /*
@@ -342,6 +343,7 @@ export function ChatMessage({
   // Segments keep prose and tool calls in the order they happened.
   if (segments && segments.length > 0) {
     const grouped = groupSegments(segments);
+    const usage = segments.find((s): s is Extract<Segment, { kind: "usage" }> => s.kind === "usage");
     return (
       <div className="group -mx-3 flex flex-col gap-1.5 rounded-xl px-3 py-2 transition-colors hover:bg-[var(--hover-bg)]/40">
         {grouped.map((seg, i) => {
@@ -360,9 +362,8 @@ export function ChatMessage({
               />
             );
           }
-          if (seg.kind === "usage") {
-            return debugMode ? <UsageHud key={"u" + i} usage={seg.usage} streaming={!!streaming} /> : null;
-          }
+          // Debug stats are pinned to the very bottom of the turn instead.
+          if (seg.kind === "usage") return null;
           if (seg.kind === "think") {
             return seg.text.trim() ? <ThinkBlock key={`k${i}`} text={seg.text} live={!!streaming && isLast} /> : null;
           }
@@ -371,22 +372,20 @@ export function ChatMessage({
           }
           return null;
         })}
-        <LiveTail streaming={streaming} lastChange={lastChange} />
+        <LiveTail streaming={streaming} lastChange={lastChange} segments={segments} />
         <div className="flex items-center justify-between">
           {actions || <span />}
           <DurationFooter streaming={streaming} durationMs={durationMs} />
         </div>
+        {debugMode && usage && <UsageHud usage={usage.usage} streaming={!!streaming} />}
       </div>
     );
   }
 
   return (
     <div className="group -mx-3 flex flex-col gap-1.5 rounded-xl px-3 py-2 transition-colors hover:bg-[var(--hover-bg)]/40">
-      {answerText ? (
-        <Markdown text={text} />
-      ) : streaming ? (
-        <WorkingIndicator label="Thinking…" />
-      ) : null}
+      {answerText && <Markdown text={text} />}
+      <LiveTail streaming={streaming} lastChange={lastChange} />
       <div className="flex items-center justify-between">
         {actions || <span />}
         <DurationFooter streaming={streaming} durationMs={durationMs} />
@@ -396,33 +395,25 @@ export function ChatMessage({
 }
 
 /**
- * Live "the model is doing something" line, driven by ACTIVITY: it shows
- * once the turn has been quiet for 2s, with a ticking elapsed figure.
+ * Live "the model is doing something" row: Gourab acting out the current
+ * activity, with a ticking figure once the turn has been quiet for 2s.
  */
-function LiveTail({ streaming, lastChange }: { streaming?: boolean; lastChange: { current: number } }) {
+function LiveTail({
+  streaming,
+  lastChange,
+  segments,
+}: {
+  streaming?: boolean;
+  lastChange: { current: number };
+  segments?: Segment[];
+}) {
   const [, tick] = useState(0);
   useEffect(() => {
     if (!streaming) return;
     const id = setInterval(() => tick((n) => n + 1), 1000);
     return () => clearInterval(id);
   }, [streaming]);
-  if (!streaming) return null;
-  const quietMs = Date.now() - lastChange.current;
-  if (quietMs < 2000) return null;
-  return <WorkingIndicator label={"Working… " + formatDuration(quietMs)} />;
-}
-
-/** Pulsing "working" line for a live run with nothing new on screen. */
-function WorkingIndicator({ label }: { label: string }) {
-  return (
-    <div className="flex items-center gap-2 px-1.5 py-0.5 text-[12px] text-[var(--text-dim)]">
-      <span className="relative flex h-2 w-2">
-        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--accent)] opacity-60" />
-        <span className="relative inline-flex h-2 w-2 rounded-full bg-[var(--accent)]" />
-      </span>
-      <span className="animate-pulse">{label}</span>
-    </div>
-  );
+  return <GourabDock streaming={streaming} segments={segments} quietMs={Date.now() - lastChange.current} />;
 }
 
 /* ---------- Debug mode: live token HUD ---------- */

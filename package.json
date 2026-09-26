@@ -14,6 +14,7 @@
     "icons": "tauri icon app-icon.png && python scripts/generate_icons.py"
   },
   "dependencies": {
+    "@blobatar/react": "^2.7.0",
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-dialog": "^2.7.3",
@@ -22,6 +23,7 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-web-links": "^0.12.0",
     "@xterm/xterm": "^6.0.0",
+    "blobatar": "^2.7.0",
     "lucide-react": "^1.47.0",
     "motion": "^13.4.0",
     "react": "^18.3.1",

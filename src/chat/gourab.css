@@ -1,0 +1,237 @@
+/* Gourab — body acts and props. The face itself is blobatar/motion.css. */
+
+.gourab {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  margin-right: 12px; /* room for the props that orbit him */
+}
+.gourab-body {
+  width: 34px;
+  height: 34px;
+  transform-origin: 50% 90%;
+}
+.gourab-body svg {
+  display: block;
+  overflow: visible;
+}
+
+/* ---- Body acts ---- */
+
+/* Thinking: slow sway, head cocked. */
+.gourab-thinking .gourab-body { animation: gourab-sway 2.4s ease-in-out infinite; }
+@keyframes gourab-sway {
+  0%, 100% { transform: rotate(-5deg); }
+  50% { transform: rotate(5deg) translateY(-1px); }
+}
+
+/* Coding: quick typing bounces with a squash on every "key". */
+.gourab-coding .gourab-body { animation: gourab-type 0.32s ease-in-out infinite; }
+@keyframes gourab-type {
+  0%, 100% { transform: translateY(0) scale(1.04, 0.96); }
+  50% { transform: translateY(-2.5px) scale(0.97, 1.03); }
+}
+
+/* Reading / searching: leaning in, scanning side to side. */
+.gourab-reading .gourab-body { animation: gourab-scan 2s ease-in-out infinite; }
+.gourab-searching .gourab-body { animation: gourab-scan 1.1s ease-in-out infinite; }
+@keyframes gourab-scan {
+  0%, 100% { transform: translateX(-2px) rotate(-4deg); }
+  50% { transform: translateX(2px) rotate(4deg); }
+}
+
+/* Running: excited hops. */
+.gourab-running .gourab-body { animation: gourab-hop 0.7s cubic-bezier(0.3, 0, 0.4, 1) infinite; }
+@keyframes gourab-hop {
+  0%, 100% { transform: translateY(0) scale(1.06, 0.94); }
+  35% { transform: translateY(-6px) scale(0.95, 1.05); }
+  60% { transform: translateY(0) scale(1.08, 0.92); }
+  75% { transform: translateY(0) scale(1, 1); }
+}
+
+/* Delegating: a little wave-lean toward the helper. */
+.gourab-delegating .gourab-body { animation: gourab-lean 1.2s ease-in-out infinite; }
+@keyframes gourab-lean {
+  0%, 100% { transform: rotate(0); }
+  50% { transform: rotate(10deg) translateX(1px); }
+}
+
+/* Writing the answer: nodding along while talking. */
+.gourab-writing .gourab-body { animation: gourab-nod 0.9s ease-in-out infinite; }
+@keyframes gourab-nod {
+  0%, 100% { transform: translateY(0) rotate(0); }
+  50% { transform: translateY(1px) rotate(-3deg) scale(1.02, 0.98); }
+}
+
+/* Retrying: droopy and deflated. */
+.gourab-retrying .gourab-body { animation: gourab-droop 2.2s ease-in-out infinite; }
+@keyframes gourab-droop {
+  0%, 100% { transform: translateY(1px) scale(1.04, 0.94); }
+  50% { transform: translateY(2px) scale(1.07, 0.9) rotate(-3deg); }
+}
+
+/* Done: a victory jump with a spin, once. */
+.gourab-done .gourab-body { animation: gourab-jump 0.9s cubic-bezier(0.3, 0, 0.3, 1) 1 both; }
+@keyframes gourab-jump {
+  0% { transform: scale(1.1, 0.88); }
+  40% { transform: translateY(-9px) rotate(-180deg) scale(0.95, 1.05); }
+  75% { transform: translateY(0) rotate(-360deg) scale(1.1, 0.9); }
+  100% { transform: translateY(0) rotate(-360deg) scale(1); }
+}
+
+/* ---- Props ---- */
+
+.gourab-glyph {
+  position: absolute;
+  bottom: 60%;
+  font: 600 8.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--accent);
+  opacity: 0;
+  pointer-events: none;
+  white-space: nowrap;
+  animation: gourab-glyph 1.7s ease-out infinite;
+}
+@keyframes gourab-glyph {
+  0% { opacity: 0; transform: translate(0, 4px) scale(0.6); }
+  20% { opacity: 1; }
+  100% { opacity: 0; transform: translate(6px, -16px) scale(1) rotate(12deg); }
+}
+
+.gourab-lens {
+  position: absolute;
+  right: -7px;
+  bottom: 0;
+  color: var(--accent);
+  pointer-events: none;
+  animation: gourab-lens 2s ease-in-out infinite;
+}
+.gourab-lens-fast { animation-duration: 1.1s; }
+@keyframes gourab-lens {
+  0%, 100% { transform: translate(-22px, -2px) rotate(-10deg); }
+  50% { transform: translate(0, -6px) rotate(15deg); }
+}
+
+.gourab-prompt {
+  position: absolute;
+  right: -12px;
+  top: -4px;
+  padding: 0 2px;
+  border-radius: 3px;
+  background: var(--hover-bg);
+  font: 700 8.5px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--accent);
+  pointer-events: none;
+}
+.gourab-caret { animation: gourab-blink 0.8s steps(1) infinite; }
+@keyframes gourab-blink {
+  50% { opacity: 0; }
+}
+
+.gourab-bubble {
+  position: absolute;
+  right: -6px;
+  top: 2px;
+  border-radius: 999px;
+  border: 1.5px solid var(--text-dim);
+  opacity: 0;
+  pointer-events: none;
+  animation: gourab-bubble 1.4s ease-out infinite;
+}
+@keyframes gourab-bubble {
+  0% { opacity: 0; transform: translate(0, 0) scale(0.5); }
+  30% { opacity: 0.9; }
+  100% { opacity: 0; transform: translate(8px, -14px) scale(1.1); }
+}
+
+.gourab-minion {
+  position: absolute;
+  left: 20px;
+  bottom: 0;
+  pointer-events: none;
+  animation: gourab-minion 1.6s cubic-bezier(0.3, 0, 0.3, 1) infinite;
+}
+.gourab-minion svg { display: block; overflow: visible; }
+@keyframes gourab-minion {
+  0% { opacity: 0; transform: translate(-10px, 0) scale(0.3); }
+  25% { opacity: 1; transform: translate(0, -10px) scale(1); }
+  55% { transform: translate(6px, 0) scale(1.05, 0.9); }
+  80% { opacity: 1; transform: translate(10px, -4px) scale(1); }
+  100% { opacity: 0; transform: translate(14px, 0) scale(0.8); }
+}
+
+.gourab-talk {
+  position: absolute;
+  top: 45%;
+  right: -9px;
+  width: 3px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--accent);
+  opacity: 0;
+  pointer-events: none;
+  animation: gourab-talk 0.9s ease-out infinite;
+}
+@keyframes gourab-talk {
+  0% { opacity: 0; transform: translate(0, 0); }
+  30% { opacity: 1; }
+  100% { opacity: 0; transform: translate(8px, -3px); }
+}
+
+.gourab-sweat {
+  position: absolute;
+  right: 1px;
+  top: 3px;
+  width: 5px;
+  height: 7px;
+  border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+  background: #7cc4ff;
+  pointer-events: none;
+  animation: gourab-sweat 1.8s ease-in infinite;
+}
+@keyframes gourab-sweat {
+  0% { opacity: 0; transform: translateY(-2px) scale(0.5); }
+  25% { opacity: 1; transform: translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateY(12px) scale(0.9); }
+}
+
+.gourab-spark {
+  position: absolute;
+  font-size: 9px;
+  line-height: 1;
+  color: var(--accent);
+  opacity: 0;
+  pointer-events: none;
+  animation: gourab-spark 1s ease-out 0.25s 2;
+}
+.gourab-spark-0 { left: -6px; top: 0; --dx: -6px; --dy: -8px; }
+.gourab-spark-1 { right: -6px; top: -2px; --dx: 6px; --dy: -9px; }
+.gourab-spark-2 { left: -8px; bottom: 4px; --dx: -8px; --dy: 2px; animation-delay: 0.4s; }
+.gourab-spark-3 { right: -8px; bottom: 6px; --dx: 8px; --dy: 1px; animation-delay: 0.4s; }
+@keyframes gourab-spark {
+  0% { opacity: 0; transform: translate(0, 0) scale(0.4) rotate(0); }
+  40% { opacity: 1; }
+  100% { opacity: 0; transform: translate(var(--dx), var(--dy)) scale(1.2) rotate(90deg); }
+}
+
+/* "…" that keeps typing itself after the label. */
+.gourab-label::after {
+  content: "";
+  display: inline-block;
+  width: 1.2em;
+  text-align: left;
+  animation: gourab-dots 1.2s steps(4) infinite;
+}
+@keyframes gourab-dots {
+  0% { content: ""; }
+  25% { content: "."; }
+  50% { content: ".."; }
+  75% { content: "..."; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gourab *,
+  .gourab-label::after {
+    animation: none !important;
+  }
+}

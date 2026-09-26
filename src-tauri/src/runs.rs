@@ -37,9 +37,6 @@ pub enum RunEvent {
         old_text: Option<String>,
         new_text: Option<String>,
     },
-    Tasks {
-        tasks: serde_json::Value,
-    },
     /// A command waiting for Allow/Deny. Buffered so a WebView reload can
     /// re-show the banner — otherwise the run waits forever for an answer
     /// nobody can give anymore.
@@ -114,6 +111,18 @@ pub fn push_event(run_id: &str, ev: RunEvent) {
                     return;
                 }
                 _ => {}
+            }
+            // Live card updates of a call still streaming its arguments
+            // replace the previous update instead of stacking up.
+            if let (
+                RunEvent::Step { index, done: false, .. },
+                Some(last @ RunEvent::Step { done: false, .. }),
+            ) = (&ev, slot.events.last_mut())
+            {
+                if matches!(last, RunEvent::Step { index: i, .. } if i == index) {
+                    *last = ev;
+                    return;
+                }
             }
             slot.events.push(ev);
             if slot.events.len() > MAX_EVENTS {

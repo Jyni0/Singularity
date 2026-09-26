@@ -7,6 +7,8 @@ import { Combobox } from "../ui/Combobox.c";
 import { SBUTTON, SINPUT } from "../ui/tokens.s";
 import { ScrollArea, ScrollBox } from "../ui/ScrollArea.c";
 import { ModelsSettings } from "./ModelsSettings.c";
+import { AgentsSettings } from "./AgentsSettings.c";
+import type * as db from "../core/db.r";
 import { TerminalSettings } from "./TerminalSettings.c";
 import { ProjectSelect, ProjectSettingsPanel } from "./ProjectSettings.c";
 import { SettingRow, SettingsCard, Sep } from "./SettingsParts.c";
@@ -18,6 +20,7 @@ export type SettingsSection =
   | "projects"
   | "project-settings"
   | "models"
+  | "agents"
   | "terminal"
   | "about";
 
@@ -39,11 +42,20 @@ export function SettingsModal({
   onGlobalAutoRun,
   debugMode,
   onDebugMode,
+  subagents,
+  onSubagents,
+  maxAgents,
+  onMaxAgents,
   initialProject,
   initialSection,
   mode = "agent",
   onClose,
 }: {
+  /** Helper agents (Settings → Agent). */
+  subagents: db.Subagent[];
+  onSubagents: (next: db.Subagent[]) => void;
+  maxAgents: number;
+  onMaxAgents: (n: number) => void;
   theme: Theme;
   onTheme: (t: Theme) => void;
   projects: Project[];
@@ -109,6 +121,7 @@ export function SettingsModal({
       ? [
           { id: "general", label: "General" },
           { id: "models", label: "Models" },
+          { id: "agents", label: "Agent" },
         ]
       : [
           { id: "general", label: "General" },
@@ -134,6 +147,7 @@ export function SettingsModal({
   const titles: Record<SettingsSection, [string, string]> = {
     general: ["General", "Appearance, theme and workspace defaults"],
     models: ["Models", "Connect providers and manage the models they expose"],
+    agents: ["Agent", "Helper subagents and how many can work at once"],
     permissions: ["Global Permissions", "Tool and filesystem access rules"],
     projects: ["Manage Projects", "Create and organize project folders"],
     "project-settings": ["Project Settings", "Rename, permissions and delete for one project"],
@@ -247,6 +261,15 @@ export function SettingsModal({
               persistent={persistent}
               onProvidersChanged={onProvidersChanged}
               onModelsChanged={onModelsChanged}
+            />
+          )}
+
+          {effectiveSection === "agents" && (
+            <AgentsSettings
+              subagents={subagents}
+              onChange={onSubagents}
+              maxAgents={maxAgents}
+              onMaxAgents={onMaxAgents}
             />
           )}
 

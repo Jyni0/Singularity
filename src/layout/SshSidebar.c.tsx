@@ -97,6 +97,7 @@ export function SshSidebar({
           <ChevronRight size={12} strokeWidth={2} />
         </motion.span>
       </button>
+      {count ? "" : ""}
       {tab && (
         <span className="ml-auto flex items-center gap-2">
           <button

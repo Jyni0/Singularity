@@ -376,6 +376,39 @@ export interface MessageMeta {
   segmentsJson?: string;
 }
 
+/**
+ * Drops every stored message of a conversation from the `nth` USER message
+ * on (0-based) — "edit and resend" rewinds the chat to that prompt. User
+ * turns are always persisted, so counting them maps the on-screen position
+ * to the stored rows even when unsaved error notes sit in between.
+ */
+export async function truncateFromUserMessage(conversationId: string, nth: number): Promise<void> {
+  const db = await getDb();
+  if (!db) {
+    const rows = memory.messages.filter((m) => m.conversation_id === conversationId);
+    const users = rows.filter((m) => m.role === "user");
+    const cut = users[nth];
+    if (!cut) return;
+    const from = rows.indexOf(cut);
+    const drop = new Set(rows.slice(from));
+    memory.messages = memory.messages.filter((m) => !drop.has(m));
+    return;
+  }
+  const rows = await db.select<{ rowid: number; role: string }[]>(
+    `SELECT rowid, role FROM messages WHERE conversation_id = $1 ORDER BY created_at, rowid`,
+    [conversationId]
+  );
+  let seen = -1;
+  const from = rows.findIndex((r) => r.role === "user" && ++seen === nth);
+  if (from < 0) return;
+  const ids = rows.slice(from).map((r) => r.rowid);
+  if (!ids.length) return;
+  await db.execute(
+    `DELETE FROM messages WHERE rowid IN (${ids.map((_, i) => "$" + (i + 1)).join(",")})`,
+    ids
+  );
+}
+
 export async function appendMessage(
   conversationId: string,
   role: "user" | "agent",
@@ -1027,18 +1060,47 @@ export interface AgentRequest {
   provider_id?: string;
   /** Max requests/minute for the provider (0 = unlimited). */
   rate_limit_rpm?: number;
-  /** Max parallel requests (0 = unlimited) — also the subtask parallelism. */
+  /** Max parallel requests (0 = unlimited). */
   concurrency?: number;
-  /** Decompose this prompt into parallel subtasks (Task list) first. */
-  decompose?: boolean;
+  /** Sampling temperature; omitted = the provider's default. */
+  temperature?: number | null;
+  /** Helper agents the main agent may delegate to (Settings → Agent). */
+  subagents?: Subagent[];
+  /** How many helper agents may work at the same time. */
+  max_agents?: number;
 }
 
-/** One subtask of a decomposed run (agent://tasks event). */
-export interface TaskState {
-  id: number;
-  title: string;
-  status: "pending" | "running" | "done" | "error" | string;
-  summary?: string;
+/** A user-defined helper agent (stored in settings as "subagents"). */
+export interface Subagent {
+  id: string;
+  name: string;
+  /** When the main agent should use it. */
+  description: string;
+  /** The helper's own system prompt. */
+  prompt: string;
+  /** Disabled helpers are kept but not offered to the model. */
+  enabled: boolean;
+}
+
+/** Saved helper agents. */
+export async function loadSubagents(): Promise<Subagent[]> {
+  try {
+    const raw = await getSetting("subagents");
+    const parsed = raw ? (JSON.parse(raw) as Subagent[]) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function saveSubagents(list: Subagent[]): Promise<void> {
+  await setSetting("subagents", JSON.stringify(list));
+}
+
+/** How many helper agents may run at once (default 2). */
+export async function loadMaxAgents(): Promise<number> {
+  const n = Number(await getSetting("max_agents"));
+  return Number.isFinite(n) && n >= 1 ? Math.min(n, 8) : 2;
 }
 
 /**
@@ -1203,8 +1265,6 @@ export async function runAgent(
     onThink?: (delta: string) => void;
     /** A command is waiting for permission; the UI shows Allow/Deny. */
     onConfirm?: (req: ConfirmRequest) => void;
-    /** Task-list updates from a decomposed run (plan → statuses → merge). */
-    onTasks?: (tasks: TaskState[]) => void;
     /** Cumulative token usage — the Debug mode HUD. */
     onUsage?: (usage: RunUsage) => void;
   }
@@ -1235,10 +1295,6 @@ export async function runAgent(
     listen<ConfirmRequest>("agent://confirm", (e) => {
       if (e.payload.run_id !== runId) return;
       handlers.onConfirm?.(e.payload);
-    }),
-    listen<{ run_id: string; tasks: TaskState[] }>("agent://tasks", (e) => {
-      if (e.payload.run_id !== runId) return;
-      handlers.onTasks?.(e.payload.tasks);
     }),
     listen<RunUsage>("agent://usage", (e) => {
       if (e.payload.run_id !== runId) return;
@@ -1281,7 +1337,6 @@ export type RunEvent =
       old_text?: string;
       new_text?: string;
     }
-  | { kind: "Tasks"; tasks: TaskState[] }
   /** A command waiting for Allow/Deny — re-shown after a reload. */
   | { kind: "Confirm"; command: string; cwd: string }
   /** Terminal markers, present only in a finished run's buffer. */
@@ -1321,7 +1376,6 @@ export function resumeAgent(
     onText: (delta: string) => void;
     onStep: (step: AgentStepEvent) => void;
     onThink?: (delta: string) => void;
-    onTasks?: (tasks: TaskState[]) => void;
     /** The re-attached run may ask for command permission — without this the
      *  run would hang forever waiting for an Allow/Deny nobody can see. */
     onConfirm?: (req: ConfirmRequest) => void;
@@ -1357,12 +1411,6 @@ export function resumeAgent(
         await listen<{ run_id: string; delta: string }>("agent://think", (e) => {
           if (e.payload.run_id !== runId) return;
           handlers.onThink?.(e.payload.delta);
-        })
-      );
-      offs.push(
-        await listen<{ run_id: string; tasks: TaskState[] }>("agent://tasks", (e) => {
-          if (e.payload.run_id !== runId) return;
-          handlers.onTasks?.(e.payload.tasks);
         })
       );
       offs.push(

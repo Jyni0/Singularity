@@ -1,17 +1,18 @@
 import { useState, useEffect, useRef } from "react";
 import { motion } from "motion/react";
-import { Send, X, Square, Mic, Loader2, Paperclip, FileText, ListChecks } from "lucide-react";
+import { Send, X, Square, Mic, Loader2, Paperclip, FileText } from "lucide-react";
 import * as db from "../core/db.r";
 import type { Project, Gateway, Attachment, Effort } from "../core/types.i";
+import type { ChatSelection } from "../hooks/useChat.h";
 import { toAttachments, formatSize } from "../utils/attachments.u";
 import { useDictation } from "../hooks/useDictation.h";
 import { useOverlayThumb } from "../hooks/useOverlayThumb.h";
-import { CHIP_CTX } from "../ui/tokens.s";
 import { Thumb } from "../ui/Thumb.c";
 
 import { ModelSelector } from "./ModelSelector.c";
 import { ProjectPicker } from "./ProjectPicker.c";
 import { EffortChip } from "./EffortChip.c";
+import { TemperatureChip } from "./TemperatureChip.c";
 
 export function PromptBox({
   onSend,
@@ -25,11 +26,7 @@ export function PromptBox({
   pickedModel,
   onPickModel,
 }: {
-  onSend: (
-    text: string,
-    selection: { gatewayId: string; modelId: string; effort: Effort; decompose: boolean },
-    attachments: Attachment[]
-  ) => void;
+  onSend: (text: string, selection: ChatSelection, attachments: Attachment[]) => void;
   projects: Project[];
   project: string;
   onSelectProject: (name: string) => void;
@@ -49,25 +46,11 @@ export function PromptBox({
   const [effort, setEffort] = useState<Effort>(
     () => (localStorage.getItem("effort") as Effort) || "medium"
   );
-  /** Task mode: the prompt is first split into a task list, then the subtasks
-   *  run in parallel (bounded by the provider's concurrency limit). The state
-   *  lives in the DATABASE ("по базе") so it survives everything; localStorage
-   *  only seeds the first paint before the DB read lands. */
-  const [decompose, setDecompose] = useState(
-    () => localStorage.getItem("decompose") === "1"
-  );
-  useEffect(() => {
-    let dead = false;
-    void db.getSetting("tasks_mode").then((v) => {
-      if (dead || v === null) return;
-      const on = v === "1";
-      setDecompose(on);
-      localStorage.setItem("decompose", on ? "1" : "0");
-    });
-    return () => {
-      dead = true;
-    };
-  }, []);
+  /** Sampling temperature — null keeps the provider default. */
+  const [temperature, setTemperature] = useState<number | null>(() => {
+    const t = localStorage.getItem("temperature");
+    return t === null || t === "" ? null : Number(t);
+  });
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -191,12 +174,17 @@ export function PromptBox({
     localStorage.setItem("effort", next);
   };
 
+  const pickTemperature = (next: number | null) => {
+    setTemperature(next);
+    localStorage.setItem("temperature", next === null ? "" : String(next));
+  };
+
   const send = () => {
     // A prompt can be just attachments — that is a legitimate request.
     if (!text.trim() && attachments.length === 0) return;
     // Sending cancels an in-flight recording instead of transcribing it.
     speech.cancel();
-    onSend(text.trim(), { gatewayId, modelId, effort, decompose }, attachments);
+    onSend(text.trim(), { gatewayId, modelId, effort, temperature }, attachments);
     setText("");
     setAttachments([]);
     setNotice(null);
@@ -312,25 +300,8 @@ export function PromptBox({
               />
               {/* Reasoning effort — low is fast, high thinks harder. */}
               <EffortChip effort={effort} onPick={pickEffort} />
-              {/* Task decomposition: split the prompt into a task list and run
-                  the subtasks in parallel under the provider's limits. */}
-              <span
-                className={
-                  decompose
-                    ? "inline-flex h-6 shrink-0 cursor-pointer items-center gap-1.5 rounded-md bg-[var(--accent)]/15 px-2 text-[11px] text-[var(--accent)]"
-                    : CHIP_CTX
-                }
-                onClick={() => {
-                  const next = !decompose;
-                  setDecompose(next);
-                  localStorage.setItem("decompose", next ? "1" : "0");
-                  void db.setSetting("tasks_mode", next ? "1" : "0");
-                }}
-                title="Task mode: decompose the prompt into a task list and run subtasks in parallel"
-              >
-                <ListChecks size={12} strokeWidth={1.5} />
-                Tasks
-              </span>
+              {/* Sampling temperature — Auto keeps the provider default. */}
+              <TemperatureChip value={temperature} onPick={pickTemperature} />
             </div>
 
             <div className="flex shrink-0 items-center gap-1">

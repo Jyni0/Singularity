@@ -8,7 +8,7 @@ import "@xterm/xterm/css/xterm.css";
 import * as db from "../core/db.r";
 import type { SshServer } from "../core/types.i";
 import { DEFAULT_TERMINAL_THEME, terminalTheme } from "../ui/TerminalTheme.s";
-import { OsLogo } from "../ui/OsLogo.c";
+// import { OsLogo } from "../ui/OsLogo.c";
 
 /** Fallbacks for the ssh_* appearance settings (persisted in SQLite). */
 const DEFAULT_SSH_TERMINAL = {

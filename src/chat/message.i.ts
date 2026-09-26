@@ -5,13 +5,11 @@
  */
 import type * as db from "../core/db.r";
 
-/** One piece of an agent turn: reasoning, prose, a tool call, or the
- *  decomposed run's task list (titles + live statuses). */
+/** One piece of an agent turn: reasoning, prose or a tool call. */
 export type Segment =
   | { kind: "think"; text: string }
   | { kind: "text"; text: string }
   | { kind: "step"; step: db.AgentStepEvent }
-  | { kind: "tasks"; tasks: db.TaskState[] }
   /** Debug-mode token accounting of this turn (live while streaming). */
   | { kind: "usage"; usage: db.RunUsage };
 

@@ -16,19 +16,12 @@ export function collectSteps(msgs: Msg[]): db.AgentStepEvent[] {
 }
 
 /** Turns a stored row back into a renderable message (duration + photos + steps). */
-/** A stored turn can hold statuses that only make sense live: steps the run
- *  never finished (done=false) and tasks left "running" when the user stopped
- *  the run. Freeze them on load so nothing animates forever. */
+/** A stored turn can hold steps the run never finished (done=false) —
+ *  freeze them on load so nothing animates forever. */
 function freezeStatus(segments: Segment[] | undefined): Segment[] | undefined {
   if (!segments) return segments;
   return segments.map((s) => {
     if (s.kind === "step" && !s.step.done) return { kind: "step", step: { ...s.step, done: true } };
-    if (s.kind === "tasks") {
-      return {
-        kind: "tasks",
-        tasks: s.tasks.map((t) => (t.status === "running" ? { ...t, status: "pending" } : t)),
-      };
-    }
     return s;
   });
 }
@@ -46,13 +39,14 @@ export function storedToMsg(m: db.StoredMessage): Msg {
   // Segments (migration 9) carry the tool steps and think blocks, so a
   // restored turn renders exactly like the live one — cards, outputs and
   // panel tabs included. Unmarked in-flight steps are re-flagged as done:
-  // nothing is running anymore once the row was stored.
+  // nothing is running anymore once the row was stored. Task boards of the
+  // removed Tasks mode are dropped.
   let segments: Segment[] | undefined;
   if (m.segments && m.segments !== "[]") {
     try {
       const parsed = JSON.parse(m.segments);
       if (Array.isArray(parsed) && parsed.length) {
-        segments = freezeStatus(parsed as Segment[]);
+        segments = freezeStatus((parsed as Segment[]).filter((s) => (s.kind as string) !== "tasks"));
       }
     } catch {
       /* stored before segments existed — fall back to plain text */
@@ -82,7 +76,7 @@ export function toolLabel(step: db.AgentStepEvent): string {
     write_file: "Write",
     edit_file: "Edit",
     apply_patch: "Patch",
-    plan: "Plan",
+    delegate: "Agent",
     list_dir: "List",
     grep: "Search",
     run_command: "Run",

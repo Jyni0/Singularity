@@ -46,3 +46,5 @@ aes-gcm = "0.11.1"
 # for a Russian locale), never UTF-8 — decoding it as UTF-8 produced the
 # "кириллица выглядит как мусор" bug.
 encoding_rs = "0.8"
+rig-core = "0.42"
+rig-agent = "0.42"

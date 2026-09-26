@@ -430,62 +430,6 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str) -> ToolResult {
     }
 }
 
-/// Extracts inline patches from free assistant text. A patch is a file path
-/// line immediately followed by one or more SEARCH/REPLACE blocks.
-/// Returns (path, diff-body) pairs so the agent loop can apply them exactly
-/// like explicit apply_patch calls — the model cannot bypass diff-only mode
-/// by pasting blocks into its reply instead of calling the tool.
-pub fn extract_inline_patches(text: &str) -> Vec<(String, String)> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut i = 0usize;
-    while i < lines.len() {
-        if lines[i].trim() == "<<<<<<< SEARCH" {
-            // The path is the nearest previous non-empty, non-marker line.
-            let mut path = String::new();
-            let mut j = i;
-            while j > 0 {
-                j -= 1;
-                let cand = lines[j].trim();
-                if cand.is_empty() {
-                    continue;
-                }
-                if cand.starts_with("<<<<<<<") || cand.starts_with("=======") || cand.starts_with(">>>>>>>") {
-                    break;
-                }
-                // Strip markdown fences / backticks around the path.
-                path = cand.trim_matches('`').trim().to_string();
-                break;
-            }
-            // Collect consecutive hunks.
-            let mut body: Vec<&str> = Vec::new();
-            while i < lines.len() {
-                body.push(lines[i]);
-                let is_end = lines[i].trim() == ">>>>>>> REPLACE";
-                i += 1;
-                if is_end {
-                    // Continue collecting while the next hunk starts right away.
-                    let mut k = i;
-                    while k < lines.len() && lines[k].trim().is_empty() {
-                        k += 1;
-                    }
-                    if k < lines.len() && lines[k].trim() == "<<<<<<< SEARCH" {
-                        i = k;
-                        continue;
-                    }
-                    break;
-                }
-            }
-            if !path.is_empty() {
-                out.push((path, body.join("\n")));
-            }
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
 /* ---------- Shell ---------- */
 
 /// Runs a command in `cwd` (the workspace when unset) and returns its output.
@@ -688,35 +632,6 @@ mod tests {
         assert_eq!(hunks.len(), 1);
         assert!(hunks[0].0.is_empty());
         assert_eq!(hunks[0].1, "new content");
-    }
-
-    #[test]
-    fn extracts_inline_patch_with_path_above() {
-        let text = [
-            "Here is the fix:",
-            "",
-            "src/app.tsx",
-            "<<<<<<< SEARCH",
-            "const a = 1;",
-            "=======",
-            "const a = 2;",
-            ">>>>>>> REPLACE",
-            "",
-            "Done.",
-        ]
-        .join("\n");
-        let patches = extract_inline_patches(&text);
-        assert_eq!(patches.len(), 1);
-        assert_eq!(patches[0].0, "src/app.tsx");
-        assert!(patches[0].1.contains("<<<<<<< SEARCH"));
-        assert!(patches[0].1.contains(">>>>>>> REPLACE"));
-    }
-
-    #[test]
-    fn strips_backtick_fenced_path() {
-        let text = "`src/app.tsx`\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE";
-        let patches = extract_inline_patches(text);
-        assert_eq!(patches[0].0, "src/app.tsx");
     }
 
     #[test]

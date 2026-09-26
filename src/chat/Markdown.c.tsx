@@ -9,7 +9,9 @@
  */
 import { useState, type ReactNode } from "react";
 import { ScrollBox } from "../ui/ScrollArea.c";
+import { FileIcon, baseName, dirName } from "./FileIcon.c";
 import {
+  Bot,
   Brain,
   Check,
   Copy,
@@ -17,7 +19,6 @@ import {
   FileDiff,
   FilePlus2,
   FolderOpen,
-  ListChecks,
   Loader2,
   Pencil,
   Search,
@@ -390,7 +391,7 @@ export function Markdown({ text }: { text: string }) {
   );
 }
 
-/* ---------- Agent tool call card ---------- */
+/* ---------- Agent tool call row ---------- */
 
 export interface ToolCallView {
   name: string;
@@ -398,71 +399,65 @@ export interface ToolCallView {
   result?: string;
   ok?: boolean;
   running?: boolean;
-  /** Opens this call in the side panel as its own tab. The card itself no
-    * longer expands — everything lives in the panel now. */
+  /** Opens this call in the side panel as its own tab. */
   onInspect?: () => void;
 }
 
 /** Each tool gets its own icon and verb, so the transcript reads at a glance. */
-export const TOOL_META: Record<
-  string,
-  { icon: typeof Terminal; label: string }
-> = {
+export const TOOL_META: Record<string, { icon: typeof Terminal; label: string }> = {
   read_file: { icon: Eye, label: "Read" },
   write_file: { icon: FilePlus2, label: "Write" },
   edit_file: { icon: Pencil, label: "Edit" },
-  apply_patch: { icon: FileDiff, label: "Patch" },
-  plan: { icon: ListChecks, label: "Plan" },
+  apply_patch: { icon: FileDiff, label: "Edit" },
   list_dir: { icon: FolderOpen, label: "List" },
   grep: { icon: Search, label: "Search" },
   run_command: { icon: Terminal, label: "Run" },
   ssh_exec: { icon: Server, label: "SSH" },
+  delegate: { icon: Bot, label: "Agent" },
 };
 
-/** Reasoning the model streamed before or between its actions. */
-export function ThinkBlock({
-  text,
-  live,
-}: {
-  text: string;
-  live?: boolean;
-}) {
-  // Collapsed while streaming would hide progress; open by default, and the
-  // user can fold it away once the turn is done.
-  const [open, setOpen] = useState(true);
+/** Tools whose input starts with a file path. */
+const FILE_TOOLS = new Set(["read_file", "write_file", "edit_file", "apply_patch"]);
 
+/**
+ * Splits a tool row's input into the file it touches and the rest:
+ * "src/a.ts (12–40)" → path "src/a.ts", extra "(12–40)". Subagent rows carry
+ * a "[Helper] " prefix, kept apart as the owner tag.
+ */
+function parseInput(name: string, input: string): { owner: string; path: string | null; extra: string } {
+  let rest = input;
+  let owner = "";
+  const m = /^\[([^\]]+)\] /.exec(rest);
+  if (m) {
+    owner = m[1];
+    rest = rest.slice(m[0].length);
+  }
+  if (FILE_TOOLS.has(name) || name === "list_dir") {
+    const sp = rest.search(/ [(…]/);
+    const path = (sp >= 0 ? rest.slice(0, sp) : rest).trim();
+    return { owner, path: path || (name === "list_dir" ? "." : null), extra: sp >= 0 ? rest.slice(sp).trim() : "" };
+  }
+  return { owner, path: null, extra: rest };
+}
+
+/** Reasoning the model streamed before or between its actions. */
+export function ThinkBlock({ text, live }: { text: string; live?: boolean }) {
+  // Open while streaming (progress must be visible), folded once done.
+  const [open, setOpen] = useState(!!live);
   return (
-    <div className="my-1 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-surface)]">
+    <div className="flex flex-col">
       <button
-        className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
+        className="flex w-fit items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[12px] text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-muted)]"
         onClick={() => setOpen(!open)}
       >
-        <ChevronRight
-          size={12}
-          className={`shrink-0 text-[var(--text-dim)] transition-transform ${open ? "rotate-90" : ""}`}
-        />
-        <Brain size={12} className="shrink-0 text-[var(--text-dim)]" />
-        <span className="shrink-0 text-[12px] font-medium text-[var(--text-muted)]">
-          Think
-        </span>
-        {live && (
-          <span className="shrink-0 text-[10px] uppercase tracking-wide text-[var(--accent)]">
-            thinking…
-          </span>
-        )}
-        {!open && (
-          <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-dim)]">
-            {text.replace(/\s+/g, " ").slice(0, 90)}
-          </span>
-        )}
+        <Brain size={12} className={live ? "animate-pulse text-[var(--accent)]" : ""} />
+        <span>{live ? "Thinking…" : "Thought"}</span>
+        <ChevronRight size={12} className={`transition-transform ${open ? "rotate-90" : ""}`} />
       </button>
-
       {open && (
-        <ScrollBox className="max-h-[280px] overflow-auto border-t border-[var(--border)] bg-[var(--bg-input)] px-3 py-2">
+        <ScrollBox className="ml-2 mt-1 max-h-[260px] overflow-auto border-l border-[var(--border-soft)] pl-3">
           {/* Reasoning is prose, not markdown the model meant for the user. */}
-          <p className="whitespace-pre-wrap text-[12px] leading-[1.6] text-[var(--text-muted)]">
-            {text}
-          </p>
+          <p className="whitespace-pre-wrap text-[12px] leading-[1.6] text-[var(--text-dim)]">{text}</p>
         </ScrollBox>
       )}
     </div>
@@ -470,9 +465,9 @@ export function ThinkBlock({
 }
 
 /**
- * Renders one tool invocation as a compact row. There is no inline expander
- * anymore: clicking the row opens the full diff / output in the side panel as
- * its own closeable tab, so every detail lives in one place.
+ * One tool invocation as a flat row — no box; the background shows on hover.
+ * File tools show the language badge + file name, the folder dimmed after
+ * it. A click opens the full diff / output in the side panel.
  */
 export function ToolCall({ call }: { call: ToolCallView }) {
   const running = call.running ?? false;
@@ -480,41 +475,46 @@ export function ToolCall({ call }: { call: ToolCallView }) {
   const meta = TOOL_META[call.name] ?? { icon: Wrench, label: call.name };
   const Icon = meta.icon;
   const clickable = !!call.onInspect;
+  const { owner, path, extra } = parseInput(call.name, call.input);
 
   return (
     <div
-      className={`my-1 flex items-center gap-2 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] px-3 py-2 transition-colors ${
-        clickable ? "cursor-pointer hover:bg-[var(--hover-bg)] hover:border-[var(--accent)]/40" : ""
+      className={`group/tool flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-[12.5px] transition-colors ${
+        clickable ? "cursor-pointer hover:bg-[var(--hover-bg)]" : ""
       }`}
       onClick={clickable ? call.onInspect : undefined}
       title={clickable ? "Open in the side panel" : undefined}
       role={clickable ? "button" : undefined}
     >
-      <Icon size={12} className="shrink-0 text-[var(--text-dim)]" />
-      <span className="shrink-0 text-[12px] font-medium text-[var(--text-main)]">
-        {meta.label}
-      </span>
-      <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--text-dim)]">
-        {call.input}
-      </span>
-      {clickable && (
-        <ChevronRight size={12} className="shrink-0 text-[var(--text-dim)]" />
-      )}
       {running ? (
+        <Loader2 size={13} className="shrink-0 animate-spin text-[var(--accent)]" />
+      ) : (
+        <Icon size={13} strokeWidth={1.6} className={`shrink-0 ${ok ? "text-[var(--text-dim)]" : "text-[var(--diff-del)]"}`} />
+      )}
+      <span className="shrink-0 text-[var(--text-muted)]">{meta.label}</span>
+      {owner && (
+        <span className="shrink-0 rounded bg-[var(--accent)]/12 px-1.5 text-[10.5px] text-[var(--accent)]">{owner}</span>
+      )}
+      {path !== null ? (
         <>
-          <Loader2 size={11} className="shrink-0 animate-spin text-[var(--accent)]" />
-          <span className="shrink-0 text-[10px] uppercase tracking-wide text-[var(--text-dim)]">
-            running
-          </span>
+          <FileIcon path={path} folder={call.name === "list_dir"} />
+          <span className="min-w-0 shrink truncate font-medium text-[var(--text-main)]">{baseName(path)}</span>
+          {dirName(path) && (
+            <span className="hidden min-w-0 shrink-[2] truncate text-[11px] text-[var(--text-dim)] group-hover/tool:inline">
+              {dirName(path)}
+            </span>
+          )}
+          {extra && <span className="shrink-0 font-mono text-[11px] text-[var(--text-dim)]">{extra}</span>}
         </>
       ) : (
-        <span
-          className={`shrink-0 text-[10px] uppercase tracking-wide ${
-            ok ? "text-[var(--accent)]" : "text-[var(--diff-del)]"
-          }`}
-        >
-          {ok ? "done" : "error"}
-        </span>
+        <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-[var(--text-dim)]">{extra}</span>
+      )}
+      <span className="flex-1" />
+      {!running && !ok && (
+        <span className="shrink-0 text-[10.5px] text-[var(--diff-del)]">failed</span>
+      )}
+      {clickable && (
+        <ChevronRight size={12} className="shrink-0 text-[var(--text-dim)] opacity-0 transition-opacity group-hover/tool:opacity-100" />
       )}
     </div>
   );

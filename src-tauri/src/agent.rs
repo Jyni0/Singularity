@@ -1,25 +1,18 @@
 //! Agent loop - lets the model actually do work, not just talk.
 //!
-//! This file is the shared spine: events, cancellation, the approval gate,
-//! the public entry point and the protocol dispatch. The heavy parts live in
-//! the agent/ submodules:
-//!   prompt     - tool schema + system prompt + call summaries
-//!   planner    - decompose a request into subtasks
-//!   decompose  - parallel subtask execution + merge round
-//!   openai     - OpenAI-compatible tool_calls loop
-//!   anthropic  - Anthropic tool_use loop
-//!   context    - token-budget pruning of the outgoing history
-//!   guard      - stuck-loop detection and nudges
+//! The run loop itself is Rig's (`rig-agent`): provider clients, streaming,
+//! multi-turn tool calling and hooks. This file is the shared spine around
+//! it: the request shape, UI events, the command approval gate and the
+//! public entry point. The heavy parts live in the agent/ submodules:
+//!   prompt    - tool schema + system prompt + call summaries
+//!   model     - provider → Rig model handle (effort, temperature, caching)
+//!   runtime   - Rig agent build, streaming consumer, hook, tools, subagents
+//!   context   - history bounding
 
-mod anthropic;
 mod context;
-mod decompose;
-mod guard;
-mod openai;
-mod planner;
+mod model;
 mod prompt;
-
-pub use openai::OpenAiUsage;
+mod runtime;
 
 use crate::tools;
 use serde::{Deserialize, Serialize};
@@ -116,22 +109,9 @@ async fn ask_confirm(app: &AppHandle, run_id: &str, command: &str, cwd: &str) ->
     }
 }
 
-/// Upper bound on model→tool→model rounds. Big enough for a real project
-/// (the old 64 cut off legitimate long runs), while the repeat guard and the
-/// failure-streak nudge stop pathological loops long before this.
-const MAX_STEPS: usize = 128;
-
-/// Rounds before MAX_STEPS where the model is told to wrap up: no new tools,
-/// write the final summary now. The run must not be cut off mid-project at the
-/// step limit — this gives the model a graceful exit and the user a real answer.
-pub(super) const WRAP_UP_AT: usize = MAX_STEPS - 4;
-
-/// The wrap-up instruction injected near the step budget.
-fn wrap_up_nudge(remaining: usize) -> String {
-    format!(
-        "SYSTEM: you are near the tool-round budget — {remaining} round(s) left. STOP starting new work. Use the remaining rounds only to finish and TEST what is in progress, then give your final summary of exactly what you completed and what is left. Do NOT call more tools once the work is in a stable state."
-    )
-}
+/// Upper bound on model calls of one run (Rig's total model-call budget).
+/// The repeat guard in the hook stops pathological loops long before this.
+const MAX_TURNS: usize = 128;
 
 /* ---------- Events ---------- */
 
@@ -186,36 +166,6 @@ pub struct AgentError {
     pub message: String,
 }
 
-/// Dispatches to the provider's protocol loop (used by both the plain and
-/// decomposed paths).
-async fn run_protocol(
-    app: &AppHandle,
-    run_id: &str,
-    req: &AgentRequest,
-    system: &str,
-    root: &Path,
-    turns: Vec<crate::chat::ChatTurn>,
-) -> Result<String, String> {
-    run_protocol_from(app, run_id, req, system, root, turns, 0).await
-}
-
-/// Same as run_protocol, but step events start from step_index_start — the
-/// merge round of a decomposed run continues numbering after the subtask
-/// steps so the two never collide in the transcript.
-async fn run_protocol_from(
-    app: &AppHandle,
-    run_id: &str,
-    req: &AgentRequest,
-    system: &str,
-    root: &Path,
-    turns: Vec<crate::chat::ChatTurn>,
-    step_index_start: usize,
-) -> Result<String, String> {
-    match req.kind.as_str() {
-        "anthropic-messages" => anthropic::run_anthropic(app, run_id, req, system, root, turns, step_index_start).await,
-        _ => openai::run_openai(app, run_id, req, system, root, turns, step_index_start).await,
-    }
-}
 /* ---------- Public entry point ---------- */
 
 #[derive(Debug, Clone, Deserialize)]
@@ -237,6 +187,9 @@ pub struct AgentRequest {
     /// `low`, `medium`, `high` — reasoning depth where the provider supports it.
     #[serde(default)]
     pub effort: String,
+    /// Sampling temperature; None keeps the provider default.
+    #[serde(default)]
+    pub temperature: Option<f64>,
     /// Run commands without asking. False = every `run_command` needs the
     /// user's approval through the `agent://confirm` event.
     #[serde(default)]
@@ -257,10 +210,25 @@ pub struct AgentRequest {
     /// Max parallel in-flight requests (0 = unlimited).
     #[serde(default)]
     pub concurrency: usize,
-    /// Decompose the user's prompt into parallel subtasks (Task list) before
-    /// executing. Off by default; the prompt box toggles it per message.
+    /// Helper agents the main agent MAY delegate to (Settings → Agent).
     #[serde(default)]
-    pub decompose: bool,
+    pub subagents: Vec<SubagentDef>,
+    /// How many subagents may work at the same time (0/1 = one at a time).
+    #[serde(default)]
+    pub max_agents: usize,
+}
+
+/// A user-defined helper agent: the main agent decides which task (if any)
+/// to hand it through the `delegate` tool.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubagentDef {
+    pub name: String,
+    /// When to use it — shown to the main agent.
+    #[serde(default)]
+    pub description: String,
+    /// The subagent's own system prompt.
+    #[serde(default)]
+    pub prompt: String,
 }
 
 /// What the model needs to see about an SSH unit: a name to pick and the
@@ -308,13 +276,11 @@ pub async fn run_agent(
     // A stale stop request must never kill a fresh run that reuses the id.
     crate::cancel::clear(&run_id);
 
-    // Decomposition (opt-in per message): plan → parallel subtasks → merge.
-    // Falls back to the plain single loop when the prompt is too simple.
-    let result = if req.decompose {
-        decompose::run_decomposed(&app, &run_id, &req, &system, &root, turns).await
-    } else {
-        run_protocol(&app, &run_id, &req, &system, &root, turns).await
-    };
+    // Only the recent conversation goes on the wire, with old answers
+    // clipped — the whole chat history used to ride along on every round.
+    let turns = context::trim_history(turns);
+
+    let result = runtime::run(&app, &run_id, &req, &system, &root, turns).await;
 
     crate::cancel::clear(&run_id);
 
@@ -345,32 +311,6 @@ pub async fn run_agent(
             Err(e)
         }
     }
-}
-
-/// Injects the wrap-up nudge into a message list. Anthropic requires strict
-/// role alternation, so there the nudge is merged INTO the trailing user turn
-/// instead of adding a second one; the OpenAI shape just appends.
-fn inject_wrap_up(messages: &mut Vec<Value>, anthropic: bool) {
-    let nudge = wrap_up_nudge(MAX_STEPS - WRAP_UP_AT);
-    if anthropic {
-        if let Some(last) = messages.last_mut() {
-            if last.get("role").and_then(|v| v.as_str()) == Some("user") {
-                match last.get("content").cloned() {
-                    Some(Value::Array(mut parts)) => {
-                        parts.push(json!({ "type": "text", "text": nudge }));
-                        last["content"] = Value::Array(parts);
-                        return;
-                    }
-                    Some(Value::String(s)) => {
-                        last["content"] = json!([{ "type": "text", "text": s }, { "type": "text", "text": nudge }]);
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    messages.push(json!({ "role": "user", "content": nudge }));
 }
 
 fn emit_text(app: &AppHandle, run_id: &str, delta: impl Into<String>) {
@@ -432,76 +372,6 @@ fn emit_step(app: &AppHandle, run_id: &str, index: usize, name: &str, input: Str
     );
 }
 
-/// Transient provider failures must not kill a whole run: "provider returned
-/// 502 Bad Gateway" ended generations that were one retry away from finishing.
-pub(super) fn is_transient_status(status: u16) -> bool {
-    status == 408 || status == 429 || (500..=504).contains(&status)
-}
-
-/// Send attempts for one round before giving up (1 try + 2 retries).
-pub(super) const RETRY_ATTEMPTS: usize = 3;
-
-/// Sends a provider request, retrying transient failures (429/5xx/connection
-/// resets) with a short backoff. The user SEES each retry in the chat instead
-/// of watching the run die. `build` creates a fresh RequestBuilder per
-/// attempt — reqwest builders are not Clone.
-pub(super) async fn send_with_retry(
-    app: &AppHandle,
-    run_id: &str,
-    build: impl Fn() -> reqwest::RequestBuilder,
-) -> Result<reqwest::Response, String> {
-    let mut last_err = String::from("request failed");
-    for attempt in 0..RETRY_ATTEMPTS {
-        if is_cancelled(run_id) {
-            return Err(crate::cancel::STOPPED.to_string());
-        }
-        let res = tokio::select! {
-            r = build().send() => r,
-            _ = crate::cancel::cancel_signal(run_id) => {
-                return Err(crate::cancel::STOPPED.to_string());
-            }
-        };
-        match res {
-            Ok(r) => {
-                let status = r.status();
-                if status.is_success()
-                    || !is_transient_status(status.as_u16())
-                    || attempt + 1 == RETRY_ATTEMPTS
-                {
-                    return Ok(r);
-                }
-                last_err = format!("provider returned {status}");
-            }
-            Err(e) => {
-                if attempt + 1 == RETRY_ATTEMPTS {
-                    return Err(format!("request failed: {e}"));
-                }
-                last_err = format!("connection error: {e}");
-            }
-        }
-        // Backoff 1s, 2s — long enough for a gateway to recover, short enough
-        // to stay responsive. Stop still works while waiting.
-        let wait = std::time::Duration::from_millis(1000 * 2u64.pow(attempt as u32));
-        emit_text(
-            app,
-            run_id,
-            format!(
-                "\n\n⚠️ {last_err} — retrying in {}s ({}/{})…\n",
-                wait.as_secs(),
-                attempt + 1,
-                RETRY_ATTEMPTS
-            ),
-        );
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
-            _ = crate::cancel::cancel_signal(run_id) => {
-                return Err(crate::cancel::STOPPED.to_string());
-            }
-        }
-    }
-    Err(last_err)
-}
-
 /// Runs the model's ssh_exec call through the shared SSH pool. The unit name
 /// from the model maps to a saved server id; credentials never leave Rust.
 /// Every attempt is audit-logged with actor "agent" (the Logs page shows it).
@@ -524,7 +394,6 @@ async fn run_ssh_tool(app: &AppHandle, req: &AgentRequest, args: &Value) -> tool
     }
 }
 
-
 /// Aggregated usage of one run — what the Debug HUD displays.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunUsage {
@@ -539,15 +408,20 @@ pub struct RunUsage {
     pub elapsed_ms: u64,
 }
 
-#[derive(Deserialize)]
-pub(super) struct ApiError {
-    pub message: Option<String>,
+/// Token accounting as reported by OpenAI-compatible providers (plain chat).
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAiUsage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
-/// One accumulated tool call. Arguments arrive split across chunks.
-#[derive(Default, Clone)]
-pub(super) struct PendingCall {
-    pub id: String,
-    pub name: String,
-    pub args: String,
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptTokensDetails {
+    /// Tokens served from the provider's prompt cache (cheaper, faster).
+    #[serde(default)]
+    pub cached_tokens: u64,
 }

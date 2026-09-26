@@ -1,0 +1,148 @@
+/**
+ * Settings → Agent: user-defined helper agents (subagents) and how many may
+ * work at once. Helpers are optional — the main agent decides on its own
+ * which part of a prompt (if any) to hand to which helper, through its
+ * `delegate` tool. Everything here is persisted in the settings table.
+ */
+import { useState } from "react";
+import { Bot, Plus, Trash2 } from "lucide-react";
+import * as db from "../core/db.r";
+import { SBUTTON, SINPUT } from "../ui/tokens.s";
+import { Switch } from "../ui/Switch.c";
+import { SettingRow, SettingsCard, Sep } from "./SettingsParts.c";
+
+const TEXTAREA =
+  "w-full resize-y rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 text-[12px] leading-relaxed text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
+
+export function AgentsSettings({
+  subagents,
+  onChange,
+  maxAgents,
+  onMaxAgents,
+}: {
+  subagents: db.Subagent[];
+  onChange: (next: db.Subagent[]) => void;
+  maxAgents: number;
+  onMaxAgents: (n: number) => void;
+}) {
+  const [openId, setOpenId] = useState<string | null>(null);
+
+  const update = (id: string, patch: Partial<db.Subagent>) =>
+    onChange(subagents.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+
+  const add = () => {
+    const id = "sa-" + Date.now().toString(36);
+    onChange([
+      ...subagents,
+      { id, name: `Helper ${subagents.length + 1}`, description: "", prompt: "", enabled: true },
+    ]);
+    setOpenId(id);
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <SettingsCard>
+        <SettingRow
+          title="Max agents at once"
+          hint="How many helper agents may work in parallel (1–8). They share the provider's rate limits."
+        >
+          <input
+            type="number"
+            min={1}
+            max={8}
+            className={`${SINPUT} w-[90px]`}
+            value={maxAgents}
+            onChange={(e) => {
+              const n = Math.min(8, Math.max(1, Number(e.target.value) || 1));
+              onMaxAgents(n);
+            }}
+          />
+        </SettingRow>
+      </SettingsCard>
+
+      <SettingsCard>
+        <div className="flex items-center gap-2">
+          <div className="min-w-0 flex-1">
+            <div className="text-[13px] text-[var(--text-main)]">Subagents</div>
+            <div className="mt-0.5 text-[12px] text-[var(--text-dim)]">
+              Optional helpers. The agent reads each description and decides which task, if any, to give them.
+            </div>
+          </div>
+          <button className={SBUTTON} onClick={add}>
+            <Plus size={13} className="mr-1" /> Add subagent
+          </button>
+        </div>
+
+        {subagents.length === 0 && (
+          <div className="rounded-lg border border-dashed border-[var(--border)] px-3 py-4 text-center text-[12px] text-[var(--text-dim)]">
+            No subagents yet — the agent works alone.
+          </div>
+        )}
+
+        {subagents.map((s, i) => {
+          const open = openId === s.id;
+          return (
+            <div key={s.id} className="flex flex-col">
+              {i > 0 && <Sep />}
+              <div
+                className="group flex cursor-pointer items-center gap-2 rounded-lg px-1.5 py-2 transition-colors hover:bg-[var(--hover-bg)]"
+                onClick={() => setOpenId(open ? null : s.id)}
+              >
+                <Bot size={14} className={s.enabled ? "text-[var(--accent)]" : "text-[var(--text-dim)]"} />
+                <span className="min-w-0 shrink-0 text-[13px] font-medium text-[var(--text-main)]">{s.name || "Unnamed"}</span>
+                <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text-dim)]">
+                  {s.description || "No description"}
+                </span>
+                <span onClick={(e) => e.stopPropagation()}>
+                  <Switch on={s.enabled} onChange={(on) => update(s.id, { enabled: on })} ariaLabel="enable subagent" />
+                </span>
+                <button
+                  className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-dim)] opacity-0 transition-all hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)] group-hover:opacity-100"
+                  title="Delete subagent"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onChange(subagents.filter((x) => x.id !== s.id));
+                  }}
+                >
+                  <Trash2 size={12} />
+                </button>
+              </div>
+              {open && (
+                <div className="flex flex-col gap-2.5 px-1.5 pb-2 pt-1">
+                  <label className="flex flex-col gap-1 text-[11px] text-[var(--text-dim)]">
+                    Name
+                    <input
+                      className={`${SINPUT} w-full`}
+                      value={s.name}
+                      placeholder="e.g. Tester"
+                      onChange={(e) => update(s.id, { name: e.target.value.replace(/[^\p{L}\p{N} _-]/gu, "") })}
+                    />
+                  </label>
+                  <label className="flex flex-col gap-1 text-[11px] text-[var(--text-dim)]">
+                    When to use it (shown to the main agent)
+                    <input
+                      className={`${SINPUT} w-full`}
+                      value={s.description}
+                      placeholder="e.g. Writes and runs unit tests for changed code"
+                      onChange={(e) => update(s.id, { description: e.target.value })}
+                    />
+                  </label>
+                  <label className="flex flex-col gap-1 text-[11px] text-[var(--text-dim)]">
+                    Prompt (the subagent's own instructions)
+                    <textarea
+                      className={TEXTAREA}
+                      rows={6}
+                      value={s.prompt}
+                      placeholder="You are a testing specialist. Prefer small focused tests…"
+                      onChange={(e) => update(s.id, { prompt: e.target.value })}
+                    />
+                  </label>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </SettingsCard>
+    </div>
+  );
+}

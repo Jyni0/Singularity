@@ -2,17 +2,18 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Shield, ChevronDown } from "lucide-react";
 import * as db from "../core/db.r";
-import type { AppMode, Conversation, Model, Project, Provider, SshConn, SshKey, SshScript, SshServer, Theme, UnitsTab, ViewKind, Attachment, Effort } from "../core/types.i";
+import type { AppMode, Model, Project, Provider, SshConn, SshKey, SshScript, SshServer, Theme, UnitsTab, ViewKind, Attachment } from "../core/types.i";
 import { NO_PROJECT, THEMES } from "../core/types.i";
-import { composePrompt } from "../utils/attachments.u";
 import { toGateways } from "../utils/gateways.u";
 import { useBlockContextMenu } from "../hooks/useBlockContextMenu.h";
 import { ScrollArea } from "../ui/ScrollArea.c";
 import { AuroraGlow } from "../ui/AuroraGlow.c";
 
-import type { Msg, PanelState, PanelTabSpec, Segment } from "../chat/message.i";
+import type { PanelState, PanelTabSpec } from "../chat/message.i";
 import { storedToMsg, fileLabel, toolLabel } from "../chat/message.u";
-import { ChatMessage, TaskChips } from "../chat/ChatMessage.c";
+import { ChatMessage } from "../chat/ChatMessage.c";
+import { useChat, DRAFT_ID } from "../hooks/useChat.h";
+import type { ChatSelection } from "../hooks/useChat.h";
 import { PromptBox } from "../chat/PromptBox.c";
 import { InspectionPanel } from "../chat/InspectionPanel.c";
 import { TitleBar } from "../layout/TitleBar.c";
@@ -42,9 +43,6 @@ export const INITIAL_SCHEDULED = ["Nightly /review @main", "Weekly /test all"];
 
 /* ---------- Custom title bar ---------- */
 
-export /** Buffer key for the "new chat" view before a conversation exists. */
-const DRAFT_ID = "__new__";
-
 export /** Inspection panel width bounds, px. */
 const PANEL_MIN_W = 260;
 
@@ -53,28 +51,6 @@ export const PANEL_MAX_W = 720;
 export default function App() {
   // No default browser context menu anywhere in the window.
   useBlockContextMenu();
-  /**
-   * Live message buffers, keyed by conversation id. A run keeps streaming into
-   * its own buffer even while the user reads another chat or another view —
-   * background generation falls out of this shape for free.
-   */
-  const [convMsgs, setConvMsgs] = useState<Record<string, Msg[]>>({});
-  const convMsgsRef = useRef(convMsgs);
-  convMsgsRef.current = convMsgs;
-  /** Run ids whose re-attach this component has already claimed — StrictMode
-   *  double-mounts effects in dev, and replaying one buffer twice doubled the
-   *  text ("генерация пошла заново"). A Set survives remounts for the page's
-   *  lifetime, which is exactly the scope a boot re-attach needs. */
-  const claimedRuns = useRef(new Set<string>());
-  /** convId → requestId of the generation currently running for it. */
-  const [activeRuns, setActiveRuns] = useState<Record<string, string>>({});
-  /**
-   * convId → phase of its live run: "thinking" until the first text delta,
-   * then "streaming". Drives the aurora palette behind the prompt box.
-   */
-  const [runPhase, setRunPhase] = useState<Record<string, "thinking" | "streaming">>({});
-  /** Conversation whose last run failed — the aurora glows red until the next send. */
-  const [erroredConv, setErroredConv] = useState<string | null>(null);
   /** Right inspection panel of the chat view. */
   const [panel, setPanel] = useState<PanelState>({ kind: "none" });
   /** Panel width, drag-resizable and persisted like the sidebar's. */
@@ -118,9 +94,6 @@ export default function App() {
   const [pickedModel, setPickedModel] = useState<{ gatewayId: string; modelId: string } | null>(
     null
   );
-  /** Commands waiting for Allow/Deny, keyed by run id — a background run's
-   * request survives navigation and shows again when the chat is opened. */
-  const [confirmReqs, setConfirmReqs] = useState<Record<string, db.ConfirmRequest>>({});
   const chatRef = useRef<HTMLDivElement>(null);
 
   /* ---------- App mode (Agent ↔ SSH Client) ----------
@@ -160,22 +133,52 @@ export default function App() {
    */
   const [sshPanel, setSshPanel] = useState<SshPanelTarget | null>(null);
 
+  /** Helper agents (Settings → Agent) and how many may work at once. */
+  const [subagents, setSubagents] = useState<db.Subagent[]>([]);
+  const [maxAgents, setMaxAgents] = useState(2);
+  useEffect(() => {
+    void db.loadSubagents().then(setSubagents);
+    void db.loadMaxAgents().then(setMaxAgents);
+  }, []);
+
+  /** Chat state + lifecycle: messages, streaming, tools, stop, edit/resend. */
+  const chat = useChat({
+    providers,
+    models,
+    projects,
+    workspace,
+    agentMode,
+    globalAutoRun,
+    sshServers,
+    subagents,
+    maxAgents,
+    pickedModel,
+    newChatProject,
+    onConversationCreated: (project, conv) => {
+      setProjects((prev) =>
+        prev.map((p) => (p.name !== project ? p : { ...p, conversations: [conv, ...p.conversations] }))
+      );
+      setActiveConv({ project, id: conv.id });
+      setView("chat");
+    },
+    onActivity: (convId) => bumpConversationActivity(convId),
+    onTitle: (project, convId, title) =>
+      setProjects((prev) =>
+        prev.map((p) =>
+          p.name !== project
+            ? p
+            : { ...p, conversations: p.conversations.map((c) => (c.id === convId ? { ...c, title } : c)) }
+        )
+      ),
+  });
+  const { convMsgs, setConvMsgs, activeRuns, runPhase, erroredConv, confirmReqs } = chat;
+
   /** Messages of the conversation currently on screen. */
   const draftMsgs = activeConv
     ? convMsgs[activeConv.id] ?? []
     : convMsgs[DRAFT_ID] ?? [];
   /** True while THIS conversation has a generation running. */
   const streaming = !!activeConv && !!activeRuns[activeConv.id];
-  /** Latest task board of the on-screen conversation — powers the chips strip
-   *  above the prompt box. Only shown while a run is live (a finished board
-   *  stays in the transcript; the strip is a "right now" indicator). */
-  const liveTasks = (() => {
-    if (!streaming) return [];
-    const msgs = activeConv ? convMsgs[activeConv.id] ?? [] : [];
-    const last = msgs[msgs.length - 1];
-    const seg = last?.segments?.slice().reverse().find((s) => s.kind === "tasks");
-    return seg && seg.kind === "tasks" ? seg.tasks : [];
-  })();
   /**
    * Aurora palette for the prompt box, derived from the on-screen chat's run:
    * red after a failed turn, indigo while it thinks, amber once text streams,
@@ -195,10 +198,6 @@ export default function App() {
   /** Ids of conversations with a live run — drives the sidebar pulse. */
   const runningConvIds = Object.keys(activeRuns);
 
-  /** Writes to a specific conversation's buffer; safe for background runs. */
-  const updateConvMsgs = useCallback((key: string, updater: (prev: Msg[]) => Msg[]) => {
-    setConvMsgs((prev) => ({ ...prev, [key]: updater(prev[key] ?? []) }));
-  }, []);
 
   // Adaptive re-clamp: shrinking the window (or growing the sidebar) must
   // never leave the SSH panel wider than the space that remains — otherwise
@@ -533,223 +532,6 @@ export default function App() {
   }, []);
 
 
-  /* ---------- Reload re-attach ----------
-     Agent runs live in Rust and keep streaming when the WebView reloads, but
-     every event emitted BEFORE the reload used to be lost — the chat came back
-     empty while the run kept working ("если обновить страницу, всё пропадает").
-     runs.rs now buffers each run's output; on boot we find the run that was
-     live (localStorage marker), replay its buffer into the conversation and
-     keep listening until it finishes, then persist the turn like a normal run. */
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const marker = localStorage.getItem("dsh:live-run");
-      if (!marker) return;
-      let runId = "";
-      let convId = "";
-      try {
-        const parsed = JSON.parse(marker) as { runId?: string; convId?: string };
-        runId = parsed.runId ?? "";
-        convId = parsed.convId ?? "";
-      } catch {
-        localStorage.removeItem("dsh:live-run");
-        return;
-      }
-      if (!runId || !convId) return;
-      // React StrictMode mounts effects twice in dev — without this claim the
-      // same buffer was replayed TWICE, doubling the text on screen and
-      // looking like the generation restarted.
-      if (claimedRuns.current.has(runId)) return;
-      claimedRuns.current.add(runId);
-      const live = await db.liveRuns();
-      const snapshot = await db.agentSnapshot(runId);
-      if (cancelled) return;
-      // Not live and nothing buffered — the run finished long ago (or never
-      // existed after an app restart). Drop the marker and move on.
-      if (!live.includes(runId) && snapshot.length === 0) {
-        localStorage.removeItem("dsh:live-run");
-        return;
-      }
-
-      // Rebuild the conversation buffer from the DB, then append the draft
-      // agent turn the live events will stream into.
-      const stored = await db.loadMessages(convId);
-      if (cancelled) return;
-      setConvMsgs((prev) => ({
-        ...prev,
-        [convId]: [...stored.map(storedToMsg), { role: "agent", text: "", segments: [] }],
-      }));
-      setActiveRuns((prev) => ({ ...prev, [convId]: runId }));
-      setRunPhase((prev) => ({ ...prev, [convId]: "thinking" }));
-
-      /** Everything this session has seen. apply() pushes here — both the
-       *  replayed buffer events and every live event afterwards — so
-       *  finish() folds the COMPLETE transcript, not just what existed at
-       *  reload time. (Do NOT prefill with the snapshot: the replay loop
-       *  below feeds those same events through apply, which would double
-       *  every delta in the persisted text.) */
-      const collected: db.RunEvent[] = [];
-
-      /** Replay/append one buffered or live event into the draft turn. */
-      const apply = (ev: db.RunEvent) => {
-        collected.push(ev);
-        if (ev.kind === "Text") setRunPhase((pp) => ({ ...pp, [convId]: "streaming" }));
-        setConvMsgs((prev) => {
-          const msgs = prev[convId];
-          if (!msgs || !msgs.length) return prev;
-          const next = [...msgs];
-          const last = { ...next[next.length - 1] };
-          if (last.role !== "agent") return prev;
-          const segs = [...(last.segments ?? [])];
-          if (ev.kind === "Text") {
-            const tail = segs[segs.length - 1];
-            if (tail && tail.kind === "text") {
-              segs[segs.length - 1] = { kind: "text", text: tail.text + ev.delta };
-            } else {
-              segs.push({ kind: "text", text: ev.delta });
-            }
-            last.text += ev.delta;
-          } else if (ev.kind === "Think") {
-            const tail = segs[segs.length - 1];
-            if (tail && tail.kind === "think") {
-              segs[segs.length - 1] = { kind: "think", text: tail.text + ev.delta };
-            } else {
-              segs.push({ kind: "think", text: ev.delta });
-            }
-          } else if (ev.kind === "Step") {
-            const step: db.AgentStepEvent = {
-              name: ev.name,
-              input: ev.input,
-              result: ev.result,
-              ok: ev.ok,
-              index: ev.index,
-              done: ev.done,
-              path: ev.path,
-              old_text: ev.old_text,
-              new_text: ev.new_text,
-            };
-            const at = segs.findIndex((s) => s.kind === "step" && s.step.index === step.index);
-            if (at >= 0) segs[at] = { kind: "step", step };
-            else segs.push({ kind: "step", step });
-          } else if (ev.kind === "Tasks") {
-            const at = segs.findIndex((s) => s.kind === "tasks");
-            if (at >= 0) segs[at] = { kind: "tasks", tasks: ev.tasks };
-            else segs.push({ kind: "tasks", tasks: ev.tasks });
-          } else if (ev.kind === "Confirm") {
-            // A reload landed while a command waited for permission — show the
-            // Allow/Deny banner again instead of hanging forever.
-            setConfirmReqs((prev) => ({
-              ...prev,
-              [runId]: { run_id: runId, command: ev.command, cwd: ev.cwd },
-            }));
-          }
-          last.segments = segs;
-          next[next.length - 1] = last;
-          return { ...prev, [convId]: next };
-        });
-      };
-
-      // 1) Replay everything buffered so far.
-      for (const ev of snapshot) {
-        if (ev.kind === "Done" || ev.kind === "Error") continue; // handled below
-        apply(ev);
-      }
-
-      const terminal = [...snapshot].reverse().find((e) => e.kind === "Done" || e.kind === "Error");
-
-      /** Fold buffered events into the final text + segments (think blocks
-       *  are ephemeral — never persisted, same contract as a normal run). */
-      const foldSnapshot = () => {
-        let text = "";
-        const segs: Segment[] = [];
-        for (const ev of collected) {
-          if (ev.kind === "Text") {
-            text += ev.delta;
-            const tail = segs[segs.length - 1];
-            if (tail && tail.kind === "text") tail.text += ev.delta;
-            else segs.push({ kind: "text", text: ev.delta });
-          } else if (ev.kind === "Step") {
-            segs.push({
-              kind: "step",
-              step: {
-                name: ev.name, input: ev.input, result: ev.result, ok: ev.ok,
-                index: ev.index, done: true, path: ev.path,
-                old_text: ev.old_text, new_text: ev.new_text,
-              },
-            });
-          } else if (ev.kind === "Tasks") {
-            const at = segs.findIndex((s) => s.kind === "tasks");
-            if (at >= 0) segs[at] = { kind: "tasks", tasks: ev.tasks };
-            else segs.push({ kind: "tasks", tasks: ev.tasks });
-          }
-        }
-        return { text, segs };
-      };
-
-      const finish = async (answer: string, failed: boolean) => {
-        localStorage.removeItem("dsh:live-run");
-        setActiveRuns((prev) => {
-          const n = { ...prev };
-          delete n[convId];
-          return n;
-        });
-        setRunPhase((prev) => {
-          const n = { ...prev };
-          delete n[convId];
-          return n;
-        });
-        // Persist the re-attached turn exactly like a normal run would have.
-        // Derive it from the BUFFER (not the React state): when the run ended
-        // during the reload, the state may not have flushed yet.
-        const folded = foldSnapshot();
-        const text = answer || folded.text;
-        const segments = folded.segs;
-        if (text.trim() || segments.some((s) => s.kind === "step")) {
-          await db.appendMessage(convId, "agent", text, {
-            segmentsJson: segments.length ? JSON.stringify(segments) : undefined,
-          });
-        }
-        setConvMsgs((prev) => {
-          const cur = prev[convId] ?? [];
-          if (!cur.length) return prev;
-          const next = [...cur];
-          next[next.length - 1] = { role: "agent", text, segments };
-          if (failed) {
-            next.push({ role: "agent", text: "⚠️ The run failed while the page was reloading." });
-          }
-          return { ...prev, [convId]: next };
-        });
-      };
-
-      if (terminal) {
-        // Finished during the reload — replay already showed the work; just
-        // finalise and persist.
-        await finish(terminal.kind === "Done" ? terminal.answer : "", terminal.kind === "Error");
-        return;
-      }
-      if (!live.includes(runId)) {
-        // No terminal event but not live either: the app itself restarted and
-        // the buffer is all that is left. Persist what we replayed.
-        await finish("", false);
-        return;
-      }
-
-      // 2) Still running — keep listening; deltas stream in live from here.
-      const answer = await db.resumeAgent(runId, {
-        onText: (d) => apply({ kind: "Text", delta: d }),
-        onStep: (s) => apply({ kind: "Step", index: s.index, name: s.name, input: s.input, done: s.done, ok: s.ok, result: s.result, path: s.path, old_text: s.old_text, new_text: s.new_text }),
-        onThink: (d) => apply({ kind: "Think", delta: d }),
-        onTasks: (t) => apply({ kind: "Tasks", tasks: t }),
-        onConfirm: (req) => setConfirmReqs((prev) => ({ ...prev, [req.run_id]: req })),
-      });
-      if (cancelled) return;
-      await finish(answer, false);
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -888,15 +670,8 @@ export default function App() {
     // Boot opens the LAST OPENED chat — not some arbitrary "most recent" row
     // that may not even exist anymore ("при запуске открывается несуществующий чат").
     localStorage.setItem("dsh:last-conv", id);
-    // A live run owns its buffer — loading over it would wipe the streaming
-    // turn. Stored messages already arrived before the run started.
-    if (activeRuns[id]) return;
-    // Messages come from the database, not from an in-memory draft.
-    const stored = await db.loadMessages(id);
-    setConvMsgs((prev) => ({
-      ...prev,
-      [id]: stored.map(storedToMsg),
-    }));
+    // Messages come from the database (a live run keeps its own buffer).
+    await chat.load(id);
   };
 
   /** Providers grouped with their models — feeds the model picker. */
@@ -966,15 +741,7 @@ export default function App() {
   const deleteConversation = async (project: string, convId: string) => {
     // A run streaming into a deleted chat would keep emitting into a buffer
     // nobody can see — stop it first.
-    const run = activeRuns[convId];
-    if (run) {
-      await db.stopGeneration(run);
-      setActiveRuns((prev) => {
-        const next = { ...prev };
-        delete next[convId];
-        return next;
-      });
-    }
+    chat.stop(convId);
     setProjects((prev) =>
       prev.map((p) =>
         p.name !== project
@@ -982,11 +749,7 @@ export default function App() {
           : { ...p, conversations: p.conversations.filter((c) => c.id !== convId) }
       )
     );
-    setConvMsgs((prev) => {
-      const next = { ...prev };
-      delete next[convId];
-      return next;
-    });
+    chat.reset(convId, true);
     await db.removeConversation(convId);
     if (activeConv?.id === convId) {
       setActiveConv(null);
@@ -1031,494 +794,13 @@ export default function App() {
     );
   };
 
-  /**
-   * Sends a message: persists it, then streams the model's answer into the
-   * conversation's own buffer, keyed by conversation id. The run keeps going
-   * when the user navigates away — the sidebar shows a pulse while it lasts.
-   * The reply is written to SQLite once streaming completes, so a partially
-   * received turn is never stored as if it were finished.
-   */
-  const sendMessage = async (
+  /** Prompt box → useChat. */
+  const sendMessage = (
     text: string,
     target: { project: string; id: string } | null,
-    selection: { gatewayId: string; modelId: string; effort: Effort; decompose: boolean },
+    selection: ChatSelection,
     attachments: Attachment[] = []
-  ) => {
-    // Text files are inlined into the prompt; images travel as data URLs and
-    // are converted to each provider's wire shape on the Rust side.
-    const promptText = composePrompt(text, attachments);
-    const images = attachments
-      .filter((a) => a.kind === "image")
-      .map((a) => ({ name: a.name, mime: a.mime, data_url: a.data }));
-    /** The user message as shown in the chat, with photo previews. */
-    const userMsg: Msg = {
-      role: "user",
-      text: promptText,
-      images: images.length ? images : undefined,
-    };
-
-    // Resolve (or create) the conversation this turn belongs to.
-    let convId: string;
-    let projectName: string;
-    let history: Msg[];
-    /** Set when this send created a brand-new chat — the AI title replaces it. */
-    let freshTitle = false;
-
-    if (target) {
-      // One run per conversation — ignore sends while this chat is busy.
-      if (activeRuns[target.id]) return;
-      convId = target.id;
-      projectName = target.project;
-      history = [...(convMsgsRef.current[convId] ?? []), userMsg];
-      updateConvMsgs(convId, (prev) => [...prev, userMsg]);
-    } else {
-      convId = `c-${Date.now()}`;
-      projectName = newChatProject;
-      const title = promptText.length > 42 ? `${promptText.slice(0, 42)}…` : promptText;
-      freshTitle = true;
-      const conv: Conversation = {
-        id: convId,
-        title,
-        updatedAt: Math.floor(Date.now() / 1000),
-      };
-      setProjects((prev) =>
-        prev.map((p) =>
-          p.name !== projectName ? p : { ...p, conversations: [conv, ...p.conversations] }
-        )
-      );
-      await db.insertConversation(projectName, conv);
-      history = [userMsg];
-      setActiveConv({ project: projectName, id: convId });
-      // The new-chat draft becomes this conversation's buffer.
-      setConvMsgs((prev) => {
-        const next = { ...prev };
-        delete next[DRAFT_ID];
-        next[convId] = history;
-        return next;
-      });
-      setView("chat");
-    }
-    await db.appendMessage(convId, "user", promptText, {
-      images: images.length ? images : undefined,
-    });
-    bumpConversationActivity(convId);
-
-    // Find the provider/model the user picked in the prompt box.
-    const provider = providers.find((p) => p.id === selection.gatewayId);
-    const modelRow = models.find(
-      (m) => m.provider_id === selection.gatewayId && m.model_id === selection.modelId
-    );
-    if (!provider || !modelRow) {
-      const note = "No model selected — add a provider in Settings → Models.";
-      updateConvMsgs(convId, (prev) => [...prev, { role: "agent", text: note }]);
-      return;
-    }
-
-    const oauth = {
-      clientId: localStorage.getItem("google_client_id") ?? "",
-      clientSecret: localStorage.getItem("google_client_secret") ?? "",
-    };
-    const cred = await db.credentialFor(provider, oauth);
-    if (cred.error) {
-      const note = `${provider.name}: ${cred.error}`;
-      updateConvMsgs(convId, (prev) => [...prev, { role: "agent", text: note }]);
-      return;
-    }
-
-    // With agent mode on the tools always have a workspace; the only case worth
-    // reporting is the shell not having one ready yet.
-    if (agentMode && !workspace.trim()) {
-      updateConvMsgs(convId, (prev) => [
-        ...prev,
-        {
-          role: "agent",
-          text:
-            "**Workspace not ready.**\n\nThe tools folder could not be resolved — " +
-            "restart the app and try again.",
-        },
-      ]);
-      return;
-    }
-
-    // Placeholder that grows as deltas arrive — always into THIS conversation,
-    // whatever the user is looking at while the run streams.
-    const requestId = `req-${Date.now()}`;
-    const startedAt = Date.now();
-    localStorage.setItem("dsh:last-conv", convId);
-    // Reload re-attach: remember which conversation this run streams into.
-    // Rust buffers every event (runs.rs), so after a page reload the boot
-    // effect replays the buffer and keeps listening — live output is no
-    // longer lost when the WebView refreshes mid-run.
-    localStorage.setItem("dsh:live-run", JSON.stringify({ runId: requestId, convId }));
-    updateConvMsgs(convId, (prev) => [...prev, { role: "agent", text: "", segments: [] }]);
-    setActiveRuns((prev) => ({ ...prev, [convId]: requestId }));
-    // The run starts out "thinking"; the first prose delta flips it to
-    // "streaming" (the aurora behind the prompt tracks this).
-    setRunPhase((prev) => ({ ...prev, [convId]: "thinking" }));
-    setErroredConv((prev) => (prev === convId ? null : prev));
-    let phase = "thinking";
-
-    /** Appends streamed prose to the current text segment of the live turn. */
-    const appendDelta = (delta: string) => {
-      if (phase === "thinking") {
-        phase = "streaming";
-        setRunPhase((prev) => ({ ...prev, [convId]: "streaming" }));
-      }
-      updateConvMsgs(convId, (prev) => {
-        const next = [...prev];
-        const last = next[next.length - 1];
-        if (!last || last.role !== "agent") return prev;
-
-        const segs = [...(last.segments ?? [])];
-        const tail = segs[segs.length - 1];
-        // Keep appending into the open text segment; a step closes it, so the
-        // next prose starts a fresh segment right after that call.
-        if (tail && tail.kind === "text") {
-          segs[segs.length - 1] = { kind: "text", text: tail.text + delta };
-        } else {
-          segs.push({ kind: "text", text: delta });
-        }
-        next[next.length - 1] = { ...last, text: last.text + delta, segments: segs };
-        return next;
-      });
-    };
-
-    /** Appends model reasoning to its own block, kept out of the answer. */
-    const appendThink = (delta: string) => {
-      updateConvMsgs(convId, (prev) => {
-        const next = [...prev];
-        const last = next[next.length - 1];
-        if (!last || last.role !== "agent") return prev;
-
-        const segs = [...(last.segments ?? [])];
-        const tail = segs[segs.length - 1];
-        if (tail && tail.kind === "think") {
-          segs[segs.length - 1] = { kind: "think", text: tail.text + delta };
-        } else {
-          segs.push({ kind: "think", text: delta });
-        }
-        // `text` stays reasoning-free: it is what gets stored and replayed.
-        next[next.length - 1] = { ...last, segments: segs };
-        return next;
-      });
-    };
-
-    /**
-     * Debug-mode usage updates: one "usage" segment per turn.
-     *
-     * accumulate differs per path: the AGENT loop re-sends the cumulative
-     * total on every event (replace), while the plain chat stream reports
-     * Anthropic/Gemini usage in pieces — prompt first, completion later (sum).
-     */
-    const appendUsage = (u: db.RunUsage, accumulate: boolean) => {
-      updateConvMsgs(convId, (prev) => {
-        const next = [...prev];
-        const last = next[next.length - 1];
-        if (!last || last.role !== "agent") return prev;
-
-        const segs = [...(last.segments ?? [])];
-        const at = segs.findIndex((s) => s.kind === "usage");
-        const prevU =
-          at >= 0 ? (segs[at] as { kind: "usage"; usage: db.RunUsage }).usage : null;
-        const merged: db.RunUsage =
-          accumulate && prevU
-            ? {
-                run_id: u.run_id,
-                prompt_tokens: prevU.prompt_tokens + u.prompt_tokens,
-                completion_tokens: prevU.completion_tokens + u.completion_tokens,
-                cached_tokens: prevU.cached_tokens + u.cached_tokens,
-                elapsed_ms: u.elapsed_ms ?? prevU.elapsed_ms,
-              }
-            : { ...u, elapsed_ms: u.elapsed_ms ?? prevU?.elapsed_ms };
-        if (at >= 0) {
-          segs[at] = { kind: "usage", usage: merged };
-        } else {
-          segs.push({ kind: "usage", usage: merged });
-        }
-        next[next.length - 1] = { ...last, segments: segs };
-        return next;
-      });
-    };
-
-    /** Task-list updates from a decomposed run: one "tasks" segment that is
-     *  replaced in place as subtasks move pending → running → done/error. */
-    const appendTasks = (tasks: db.TaskState[]) => {
-      updateConvMsgs(convId, (prev) => {
-        const next = [...prev];
-        const last = next[next.length - 1];
-        if (!last || last.role !== "agent") return prev;
-
-        const segs = [...(last.segments ?? [])];
-        const at = segs.findIndex((s) => s.kind === "tasks");
-        if (at >= 0) {
-          segs[at] = { kind: "tasks", tasks };
-        } else {
-          segs.push({ kind: "tasks", tasks });
-        }
-        next[next.length - 1] = { ...last, segments: segs };
-        return next;
-      });
-    };
-
-    /** Records a tool call: `done=false` shows it as running, `done=true`
-     * replaces the same card with its result. */
-    const appendStep = (step: db.AgentStepEvent) => {
-      updateConvMsgs(convId, (prev) => {
-        const next = [...prev];
-        const last = next[next.length - 1];
-        if (!last || last.role !== "agent") return prev;
-
-        const segs = [...(last.segments ?? [])];
-        const at = segs.findIndex(
-          (s) => s.kind === "step" && s.step.index === step.index
-        );
-        if (at >= 0) {
-          segs[at] = { kind: "step", step };
-        } else {
-          segs.push({ kind: "step", step });
-        }
-        next[next.length - 1] = { ...last, segments: segs };
-        return next;
-      });
-    };
-
-    const historyTurns = history.map((m) => ({ role: m.role, text: m.text }));
-
-    try {
-      // With a workspace set, run the full agent loop so the model can read,
-      // write and execute — otherwise it is a plain streaming chat.
-      const useAgent = !!workspace.trim() && agentMode;
-      // Per-project permission: bypass runs everything, ask prompts for every
-      // command, default inherits the global "Run commands without asking".
-      const runProject = projects.find((p) => p.name === projectName);
-      const permMode = runProject?.permMode ?? "default";
-      const autoRun = permMode === "bypass" ? true : permMode === "ask" ? false : globalAutoRun;
-
-      const answer = useAgent
-        ? await db.runAgent(
-            requestId,
-            {
-              kind: provider.kind,
-              base_url: provider.base_url,
-              api_key: cred.apiKey,
-              auth: cred.auth,
-              model: modelRow.model_id,
-              system: "",
-              workspace,
-              effort: selection.effort,
-              auto_run: autoRun,
-              images,
-              // Provider limits — Rust (limiter.rs) enforces them across chat,
-              // agent rounds and parallel subtasks alike.
-              provider_id: provider.id,
-              rate_limit_rpm: provider.rate_limit_rpm ?? 0,
-              concurrency: provider.concurrency ?? 0,
-              decompose: selection.decompose,
-              // SSH units ride along so the model gets the ssh_exec tool;
-              // credentials never leave the database.
-              ssh_units: sshServers.map((s) => ({ id: s.id, name: s.name, host: s.host })),
-            },
-            historyTurns,
-            {
-              onText: appendDelta,
-              onStep: appendStep,
-              onThink: appendThink,
-              onTasks: appendTasks,
-              // Agent events are already cumulative — replace, do not sum.
-              onUsage: (u) => appendUsage(u, false),
-              // Parked per run id: a background run's request stays available
-              // and reappears the moment the user opens that chat.
-              onConfirm: (req) =>
-                setConfirmReqs((prev) => ({ ...prev, [req.run_id]: req })),
-            }
-          )
-        : await db.streamChat(
-            requestId,
-            {
-              kind: provider.kind,
-              base_url: provider.base_url,
-              api_key: cred.apiKey,
-              auth: cred.auth,
-              model: modelRow.model_id,
-              effort: selection.effort,
-              images,
-              provider_id: provider.id,
-              rate_limit_rpm: provider.rate_limit_rpm ?? 0,
-              concurrency: provider.concurrency ?? 0,
-              system:
-                "You are Singularity, a coding agent inside a desktop workspace. " +
-                "Answer concisely and prefer concrete, runnable steps.",
-            },
-            historyTurns,
-            appendDelta,
-            // Plain chat reports usage in pieces (prompt, then completion) —
-            // accumulate. elapsed_ms isn't in those events, so measure here.
-            (u) => appendUsage({ ...u, elapsed_ms: Date.now() - startedAt }, true)
-          );
-
-      const elapsed = Date.now() - startedAt;
-      // Persist the whole turn: prose AND the interleaved tool steps. Before
-      // segments were stored, reopening a chat after a restart showed only
-      // the answer text — every "action" (file edit, command run, output)
-      // vanished. A turn with steps but no prose is still stored, so agent
-      // work that only touched files does not disappear either.
-      const finalSegments = (convMsgsRef.current[convId] ?? []).at(-1)?.segments;
-      const stepsCount = finalSegments?.filter((s) => s.kind === "step").length ?? 0;
-      if (answer.trim() || stepsCount > 0) {
-        // Reasoning blocks stay ephemeral (shown live, never stored) — same
-        // contract as the answer text, which has always excluded them.
-        const persisted = finalSegments?.filter((s) => s.kind !== "think");
-        await db.appendMessage(convId, "agent", answer, {
-          durationMs: elapsed,
-          segmentsJson: persisted && persisted.length
-            ? JSON.stringify(persisted)
-            : undefined,
-        });
-        bumpConversationActivity(convId);
-      }
-      // A brand-new chat gets a real title: the model names it after the first
-      // prompt. Fire-and-forget — on any failure the truncated prompt stays.
-      if (freshTitle) {
-        void generateTitle(convId, projectName, provider, cred, modelRow.model_id, promptText);
-      }
-      // Show the elapsed time on the live message right away.
-      updateConvMsgs(convId, (prev) => {
-        const next = [...prev];
-        const last = next[next.length - 1];
-        if (last && last.role === "agent") {
-          next[next.length - 1] = { ...last, durationMs: elapsed };
-        }
-        return next;
-      });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      const elapsed = Date.now() - startedAt;
-      // The aurora behind the prompt turns red until the next send in this chat.
-      setErroredConv(convId);
-      updateConvMsgs(convId, (prev) => {
-        const next = [...prev];
-        const last = next[next.length - 1];
-        if (last && last.role === "agent" && last.text === "") {
-          next[next.length - 1] = { role: "agent", text: `⚠️ ${msg}`, durationMs: elapsed };
-        } else {
-          next.push({ role: "agent", text: `⚠️ ${msg}`, durationMs: elapsed });
-        }
-        return next;
-      });
-      // SAVE WHAT WAS GENERATED. A Stop (or a dead provider) used to leave the
-      // partial turn on screen but NOT in the database — after a restart the
-      // work looked lost and the user re-sent the prompt from scratch. Read the
-      // live buffer via ref, drop ephemeral think segments, persist like a
-      // normal turn.
-      try {
-        const cur = convMsgsRef.current[convId] ?? [];
-        const partial = cur.find((m) => m.role === "agent" && m.text.trim() && !m.text.startsWith("⚠️"));
-        if (partial) {
-          const persisted = partial.segments?.filter((s) => s.kind !== "think");
-          const suffix = msg.includes("stopped") ? "  \n\n_(stopped — partial result saved)_" : "";
-          await db.appendMessage(convId, "agent", partial.text + suffix, {
-            durationMs: elapsed,
-            segmentsJson: persisted && persisted.length ? JSON.stringify(persisted) : undefined,
-          });
-          bumpConversationActivity(convId);
-        } else {
-          // No prose yet, but tools DID run (files may have been touched) —
-          // keep the action cards so the work is not invisible after restart.
-          const acted = cur.find((m) => m.role === "agent" && m.segments?.some((s) => s.kind === "step" && s.step.done));
-          if (acted && acted.segments) {
-            await db.appendMessage(convId, "agent", "", {
-              durationMs: elapsed,
-              segmentsJson: JSON.stringify(acted.segments.filter((s) => s.kind !== "think")),
-            });
-            bumpConversationActivity(convId);
-          }
-        }
-      } catch {
-        // Persistence must never mask the original error UI.
-      }
-    } finally {
-      localStorage.removeItem("dsh:live-run");
-      setActiveRuns((prev) => {
-        const next = { ...prev };
-        delete next[convId];
-        return next;
-      });
-      setRunPhase((prev) => {
-        const next = { ...prev };
-        delete next[convId];
-        return next;
-      });
-      setConfirmReqs((prev) => {
-        const next = { ...prev };
-        delete next[requestId];
-        return next;
-      });
-    }
-  };
-
-  /**
-   * Names a brand-new chat from its first prompt using the same provider that
-   * just answered. Deliberately minimal: tiny context, no tools, and the
-   * result only replaces the placeholder when it looks like a real title.
-   * Any failure keeps the truncated-prompt title — never worth an error UI.
-   */
-  const generateTitle = async (
-    convId: string,
-    projectName: string,
-    provider: Provider,
-    cred: { apiKey: string; auth: "key" | "bearer" },
-    modelId: string,
-    firstPrompt: string
-  ) => {
-    try {
-      let out = "";
-      await db.streamChat(
-        `title-${convId}`,
-        {
-          kind: provider.kind,
-          base_url: provider.base_url,
-          api_key: cred.apiKey,
-          auth: cred.auth,
-          model: modelId,
-          effort: "low",
-          provider_id: provider.id,
-          rate_limit_rpm: provider.rate_limit_rpm ?? 0,
-          concurrency: provider.concurrency ?? 0,
-          system:
-            "You name conversations. Reply with a short title of at most 6 words " +
-            "for the user's first message. No quotes, no trailing punctuation, " +
-            "same language as the message.",
-        },
-        [{ role: "user", text: firstPrompt.slice(0, 600) }],
-        (d) => {
-          out += d;
-        }
-      );
-      // Keep only the first line and trim it to a sane title length.
-      const clean = out
-        .split("\n")[0]
-        .replace(/^["'«»\s]+|["'«»\s]+$/g, "")
-        .slice(0, 60)
-        .trim();
-      if (clean.length >= 2) {
-        setProjects((prev) =>
-          prev.map((p) =>
-            p.name !== projectName
-              ? p
-              : {
-                  ...p,
-                  conversations: p.conversations.map((c) =>
-                    c.id === convId ? { ...c, title: clean } : c
-                  ),
-                }
-          )
-        );
-        await db.updateConversationTitle(convId, clean);
-      }
-    } catch {
-      /* a failed rename is not worth surfacing — the placeholder stays */
-    }
-  };
+  ) => void chat.send(text, target, selection, attachments);
 
   /** Opens Settings directly on the "Project Settings" tab for one project. */
   const openProjectSettings = (name: string) => {
@@ -1619,13 +901,13 @@ export default function App() {
               // Plain "New Conversation" starts a chat with no project folder.
               setNewChatProject(NO_PROJECT);
               setActiveConv(null);
-              setConvMsgs((prev) => ({ ...prev, [DRAFT_ID]: [] }));
+              chat.reset(DRAFT_ID);
               setView("new");
             }}
             onNewConversationInProject={(project) => {
               setNewChatProject(project);
               setActiveConv(null);
-              setConvMsgs((prev) => ({ ...prev, [DRAFT_ID]: [] }));
+              chat.reset(DRAFT_ID);
               setView("new");
             }}
             onShowView={(v) => setView(v)}
@@ -1800,6 +1082,11 @@ export default function App() {
                             durationMs={m.durationMs}
                             images={m.images}
                             debugMode={debugMode}
+                            onEdit={
+                              m.role === "user" && activeConv && !streaming
+                                ? (next) => void chat.editAndResend(activeConv.id, activeConv.project, i, next)
+                                : undefined
+                            }
                             onInspectStep={(step) => {
                               // Every step opens as its OWN closeable panel tab:
                               // a file change shows its diff, a command its full
@@ -1887,29 +1174,13 @@ export default function App() {
                       </div>
                       <button
                         className="shrink-0 rounded-lg bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-white transition-opacity hover:opacity-90"
-                        onClick={() => {
-                          const req = confirmReq;
-                          setConfirmReqs((prev) => {
-                            const next = { ...prev };
-                            delete next[req.run_id];
-                            return next;
-                          });
-                          void db.confirmCommand(req.run_id, true);
-                        }}
+                        onClick={() => chat.confirm(confirmReq.run_id, true)}
                       >
                         Allow
                       </button>
                       <button
                         className="shrink-0 rounded-lg border border-[var(--border)] px-3 py-1.5 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
-                        onClick={() => {
-                          const req = confirmReq;
-                          setConfirmReqs((prev) => {
-                            const next = { ...prev };
-                            delete next[req.run_id];
-                            return next;
-                          });
-                          void db.confirmCommand(req.run_id, false);
-                        }}
+                        onClick={() => chat.confirm(confirmReq.run_id, false)}
                       >
                         Deny
                       </button>
@@ -1920,10 +1191,6 @@ export default function App() {
 
               {/* The column-wide aurora above IS the running indicator: its
                   palette shifts indigo → amber with the run phase. */}
-              {/* Live task strip: what is running RIGHT NOW, above the prompt.
-                  Collapsed = current task + progress; expanded = scrollable
-                  board (past ~5 tasks it scrolls instead of eating the screen). */}
-              {liveTasks.length > 0 && <TaskChips tasks={liveTasks} />}
               <PromptBox
                 onSend={(text, selection, attachments) => sendMessage(text, activeConv, selection, attachments)}
                 projects={projects}
@@ -1933,10 +1200,7 @@ export default function App() {
                 pickedModel={pickedModel}
                 onPickModel={pickModel}
                 busy={streaming}
-                onStop={() => {
-                  const run = activeConv ? activeRuns[activeConv.id] : undefined;
-                  if (run) void db.stopGeneration(run);
-                }}
+                onStop={() => activeConv && chat.stop(activeConv.id)}
               />
             </div>
           )}
@@ -2006,6 +1270,16 @@ export default function App() {
               onDebugMode={(next) => {
                 setDebugMode(next);
                 void db.setSetting("debug_mode", next ? "1" : "0");
+              }}
+              subagents={subagents}
+              onSubagents={(next) => {
+                setSubagents(next);
+                void db.saveSubagents(next);
+              }}
+              maxAgents={maxAgents}
+              onMaxAgents={(n) => {
+                setMaxAgents(n);
+                void db.setSetting("max_agents", String(n));
               }}
               initialProject={settingsProject}
               initialSection={settingsSection}

@@ -1,40 +1,149 @@
 import { useEffect, useRef, useState } from "react";
-import { AnimatePresence, motion } from "motion/react";
-import { ArrowUp, Bug, Check, ChevronDown, ChevronRight, Circle, ListChecks, Loader2, Wrench, XCircle } from "lucide-react";
+import { ArrowUp, Bug, Check, ChevronDown, ChevronRight, Copy, Loader2, Pencil, Wrench } from "lucide-react";
 import * as db from "../core/db.r";
 import { formatDuration } from "../utils/format.u";
 import { Markdown, ToolCall, ThinkBlock } from "./Markdown.c";
+import { FileIcon } from "./FileIcon.c";
 import type { Segment } from "./message.i";
 
+/*
+ * Transcript rows, Antigravity-style: nothing sits in a boxed bubble. Prose,
+ * prompts and tool rows are flat on the page; a soft background appears only
+ * under the row the pointer is on, together with that row's actions.
+ */
+
 export function MessageBody({ text }: { text: string }) {
-  const long = text.length > 280 || text.split("\n").length > 6;
+  const long = text.length > 600 || text.split("\n").length > 12;
   const [open, setOpen] = useState(!long);
   return (
-    <div className="flex min-w-0 max-w-full flex-col gap-1" onClick={() => long && setOpen(!open)}>
+    <div className="flex min-w-0 max-w-full flex-col gap-1">
       <div
-        className={`min-w-0 max-w-full whitespace-pre-wrap break-words leading-relaxed text-[var(--text-main)] ${
-          open ? "" : "line-clamp-4"
+        className={`min-w-0 max-w-full whitespace-pre-wrap break-words text-[14px] leading-relaxed text-[var(--text-main)] ${
+          open ? "" : "line-clamp-6"
         }`}
       >
         {text}
       </div>
       {long && (
-        <span className="flex items-center gap-1 self-start text-[11px] text-[var(--accent)]">
+        <button
+          className="flex items-center gap-1 self-start text-[11px] text-[var(--accent)]"
+          onClick={() => setOpen(!open)}
+        >
           {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           {open ? "Collapse" : "Expand"}
-        </span>
+        </button>
       )}
+    </div>
+  );
+}
+
+/* ---------- Hover actions ---------- */
+
+function ActionButton({ title, onClick, children }: { title: string; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text-main)]"
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      title={title}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** Copies `text`; the icon turns into a check for a moment. */
+function CopyButton({ text, title = "Copy" }: { text: string; title?: string }) {
+  const [done, setDone] = useState(false);
+  return (
+    <ActionButton
+      title={done ? "Copied" : title}
+      onClick={() => {
+        void navigator.clipboard.writeText(text).then(() => {
+          setDone(true);
+          setTimeout(() => setDone(false), 1200);
+        });
+      }}
+    >
+      {done ? <Check size={13} className="text-[var(--diff-add)]" /> : <Copy size={13} />}
+    </ActionButton>
+  );
+}
+
+/** Inline editor of a sent prompt: Enter resends, Esc cancels. */
+function EditBox({ initial, onCancel, onSave }: { initial: string; onCancel: () => void; onSave: (text: string) => void }) {
+  const [value, setValue] = useState(initial);
+  const ref = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 320)}px`;
+  }, []);
+  const save = () => value.trim() && onSave(value.trim());
+  return (
+    <div className="flex flex-col gap-2">
+      <textarea
+        ref={ref}
+        className="min-h-[60px] w-full resize-none rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2 text-[14px] leading-relaxed text-[var(--text-main)] outline-none focus:border-[var(--accent)]/60"
+        value={value}
+        onChange={(e) => {
+          setValue(e.target.value);
+          e.target.style.height = "auto";
+          e.target.style.height = `${Math.min(e.target.scrollHeight, 320)}px`;
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") onCancel();
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            save();
+          }
+        }}
+      />
+      <div className="flex items-center justify-end gap-2">
+        <span className="mr-auto text-[11px] text-[var(--text-dim)]">
+          Resending replaces everything after this prompt
+        </span>
+        <button
+          className="h-7 rounded-md px-3 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text-main)]"
+          onClick={onCancel}
+        >
+          Cancel
+        </button>
+        <button
+          className="h-7 rounded-md bg-[var(--accent)] px-3 text-[12px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+          onClick={save}
+          disabled={!value.trim()}
+        >
+          Send
+        </button>
+      </div>
     </div>
   );
 }
 
 /* ---------- Collapsible action group ---------- */
 
+/** Distinct files a group of steps touched, in first-touch order. */
+function touchedFiles(steps: db.AgentStepEvent[]): string[] {
+  const out: string[] = [];
+  for (const s of steps) {
+    const p = s.path ?? (["read_file", "apply_patch", "write_file", "edit_file"].includes(s.name)
+      ? s.input.replace(/^\[[^\]]+\] /, "").split(/ [(…]/)[0].trim()
+      : "");
+    if (p && !out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
 /**
- * Consecutive tool calls collapsed into one transparent "Worked for …" row —
- * the transcript reads as prose + a compact action log instead of a wall of
- * cards. Open WHILE streaming (live progress must be visible), auto-collapses
- * when the turn finishes; a click re-opens it to inspect every action.
+ * Consecutive tool calls folded into one flat "Worked for …" row with the
+ * language badges of the files involved. Open while streaming, collapsed
+ * when the turn finishes; a click re-opens the action log.
  */
 function StepGroup({
   steps,
@@ -48,14 +157,10 @@ function StepGroup({
   onInspectStep?: (step: db.AgentStepEvent) => void;
 }) {
   const [open, setOpen] = useState(!!streaming);
-  // Collapse once the turn is over — the answer matters, not the log.
   useEffect(() => {
     if (!streaming) setOpen(false);
   }, [streaming]);
-  // Live elapsed while streaming; the stored duration takes over when done.
-  // A turn that STOPPED or ERRORED never gets a stored duration — freeze the
-  // live clock at the moment streaming ended so the header still reads
-  // "Worked for 41s" instead of a bare "Worked".
+  // Live elapsed while streaming; frozen when a stopped turn has no duration.
   const startRef = useRef(Date.now());
   const endRef = useRef<number | null>(null);
   const [, tick] = useState(0);
@@ -72,13 +177,13 @@ function StepGroup({
     : (durationMs ?? (endRef.current !== null ? endRef.current - startRef.current : 0));
   const label = elapsed && elapsed > 0 ? "Worked for " + formatDuration(elapsed) : "Worked";
   const running = steps.some((s) => !s.step.done);
+  const files = touchedFiles(steps.map((s) => s.step));
   return (
     <div className="flex flex-col">
-      {/* Transparent header row — same airy treatment as the project rows. */}
       <button
-        className="flex w-fit items-center gap-1.5 rounded-md px-1 py-0.5 text-[11.5px] text-[var(--text-dim)] transition-colors select-none hover:text-[var(--text-muted)]"
+        className="flex w-fit items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[12px] text-[var(--text-dim)] transition-colors select-none hover:bg-[var(--hover-bg)] hover:text-[var(--text-muted)]"
         onClick={() => setOpen(!open)}
-        title="Show the tool calls of this turn"
+        title="Show the actions of this turn"
       >
         {streaming && running ? (
           <Loader2 size={12} className="animate-spin text-[var(--accent)]" />
@@ -86,11 +191,21 @@ function StepGroup({
           <Wrench size={12} strokeWidth={1.5} />
         )}
         <span>{label}</span>
-        <span className="text-[10px] opacity-70">· {steps.length} action{steps.length === 1 ? "" : "s"}</span>
-        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        <span className="text-[11px] opacity-70">
+          · {steps.length} action{steps.length === 1 ? "" : "s"}
+        </span>
+        {files.length > 0 && (
+          <span className="ml-0.5 flex items-center gap-0.5">
+            {files.slice(0, 5).map((f) => (
+              <FileIcon key={f} path={f} size={12} />
+            ))}
+            {files.length > 5 && <span className="text-[10px]">+{files.length - 5}</span>}
+          </span>
+        )}
+        <ChevronRight size={12} className={`transition-transform ${open ? "rotate-90" : ""}`} />
       </button>
       {open && (
-        <div className="mt-1 flex flex-col gap-2 border-l border-[var(--border)] pl-3">
+        <div className="ml-2 mt-0.5 flex flex-col border-l border-[var(--border-soft)] pl-2">
           {steps.map((s) => (
             <ToolCall
               key={s.key}
@@ -99,8 +214,7 @@ function StepGroup({
                 input: s.step.input,
                 result: s.step.result,
                 ok: s.step.ok,
-                // A stopped/reloaded turn leaves steps at done=false forever —
-                // only a LIVE turn may show a spinner.
+                // Only a LIVE turn may show a spinner.
                 running: !!streaming && !s.step.done,
                 onInspect: () => onInspectStep?.(s.step),
               }}
@@ -112,17 +226,11 @@ function StepGroup({
   );
 }
 
-/**
- * Folds consecutive step segments into groups so the renderer can show one
- * StepGroup per run of tool calls. Text/think/tasks/usage pass through.
- */
+/** Folds consecutive step segments into groups (one StepGroup each). */
 function groupSegments(segments: Segment[]): (Segment | { group: Segment[] })[] {
   const out: (Segment | { group: Segment[] })[] = [];
   for (const seg of segments) {
-    // The planner's own status card ("Plan — …") is NOT agent work: folding it
-    // into "Worked · 1 action" produced the confusing transcript the user
-    // complained about. It renders standalone below.
-    if (seg.kind === "step" && seg.step.name !== "plan") {
+    if (seg.kind === "step") {
       const tail = out[out.length - 1];
       if (tail && "group" in tail) tail.group.push(seg);
       else out.push({ group: [seg] });
@@ -132,6 +240,7 @@ function groupSegments(segments: Segment[]): (Segment | { group: Segment[] })[] 
   }
   return out;
 }
+
 /* ---------- Unified chat message row ---------- */
 
 export function ChatMessage({
@@ -142,51 +251,49 @@ export function ChatMessage({
   durationMs,
   images,
   debugMode,
+  onEdit,
   onInspectStep,
   onInspectImage,
 }: {
   role: "user" | "agent";
   text: string;
   segments?: Segment[];
-  /** True while this turn is still being produced — shows a "thinking…" marker. */
+  /** True while this turn is still being produced. */
   streaming?: boolean;
   /** How long the agent worked on this answer. */
   durationMs?: number;
   /** Photos attached to the message — clickable, open in the side panel. */
   images?: db.StoredImage[];
-  /** Debug mode: render the live token HUD (speed / tokens / cache / time). */
+  /** Debug mode: render the live token HUD. */
   debugMode?: boolean;
+  /** User prompts only: rewrite this prompt and run it again. */
+  onEdit?: (text: string) => void;
   /** Opens this step as its own closeable tab in the side panel. */
   onInspectStep?: (step: db.AgentStepEvent) => void;
   /** Opens this photo as its own closeable tab in the side panel. */
   onInspectImage?: (image: db.StoredImage) => void;
 }) {
-  // When did this turn last visibly change? Drives the activity indicator:
-  // ANY new segment content counts, so the pulse disappears while tokens,
-  // reasoning or tool results are arriving and returns when the run goes
-  // quiet (thinking, a long request) — proof of life either way.
+  const [editing, setEditing] = useState(false);
+  // When did this turn last visibly change? Drives the "Working…" pulse.
   const lastChange = useRef(Date.now());
-  // Rough "has anything visible changed" fingerprint: prose length, tool
-  // result length, task progress and usage counters all count as activity.
   const signature =
     (segments?.length ?? 0) * 1_000_003 +
     (text?.length ?? 0) +
     (segments?.reduce((n, s) => {
       if (s.kind === "text" || s.kind === "think") return n + s.text.length;
-      if (s.kind === "step") return n + (s.step.result?.length ?? 0) * 7 + (s.step.done ? 1 : 0) * 13;
-      if (s.kind === "tasks") return n + s.tasks.filter((t) => t.status === "done" || t.status === "error").length * 101;
+      if (s.kind === "step") return n + (s.step.result?.length ?? 0) * 7 + (s.step.input.length) * 3 + (s.step.done ? 1 : 0) * 13;
       if (s.kind === "usage") return n + (s.usage.completion_tokens ?? 0) * 3;
       return n;
     }, 0) ?? 0);
   useEffect(() => {
     lastChange.current = Date.now();
   }, [signature, role]);
+
   if (role === "user") {
     return (
-      <div className="flex flex-col items-end gap-1.5">
-        {/* Attached photos render as thumbnails; a click opens the viewer. */}
+      <div className="group relative -mx-3 flex flex-col gap-1.5 rounded-xl px-3 py-2 transition-colors hover:bg-[var(--hover-bg)]">
         {images && images.length > 0 && (
-          <div className="flex max-w-[85%] flex-wrap justify-end gap-2">
+          <div className="flex flex-wrap gap-2">
             {images.map((img, i) => (
               <button
                 key={i}
@@ -194,39 +301,56 @@ export function ChatMessage({
                 onClick={() => onInspectImage?.(img)}
                 title={`View ${img.name}`}
               >
-                <img
-                  src={img.data_url}
-                  alt={img.name}
-                  className="h-24 w-auto max-w-[180px] object-cover"
-                />
+                <img src={img.data_url} alt={img.name} className="h-20 w-auto max-w-[180px] object-cover" />
               </button>
             ))}
           </div>
         )}
-        <div className="w-full rounded-xl border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2 text-left">
-          <MessageBody text={text} />
-        </div>
+        {editing && onEdit ? (
+          <EditBox
+            initial={text}
+            onCancel={() => setEditing(false)}
+            onSave={(next) => {
+              setEditing(false);
+              onEdit(next);
+            }}
+          />
+        ) : (
+          <>
+            <MessageBody text={text} />
+            <div className="absolute right-2 top-1.5 flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+              <CopyButton text={text} title="Copy prompt" />
+              {onEdit && (
+                <ActionButton title="Edit and resend" onClick={() => setEditing(true)}>
+                  <Pencil size={13} />
+                </ActionButton>
+              )}
+            </div>
+          </>
+        )}
       </div>
     );
   }
 
-  // Segments keep prose and tool calls in the order they happened, so the
-  // answer reads as a transcript rather than text with a dump of calls below.
-  // Consecutive tool calls fold into ONE transparent "Worked for …" group.
+  const answerText = text.trim();
+  const actions = !streaming && answerText && (
+    <div className="flex items-center gap-2 opacity-0 transition-opacity group-hover:opacity-100">
+      <CopyButton text={answerText} title="Copy answer" />
+    </div>
+  );
+
+  // Segments keep prose and tool calls in the order they happened.
   if (segments && segments.length > 0) {
     const grouped = groupSegments(segments);
     return (
-      <div className="flex flex-col gap-2">
+      <div className="group -mx-3 flex flex-col gap-1.5 rounded-xl px-3 py-2 transition-colors hover:bg-[var(--hover-bg)]/40">
         {grouped.map((seg, i) => {
           const isLast = i === grouped.length - 1;
           if ("group" in seg) {
-            // Only the group that sits at the tail of a LIVE turn stays open
-            // by itself; a finished turn collapses its actions.
-            const live = !!streaming && isLast;
             return (
               <StepGroup
                 key={`g${i}`}
-                streaming={live}
+                streaming={!!streaming && isLast}
                 durationMs={durationMs}
                 onInspectStep={onInspectStep}
                 steps={seg.group.map((s, j) => ({
@@ -236,90 +360,46 @@ export function ChatMessage({
               />
             );
           }
-          if (seg.kind === "tasks") {
-            return <TaskList key={"tasks" + i} tasks={seg.tasks} live={!!streaming} />;
-          }
           if (seg.kind === "usage") {
-            // Debug mode only — the HUD lives inside the transcript so it stays
-            // attached to the turn it measured.
-            return debugMode ? (
-              <UsageHud key={"u" + i} usage={seg.usage} streaming={!!streaming} />
-            ) : null;
+            return debugMode ? <UsageHud key={"u" + i} usage={seg.usage} streaming={!!streaming} /> : null;
           }
           if (seg.kind === "think") {
-            return seg.text.trim() ? (
-              <ThinkBlock
-                key={`k${i}`}
-                text={seg.text}
-                live={!!streaming && isLast}
-              />
-            ) : null;
+            return seg.text.trim() ? <ThinkBlock key={`k${i}`} text={seg.text} live={!!streaming && isLast} /> : null;
           }
-          // Standalone step (the planner's card): a normal ToolCall, not a
-          // "Worked" group — it is status, not labor.
-          if (seg.kind === "step") {
-            return (
-              <ToolCall
-                key={`s${i}`}
-                call={{
-                  name: seg.step.name,
-                  input: seg.step.input,
-                  result: seg.step.result,
-                  ok: seg.step.ok,
-                  running: !!streaming && !seg.step.done,
-                  onInspect: () => onInspectStep?.(seg.step),
-                }}
-              />
-            );
-          }
-          // Plain prose (steps were folded into groups above).
           if (seg.kind === "text") {
             return seg.text.trim() ? <Markdown key={`t${i}`} text={seg.text} /> : null;
           }
           return null;
         })}
-        {/* Live run, nothing changed for a moment — show the pulse with a
-            ticking timer so the screen is never "frozen" while the model
-            thinks or the provider is slow. */}
         <LiveTail streaming={streaming} lastChange={lastChange} />
-        {/* Generation time — shown at the END of the finished turn. */}
-        <DurationFooter streaming={streaming} durationMs={durationMs} />
+        <div className="flex items-center justify-between">
+          {actions || <span />}
+          <DurationFooter streaming={streaming} durationMs={durationMs} />
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col gap-2">
-      {/* Model output is markdown: headings, lists, tables and fenced code. */}
-      {text.trim() ? (
+    <div className="group -mx-3 flex flex-col gap-1.5 rounded-xl px-3 py-2 transition-colors hover:bg-[var(--hover-bg)]/40">
+      {answerText ? (
         <Markdown text={text} />
       ) : streaming ? (
-        /* Waiting for the first token — an empty bubble looked like a dead app. */
         <WorkingIndicator label="Thinking…" />
       ) : null}
-      {/* Generation time — shown at the END of the finished turn. */}
-      <DurationFooter streaming={streaming} durationMs={durationMs} />
+      <div className="flex items-center justify-between">
+        {actions || <span />}
+        <DurationFooter streaming={streaming} durationMs={durationMs} />
+      </div>
     </div>
   );
 }
 
 /**
- * Live "the model is doing something" line. Driven by ACTIVITY — the time
- * since the turn's segments last changed — not by "is the tail text
- * non-empty". Static prose (a status line the agent already wrote) counted
- * as progress, so a thinking model that had not emitted a token for two
- * minutes showed nothing at all ("толи делает толи стоит на месте хз").
- * The ticking elapsed figure is the proof of life.
+ * Live "the model is doing something" line, driven by ACTIVITY: it shows
+ * once the turn has been quiet for 2s, with a ticking elapsed figure.
  */
-function LiveTail({
-  streaming,
-  lastChange,
-}: {
-  streaming?: boolean;
-  /** Ref, not a value: this component ticks on its own, so it must read the
-   *  latest change time rather than a snapshot from the last parent render. */
-  lastChange: { current: number };
-}) {
+function LiveTail({ streaming, lastChange }: { streaming?: boolean; lastChange: { current: number } }) {
   const [, tick] = useState(0);
   useEffect(() => {
     if (!streaming) return;
@@ -331,16 +411,11 @@ function LiveTail({
   if (quietMs < 2000) return null;
   return <WorkingIndicator label={"Working… " + formatDuration(quietMs)} />;
 }
-/* ---------- Live activity indicator ---------- */
 
-/**
- * Pulsing "working" line shown while the run is live but nothing is visibly
- * happening — reasoning models can spend a minute before the first token,
- * and an empty bubble looked like a frozen app ("нет прогресса на экране").
- */
+/** Pulsing "working" line for a live run with nothing new on screen. */
 function WorkingIndicator({ label }: { label: string }) {
   return (
-    <div className="flex items-center gap-2 px-1 py-0.5 text-[12px] text-[var(--text-dim)]">
+    <div className="flex items-center gap-2 px-1.5 py-0.5 text-[12px] text-[var(--text-dim)]">
       <span className="relative flex h-2 w-2">
         <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--accent)] opacity-60" />
         <span className="relative inline-flex h-2 w-2 rounded-full bg-[var(--accent)]" />
@@ -352,7 +427,6 @@ function WorkingIndicator({ label }: { label: string }) {
 
 /* ---------- Debug mode: live token HUD ---------- */
 
-/** One metric cell of the debug HUD. */
 function HudCell({ label, value, title }: { label: string; value: string; title?: string }) {
   return (
     <span className="flex items-baseline gap-1" title={title}>
@@ -362,11 +436,7 @@ function HudCell({ label, value, title }: { label: string; value: string; title?
   );
 }
 
-/**
- * Real-time inference statistics of the turn: generation speed (tok/s),
- * token spend (prompt + completion), prompt-cache hit rate and how long the
- * model has been generating. Visible only in Debug mode.
- */
+/** Real-time inference statistics of the turn (Debug mode only). */
 export function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?: boolean }) {
   const secs = (usage.elapsed_ms ?? 0) / 1000;
   const tps = secs > 0.5 ? usage.completion_tokens / secs : 0;
@@ -376,7 +446,7 @@ export function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?:
       : 0;
   const fmt = (n: number) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(Math.round(n)));
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-[var(--border-soft)] bg-[var(--bg-input)] px-2.5 py-1.5">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1.5 py-1">
       <Bug size={11} className="shrink-0 text-[var(--accent)]" />
       <HudCell label="speed" value={tps > 0 ? tps.toFixed(1) + " tok/s" : "—"} title="Completion tokens per second" />
       <HudCell
@@ -389,11 +459,7 @@ export function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?:
         value={cacheRate + "%"}
         title={"Cached prompt tokens: " + usage.cached_tokens + " of " + (usage.prompt_tokens + usage.cached_tokens)}
       />
-      <HudCell
-        label="time"
-        value={secs > 0 ? secs.toFixed(1) + "s" : "—"}
-        title="Wall time of the generation so far"
-      />
+      <HudCell label="time" value={secs > 0 ? secs.toFixed(1) + "s" : "—"} title="Wall time of the generation so far" />
       {streaming && (
         <span className="flex items-center gap-1 text-[9.5px] uppercase tracking-wide text-[var(--accent)]">
           <Loader2 size={9} className="animate-spin" /> live
@@ -403,171 +469,15 @@ export function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?:
   );
 }
 
-/* ---------- Decomposed-run task list ---------- */
-
-/** Status icon + color per subtask state. */
-const TASK_VISUAL: Record<string, { icon: typeof Check; cls: string }> = {
-  pending: { icon: Circle, cls: "text-[var(--text-dim)]" },
-  running: { icon: Loader2, cls: "text-[var(--accent)] animate-spin" },
-  done: { icon: Check, cls: "text-[var(--diff-add)]" },
-  error: { icon: XCircle, cls: "text-[var(--diff-del)]" },
-};
-
-/**
- * The subtask list of a decomposed run — rendered in place inside the
- * transcript, updated live as tasks move pending → running → done/error.
- */
-export function TaskList({ tasks, live }: { tasks: db.TaskState[]; live?: boolean }) {
-  const done = tasks.filter((t) => t.status === "done").length;
-  const failed = tasks.filter((t) => t.status === "error").length;
-  // A run that was stopped/finished can leave tasks stuck at "running" — the
-  // spinner must NOT keep animating forever ("при остановке не пропадает
-  // анимация"). Frozen turns render "running" as an interrupted outline.
-  const visual = (status: string) => {
-    if (status === "running" && !live) return { icon: Circle, cls: "text-[var(--text-dim)]" };
-    return TASK_VISUAL[status] ?? TASK_VISUAL.pending;
-  };
-  return (
-    <div className="selectable overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-surface)]">
-      <div className="flex items-center gap-2 border-b border-[var(--border-soft)] px-3 py-2">
-        <ListChecks size={13} className="shrink-0 text-[var(--accent)]" />
-        <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-[var(--text-main)]">
-          Task list
-        </span>
-        <span className="shrink-0 font-mono text-[10.5px] text-[var(--text-dim)]">
-          {done}/{tasks.length} done{failed > 0 ? " · " + failed + " failed" : ""}
-        </span>
-      </div>
-      <div className="flex flex-col">
-        {tasks.map((t) => {
-          const vis = visual(t.status);
-          const Icon = vis.icon;
-          return (
-            <div
-              key={t.id}
-              className="flex items-start gap-2 border-b border-[var(--border-soft)] px-3 py-1.5 last:border-b-0"
-            >
-              <Icon size={13} className={"mt-0.5 shrink-0 " + vis.cls} />
-              <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                <span className="truncate text-[12px] text-[var(--text-main)]">
-                  <span className="mr-1.5 font-mono text-[10.5px] text-[var(--text-dim)]">{t.id}.</span>
-                  {t.title}
-                </span>
-                {t.summary && (
-                  <span className="truncate text-[10.5px] text-[var(--text-dim)]" title={t.summary}>
-                    {t.summary}
-                  </span>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-/**
- * Compact task strip that lives ABOVE the prompt box while a decomposed run
- * is working. Two states, one click apart:
- *  - collapsed: a single row — current task title + live progress counter;
- *  - expanded:  the whole board in a small panel that scrolls past ~5 tasks.
- * The transcript TaskList stays the durable record; this is the always-
- * visible "what is happening right now" indicator the user asked for.
- */
-export function TaskChips({ tasks }: { tasks: db.TaskState[] }) {
-  const [open, setOpen] = useState(false);
-  const done = tasks.filter((t) => t.status === "done").length;
-  const failed = tasks.filter((t) => t.status === "error").length;
-  const current = tasks.find((t) => t.status === "running");
-  if (!tasks.length) return null;
-  return (
-    <div className="px-6 pb-1">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 rounded-lg py-1 text-left text-[11px] text-[var(--text-muted)] transition-colors hover:text-[var(--text-main)]"
-      >
-        {current ? (
-          <Loader2 size={12} className="shrink-0 animate-spin text-[var(--accent)]" />
-        ) : (
-          <ListChecks size={12} className="shrink-0 text-[var(--accent)]" />
-        )}
-        <span className="min-w-0 flex-1 truncate">
-          {current ? current.title : done + failed >= tasks.length ? "All tasks finished" : "Tasks"}
-        </span>
-        <span className="shrink-0 font-mono text-[10.5px] text-[var(--text-dim)]">
-          {done}/{tasks.length}{failed > 0 ? " · " + failed + " failed" : ""}
-        </span>
-        <ChevronRight
-          size={13}
-          className={"shrink-0 transition-transform " + (open ? "rotate-90" : "")}
-        />
-      </button>
-      <AnimatePresence initial={false}>
-        {open && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.18, ease: "easeOut" }}
-            className="overflow-hidden"
-          >
-            {/* Small by design: past ~5 tasks it scrolls instead of pushing
-                the prompt box off screen. */}
-            <div className="mb-1.5 max-h-[150px] overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--bg-surface)]/60 backdrop-blur-sm">
-              {tasks.map((t) => {
-                const vis = t.status === "running"
-                  ? { icon: Loader2, cls: "text-[var(--accent)] animate-spin" }
-                  : t.status === "done"
-                    ? { icon: Check, cls: "text-[var(--diff-add)]" }
-                    : t.status === "error"
-                      ? { icon: XCircle, cls: "text-[var(--diff-del)]" }
-                      : { icon: Circle, cls: "text-[var(--text-dim)]" };
-                const Icon = vis.icon;
-                return (
-                  <div key={t.id} className="flex items-center gap-2 border-b border-[var(--border-soft)] px-2.5 py-1 last:border-b-0">
-                    <Icon size={12} className={"shrink-0 " + vis.cls} />
-                    <span className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--text-main)]">
-                      <span className="mr-1 font-mono text-[10px] text-[var(--text-dim)]">{t.id}.</span>
-                      {t.title}
-                    </span>
-                    {t.summary && (
-                      <span className="hidden max-w-[40%] shrink-0 truncate text-[10px] text-[var(--text-dim)] sm:inline" title={t.summary}>
-                        {t.summary}
-                      </span>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
-  );
-}
-
-export /**
- * Generation time badge at the bottom-right of a finished agent turn.
- * Hidden while streaming and for turns without a measured duration.
- */
-function DurationFooter({
-  streaming,
-  durationMs,
-}: {
-  streaming?: boolean;
-  durationMs?: number;
-}) {
+/** Generation time at the end of a finished agent turn. */
+export function DurationFooter({ streaming, durationMs }: { streaming?: boolean; durationMs?: number }) {
   if (streaming || !durationMs || durationMs <= 0) return null;
   return (
-    <div className="flex justify-end">
-      <span
-        className="rounded-full bg-[var(--hover-bg)] flex flex-row items-center px-1.5 py-0.5 font-mono text-[10px] text-[var(--text-dim)]"
-        title="Generation time"
-      >
-        Ran for {formatDuration(durationMs)} <ArrowUp className="ml-1 size-3" />
-      </span>
-    </div>
+    <span
+      className="flex items-center font-mono text-[10.5px] text-[var(--text-dim)]"
+      title="Generation time"
+    >
+      Ran for {formatDuration(durationMs)} <ArrowUp className="ml-1 size-3" />
+    </span>
   );
 }

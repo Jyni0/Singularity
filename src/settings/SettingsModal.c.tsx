@@ -13,6 +13,7 @@ import { TerminalSettings } from "./TerminalSettings.c";
 import { ProjectSelect, ProjectSettingsPanel } from "./ProjectSettings.c";
 import { SettingRow, SettingsCard, Sep } from "./SettingsParts.c";
 import { Switch } from "../ui/Switch.c";
+import { LogsSettings } from "./LogsSettings.c";
 
 export type SettingsSection =
   | "general"
@@ -22,6 +23,7 @@ export type SettingsSection =
   | "models"
   | "agents"
   | "terminal"
+  | "logs"
   | "about";
 
 export function SettingsModal({
@@ -46,6 +48,8 @@ export function SettingsModal({
   onSubagents,
   maxAgents,
   onMaxAgents,
+  maxRetries,
+  onMaxRetries,
   initialProject,
   initialSection,
   mode = "agent",
@@ -56,6 +60,9 @@ export function SettingsModal({
   onSubagents: (next: db.Subagent[]) => void;
   maxAgents: number;
   onMaxAgents: (n: number) => void;
+  /** Retries of a failed model request (API / stream errors). */
+  maxRetries: number;
+  onMaxRetries: (n: number) => void;
   theme: Theme;
   onTheme: (t: Theme) => void;
   projects: Project[];
@@ -91,7 +98,7 @@ export function SettingsModal({
   const [section, setSection] = useState<SettingsSection>(initialSection ?? "general");
   // A section that this mode does not offer (deep link / stale state) lands
   // on General — General and About exist in EVERY mode.
-  const sshSections: SettingsSection[] = ["general", "terminal", "about"];
+  const sshSections: SettingsSection[] = ["general", "terminal", "logs", "about"];
   const effectiveSection = mode === "ssh" && !sshSections.includes(section) ? "general" : section;
   const [settingsProject, setSettingsProject] = useState<string | null>(initialProject ?? null);
   const [name, setName] = useState("");
@@ -126,6 +133,7 @@ export function SettingsModal({
       : [
           { id: "general", label: "General" },
           { id: "terminal", label: "Terminal" },
+          { id: "logs", label: "Logs" },
         ];
   const navItems: NavGroup[] = [
     { group: "Settings", items: settingsItems },
@@ -152,6 +160,7 @@ export function SettingsModal({
     projects: ["Manage Projects", "Create and organize project folders"],
     "project-settings": ["Project Settings", "Rename, permissions and delete for one project"],
     terminal: ["Terminal", "Theme and behaviour of the SSH console"],
+    logs: ["Logs", "The SSH audit trail of connections and commands"],
     about: ["About", "Application information"],
   };
 
@@ -270,10 +279,14 @@ export function SettingsModal({
               onChange={onSubagents}
               maxAgents={maxAgents}
               onMaxAgents={onMaxAgents}
+              maxRetries={maxRetries}
+              onMaxRetries={onMaxRetries}
             />
           )}
 
           {effectiveSection === "terminal" && <TerminalSettings />}
+
+          {effectiveSection === "logs" && <LogsSettings />}
 
           {effectiveSection === "permissions" && (
             <SettingsCard>

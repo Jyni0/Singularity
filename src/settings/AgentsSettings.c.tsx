@@ -19,11 +19,15 @@ export function AgentsSettings({
   onChange,
   maxAgents,
   onMaxAgents,
+  maxRetries,
+  onMaxRetries,
 }: {
   subagents: db.Subagent[];
   onChange: (next: db.Subagent[]) => void;
   maxAgents: number;
   onMaxAgents: (n: number) => void;
+  maxRetries: number;
+  onMaxRetries: (n: number) => void;
 }) {
   const [openId, setOpenId] = useState<string | null>(null);
 
@@ -42,6 +46,23 @@ export function AgentsSettings({
   return (
     <div className="flex flex-col gap-3">
       <SettingsCard>
+        <SettingRow
+          title="Max retry attempts"
+          hint="When the API fails (502, 429, broken JSON, cut connection) the request is sent again every 5s, up to this many times. 0 = never retry."
+        >
+          <input
+            type="number"
+            min={0}
+            max={20}
+            className={`${SINPUT} w-[90px]`}
+            value={maxRetries}
+            onChange={(e) => {
+              const n = Math.min(20, Math.max(0, Math.floor(Number(e.target.value) || 0)));
+              onMaxRetries(n);
+            }}
+          />
+        </SettingRow>
+        <Sep />
         <SettingRow
           title="Max agents at once"
           hint="How many helper agents may work in parallel (1–8). They share the provider's rate limits."

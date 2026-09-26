@@ -53,7 +53,7 @@ export function ModelSelector({
       <AnimatePresence>
         {open && (
           <motion.div
-            className="absolute bottom-[calc(100%+8px)] left-0 z-[200] flex min-w-[240px] flex-col gap-0.5 rounded-xl border border-[var(--border)] bg-[var(--bg-surface)] p-2 shadow-[var(--shadow-popup)]"
+            className="absolute bottom-[calc(100%+8px)] left-0 z-[200] flex min-w-[240px] flex-col rounded-xl border border-[var(--border)] bg-[var(--bg-surface)] p-2 shadow-[var(--shadow-popup)]"
             initial={{ opacity: 0, y: 8, scale: 0.96 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 8, scale: 0.96 }}
@@ -87,11 +87,11 @@ export function ModelSelector({
                       transition={{ duration: 0.12, ease: "easeOut" }}
                     >
                       {/* Long model lists scroll with the app's own bar. */}
-                      <OverlayScroll className="flex max-h-[300px] flex-col gap-0.5">
+                      <OverlayScroll className="flex max-h-[300px] flex-col gap-0.5 overflow-y-auto">
                         {g.models.map((m) => (
                           <button
                             key={m.id}
-                            className={`${MENU_ITEM} ${g.id === gw.id && m.id === model.id ? "bg-[var(--hover-bg)]" : ""}`}
+                            className={`${MENU_ITEM} min-h-8 ${g.id === gw.id && m.id === model.id ? "bg-[var(--hover-bg)]" : ""}`}
                             onClick={() => {
                               onSelect(g.id, m.id);
                               setOpen(false);

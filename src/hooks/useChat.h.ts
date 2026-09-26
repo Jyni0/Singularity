@@ -44,6 +44,8 @@ export interface UseChatOptions {
   sshServers: SshServer[];
   subagents: db.Subagent[];
   maxAgents: number;
+  /** Retries of a failed model request (Settings → Agent). */
+  maxRetries: number;
   /** Model picked in the prompt box (edit-and-resend before any send). */
   pickedModel: { gatewayId: string; modelId: string } | null;
   /** Project a brand-new chat is created in. */
@@ -283,6 +285,7 @@ export function useChat(options: UseChatOptions) {
               concurrency: provider.concurrency ?? 0,
               subagents: o.subagents.filter((s) => s.enabled && s.name.trim()),
               max_agents: o.maxAgents,
+              max_retries: o.maxRetries,
               ssh_units: o.sshServers.map((s) => ({ id: s.id, name: s.name, host: s.host })),
             },
             turns,

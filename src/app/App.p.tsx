@@ -23,7 +23,7 @@ import { HistoryView } from "../views/HistoryView.p";
 import { TasksView } from "../views/TasksView.p";
 import { UnitsView } from "../views/UnitsView.p";
 import { SshLogsView } from "../views/SshLogsView.p";
-import { TerminalView, forgetConnSession } from "../views/TerminalView.p";
+import { TerminalView, forgetConnSession, pasteIntoConn } from "../views/TerminalView.p";
 import { FilesView } from "../views/FilesView.p";
 import { SshPanel } from "../layout/SshPanel.c";
 import type { SshPanelTarget } from "../layout/SshPanel.c";
@@ -136,9 +136,12 @@ export default function App() {
   /** Helper agents (Settings → Agent) and how many may work at once. */
   const [subagents, setSubagents] = useState<db.Subagent[]>([]);
   const [maxAgents, setMaxAgents] = useState(2);
+  /** Retries of a failed model request before a run gives up. */
+  const [maxRetries, setMaxRetries] = useState(5);
   useEffect(() => {
     void db.loadSubagents().then(setSubagents);
     void db.loadMaxAgents().then(setMaxAgents);
+    void db.loadMaxRetries().then(setMaxRetries);
   }, []);
 
   /** Chat state + lifecycle: messages, streaming, tools, stop, edit/resend. */
@@ -152,6 +155,7 @@ export default function App() {
     sshServers,
     subagents,
     maxAgents,
+    maxRetries,
     pickedModel,
     newChatProject,
     onConversationCreated: (project, conv) => {
@@ -870,6 +874,11 @@ export default function App() {
             onSelectConn={selectSshConn}
             onCloseConn={closeSshConn}
             onOpenPanel={openSshPanel}
+            onPasteScript={
+              view === "ssh-terminal" && activeConn
+                ? (script) => void pasteIntoConn(activeConn, script.content)
+                : null
+            }
             onShowView={(v) => {
               setView(v);
             }}
@@ -1275,6 +1284,11 @@ export default function App() {
               onSubagents={(next) => {
                 setSubagents(next);
                 void db.saveSubagents(next);
+              }}
+              maxRetries={maxRetries}
+              onMaxRetries={(n) => {
+                setMaxRetries(n);
+                void db.setSetting("max_retries", String(n));
               }}
               maxAgents={maxAgents}
               onMaxAgents={(n) => {

@@ -1677,21 +1677,6 @@ pub async fn delete_script(app: &AppHandle, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs a saved script on a server (Units page one-click run).
-pub async fn run_script(
-    app: &AppHandle,
-    actor: &str,
-    server_id: &str,
-    script_id: &str,
-) -> Result<String, String> {
-    let scripts = list_scripts(app).await?;
-    let script = scripts
-        .into_iter()
-        .find(|s| s.id == script_id)
-        .ok_or_else(|| format!("unknown script: {script_id}"))?;
-    exec(app, actor, server_id, &script.content).await
-}
-
 /* ---------- Tauri command layer ---------- */
 // Thin wrappers; `lib.rs` registers them. Everything that could carry a
 // secret crosses as vault ciphertext or not at all (listings blank them).
@@ -1794,11 +1779,6 @@ pub async fn ssh_save_script(app: AppHandle, script: SshScript) -> Result<String
 #[tauri::command]
 pub async fn ssh_delete_script(app: AppHandle, script_id: String) -> Result<(), String> {
     delete_script(&app, &script_id).await
-}
-
-#[tauri::command]
-pub async fn ssh_run_script(app: AppHandle, server_id: String, script_id: String) -> Result<String, String> {
-    run_script(&app, "user", &server_id, &script_id).await
 }
 
 #[tauri::command]

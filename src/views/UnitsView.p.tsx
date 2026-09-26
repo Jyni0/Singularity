@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Server,
@@ -12,16 +11,12 @@ import {
   Trash2,
   LoaderCircle,
   X,
-  Play,
   FolderOpen,
   ShieldCheck,
   ShieldAlert,
 } from "lucide-react";
 import * as db from "../core/db.r";
 import type { SshKey, SshScript, SshServer, UnitsTab } from "../core/types.i";
-import { Modal } from "../ui/Modal.c";
-import { OverlayScroll } from "../ui/ScrollArea.c";
-import { Combobox } from "../ui/Combobox.c";
 import { OsLogo } from "../ui/OsLogo.c";
 
 /**
@@ -71,23 +66,6 @@ export function UnitsView({
   onOpenTerminal: (serverId: string) => void;
   onOpenFiles: (serverId: string) => void;
 }) {
-  /** Script run in flight per script id. */
-  const [runningScript, setRunningScript] = useState<string | null>(null);
-  const [scriptResult, setScriptResult] = useState<{ name: string; ok: boolean; text: string } | null>(null);
-
-  const runScript = async (serverId: string, s: SshScript) => {
-    setRunningScript(s.id);
-    setScriptResult(null);
-    try {
-      const out = await db.runSshScript(serverId, s.id);
-      setScriptResult({ name: s.name, ok: true, text: out });
-    } catch (e) {
-      setScriptResult({ name: s.name, ok: false, text: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setRunningScript(null);
-    }
-  };
-
   const TABS: { id: UnitsTab; label: string; icon: typeof Server; count: number }[] = [
     { id: "servers", label: "Servers", icon: Server, count: servers.length },
     { id: "keys", label: "Credentials", icon: KeyRound, count: keys.length },
@@ -196,10 +174,7 @@ export function UnitsView({
           {tab === "scripts" && (
             <ScriptGrid
               scripts={scripts}
-              servers={servers}
-              runningScript={runningScript}
               onEdit={(s) => onEditUnit({ kind: "script", id: s.id })}
-              onRun={runScript}
               onDelete={async (s) => {
                 await db.deleteSshScript(s.id);
                 onChanged();
@@ -209,21 +184,6 @@ export function UnitsView({
         </motion.div>
       </AnimatePresence>
 
-      {/* Script run result (output viewer — not an edit dialog) */}
-      {scriptResult && (
-        <Modal title={scriptResult.ok ? scriptResult.name : scriptResult.name + " — failed"} onClose={() => setScriptResult(null)}>
-          <OverlayScroll className="max-h-[45vh] overflow-auto rounded-lg bg-[var(--bg-input)]">
-            <pre
-              className={
-                "whitespace-pre-wrap p-3 font-mono text-[12px] leading-[1.5] " +
-                (scriptResult.ok ? "text-[var(--text-main)]" : "text-[var(--diff-del)]")
-              }
-            >
-              {scriptResult.text}
-            </pre>
-          </OverlayScroll>
-        </Modal>
-      )}
     </motion.div>
   );
 }
@@ -451,24 +411,19 @@ function KeyGrid({
 
 /* ---------- Scripts list ---------- */
 
+/**
+ * Saved scripts. They are not run from here: open a terminal on a server and
+ * click the script in the sidebar — it is pasted into that terminal.
+ */
 function ScriptGrid({
   scripts,
-  servers,
-  runningScript,
   onEdit,
-  onRun,
   onDelete,
 }: {
   scripts: SshScript[];
-  servers: SshServer[];
-  runningScript: string | null;
   onEdit: (s: SshScript) => void;
-  onRun: (serverId: string, s: SshScript) => void;
   onDelete: (s: SshScript) => void;
 }) {
-  const [target, setTarget] = useState<string>("");
-  // Servers load async: fall back to the first one until a valid target is picked.
-  const effectiveTarget = servers.some((s) => s.id === target) ? target : servers[0]?.id ?? "";
   if (scripts.length === 0) return <Empty icon={FileCode2} text="No scripts yet — save a command you run often." />;
   return (
     <div className={LIST}>
@@ -483,26 +438,7 @@ function ScriptGrid({
                 {s.content.split("\n")[0]}
               </span>
             </span>
-            <span className="flex w-[150px] shrink-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
-              {/* Run-on picker: the app's Combobox (custom popup + custom
-                  scrollbar) instead of the OS-native select. */}
-              <span className="min-w-0 flex-1 [&_button]:h-7 [&_button]:px-2 [&_button]:text-[11.5px]">
-                <Combobox
-                  searchable={false}
-                  value={effectiveTarget}
-                  onChange={setTarget}
-                  placeholder={servers.length === 0 ? "No servers" : "Run on…"}
-                  emptyText="No servers"
-                  options={servers.map((srv) => ({ value: srv.id, label: srv.name }))}
-                />
-              </span>
-              <button
-                className="flex h-7 items-center gap-1.5 rounded-full bg-[var(--accent)] px-3 text-[12px] font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={!effectiveTarget || runningScript === s.id}
-                onClick={() => effectiveTarget && onRun(effectiveTarget, s)}
-              >
-                {runningScript === s.id ? <LoaderCircle size={12} className="animate-spin" /> : <Play size={12} />} Run
-              </button>
+            <span className="flex shrink-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
               <span className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                 <button
                   className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"

@@ -28,6 +28,23 @@ const DEFAULT_SSH_TERMINAL = {
  */
 const SESSION_BY_CONN = new Map<string, string>();
 
+/** connId → the mounted xterm of that connection page. */
+const TERM_BY_CONN = new Map<string, Terminal>();
+
+/**
+ * Pastes text into a connection's terminal as if the user pasted it: xterm
+ * wraps it in bracketed-paste markers when the shell asked for them, so a
+ * multi-line script lands in the prompt instead of executing line by line.
+ * Returns false when that terminal is not mounted.
+ */
+export function pasteIntoConn(connId: string, text: string): boolean {
+  const term = TERM_BY_CONN.get(connId);
+  if (!term) return false;
+  term.paste(text);
+  term.focus();
+  return true;
+}
+
 /** Drop a connection's cached session — called by the App when the
  *  Connections row is closed (the PTY itself is killed there too). */
 export function forgetConnSession(connId: string) {
@@ -125,6 +142,7 @@ export function TerminalView({
       fit.fit();
       termRef.current = term;
       fitRef.current = fit;
+      TERM_BY_CONN.set(connId, term);
 
       // 2. Output listener FIRST, session second: the listener filters by
       //    sessionRef, so wiring it before the session id exists is safe and
@@ -239,6 +257,7 @@ export function TerminalView({
       // The PTY itself stays alive in Rust: switching connection tabs only
       // unmounts the view — switching back re-attaches via SESSION_BY_CONN.
       // The session is killed by closeSshConn when the Connections row dies.
+      if (TERM_BY_CONN.get(connId) === termRef.current) TERM_BY_CONN.delete(connId);
       termRef.current?.dispose();
       termRef.current = null;
     };

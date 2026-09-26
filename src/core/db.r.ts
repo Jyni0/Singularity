@@ -1068,6 +1068,8 @@ export interface AgentRequest {
   subagents?: Subagent[];
   /** How many helper agents may work at the same time. */
   max_agents?: number;
+  /** Retries of a failed model request (API/stream error), 5s apart. */
+  max_retries?: number;
 }
 
 /** A user-defined helper agent (stored in settings as "subagents"). */
@@ -1095,6 +1097,13 @@ export async function loadSubagents(): Promise<Subagent[]> {
 
 export async function saveSubagents(list: Subagent[]): Promise<void> {
   await setSetting("subagents", JSON.stringify(list));
+}
+
+/** Retries of a failed model request before a run gives up (default 5). */
+export async function loadMaxRetries(): Promise<number> {
+  const raw = await getSetting("max_retries");
+  const n = raw === null ? NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.min(n, 20) : 5;
 }
 
 /** How many helper agents may run at once (default 2). */
@@ -1705,9 +1714,6 @@ export async function deleteSshScript(id: string): Promise<void> {
 }
 
 /** Runs a saved script on a server; returns combined output. */
-export async function runSshScript(serverId: string, scriptId: string): Promise<string> {
-  return sshInvoke<string>("ssh_run_script", { serverId, scriptId });
-}
 
 /* ---------- Audit log (no secrets — read via SQL plugin) ---------- */
 
@@ -1732,6 +1738,25 @@ export async function loadSshLogs(limit = 300): Promise<SshLog[]> {
     [limit],
   );
   return rows.map((r) => ({ ...r, ok: !!r.ok }));
+}
+
+/** Window event fired after the audit log was cleared (Logs page reloads). */
+export const SSH_LOGS_CLEARED = "ssh-logs-cleared";
+
+/** Deletes the whole SSH audit trail (Settings → Logs, SSH Client mode). */
+export async function clearSshLogs(): Promise<void> {
+  const db = await getDb();
+  if (!db) memory.sshLogs = [];
+  else await db.execute("DELETE FROM ssh_logs");
+  window.dispatchEvent(new Event(SSH_LOGS_CLEARED));
+}
+
+/** Number of rows in the audit trail. */
+export async function countSshLogs(): Promise<number> {
+  const db = await getDb();
+  if (!db) return memory.sshLogs.length;
+  const rows = await db.select<{ n: number }[]>("SELECT COUNT(*) AS n FROM ssh_logs");
+  return rows[0]?.n ?? 0;
 }
 
 /* ---------- Live connections (Rust owns the pool) ---------- */

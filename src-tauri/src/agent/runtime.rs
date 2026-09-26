@@ -103,9 +103,18 @@ const LIVE_ARGS_STEP: usize = 400;
 const REPEAT_SKIP_AT: usize = 3;
 /// …and before the run is stopped outright.
 const REPEAT_STOP_AT: usize = 5;
+/// Marker of the repeat guard's stop — deliberate, never retried.
+const GUARD_STOP: &str = "the model repeated the same action";
+/// Pause between retries of a failed model request.
+const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The latest model request of one logical run — (prompt, history) exactly
+/// as Rig is about to send it. After a failure the run resumes from here.
+type Snapshot = Arc<Mutex<Option<(Message, Vec<Message>)>>>;
 
 struct UiHook {
     ctx: RunCtx,
+    snapshot: Snapshot,
     /// "[Helper] " prefix for subagent cards; empty for the main agent.
     label: String,
     permit: Mutex<Option<crate::limiter::Permit>>,
@@ -114,9 +123,10 @@ struct UiHook {
 }
 
 impl UiHook {
-    fn new(ctx: RunCtx, label: Option<&str>) -> Self {
+    fn new(ctx: RunCtx, label: Option<&str>, snapshot: Snapshot) -> Self {
         Self {
             ctx,
+            snapshot,
             label: label.map(|l| format!("[{l}] ")).unwrap_or_default(),
             permit: Mutex::new(None),
             live: Mutex::new(HashMap::new()),
@@ -133,10 +143,11 @@ impl UiHook {
 impl AgentHook for UiHook {
     /// Provider limits (RPM + concurrency) gate every model call; Stop ends
     /// the run before another request goes out.
-    async fn on_completion_call(&self, _ctx: &HookContext, _event: CompletionCallEvent<'_>) -> CompletionCallAction {
+    async fn on_completion_call(&self, _ctx: &HookContext, event: CompletionCallEvent<'_>) -> CompletionCallAction {
         if is_cancelled(&self.ctx.run_id) {
             return CompletionCallAction::Stop(crate::cancel::STOPPED.to_string());
         }
+        *self.snapshot.lock().unwrap() = Some((event.prompt.clone(), event.history.to_vec()));
         let req = &self.ctx.req;
         let key = if req.provider_id.is_empty() { req.base_url.clone() } else { req.provider_id.clone() };
         let permit = crate::limiter::acquire(&key, req.rate_limit_rpm, req.concurrency, &self.ctx.run_id).await;
@@ -204,7 +215,7 @@ impl AgentHook for UiHook {
         };
         if repeats >= REPEAT_STOP_AT {
             self.step(idx, event.tool_name, summary, true, &tools::ToolResult::err("stopped: repeated call"));
-            return ToolCallAction::Stop(format!("the model repeated the same action {repeats} times ({})", one_line(&fp, 120)));
+            return ToolCallAction::Stop(format!("{GUARD_STOP} {repeats} times ({})", one_line(&fp, 120)));
         }
         if repeats >= REPEAT_SKIP_AT {
             self.step(idx, event.tool_name, summary, true, &tools::ToolResult::err("skipped: repeated call"));
@@ -462,14 +473,15 @@ fn to_messages(req: &AgentRequest, turns: &[crate::chat::ChatTurn]) -> (Vec<Mess
 }
 
 /// Consumes one Rig stream: text and reasoning go to the UI (only when
-/// `to_ui`), usage to the HUD. Returns the answer text. Stop drops the
-/// stream immediately.
+/// `to_ui`), usage to the HUD. Returns the text it produced plus the error
+/// that ended it, if any (Stop drops the stream at once and reports
+/// `STOPPED`).
 async fn drive(
     ctx: &RunCtx,
     mut stream: rig_agent::agent::StreamingResult,
     to_ui: bool,
     mut on_text: impl FnMut(&str),
-) -> Result<String, String> {
+) -> (String, Option<String>) {
     let mut text = String::new();
     // Providers that stream reasoning deltas also send the full block at the
     // end of the turn — show it only when no deltas came.
@@ -482,7 +494,7 @@ async fn drive(
             },
             _ = crate::cancel::cancel_signal(&ctx.run_id) => {
                 drop(stream);
-                return cancelled_result(text);
+                return (text, Some(crate::cancel::STOPPED.to_string()));
             }
         };
         let item = match item {
@@ -490,9 +502,9 @@ async fn drive(
             Err(e) => {
                 let msg = e.to_string();
                 if is_cancelled(&ctx.run_id) || msg.contains(crate::cancel::STOPPED) {
-                    return cancelled_result(text);
+                    return (text, Some(crate::cancel::STOPPED.to_string()));
                 }
-                return Err(msg);
+                return (text, Some(msg));
             }
         };
         match item {
@@ -536,7 +548,72 @@ async fn drive(
             _ => {}
         }
     }
-    Ok(text)
+    (text, None)
+}
+
+/// Runs an agent (main or helper) to the end, retrying ANY failure — HTTP
+/// 5xx/429, broken JSON, a cut connection — up to `req.max_retries` times,
+/// every RETRY_DELAY. A retry resumes from the exact request that failed
+/// (the hook's snapshot), so finished tool work is never redone. Stop and
+/// the repeat guard are deliberate and end the run at once.
+#[allow(clippy::too_many_arguments)]
+async fn run_with_retry(
+    ctx: &RunCtx,
+    preamble: &str,
+    tools: impl Fn() -> Vec<DynamicTool>,
+    label: Option<&str>,
+    mut prompt: Message,
+    mut history: Vec<Message>,
+    parallel: usize,
+    to_ui: bool,
+    mut on_text: impl FnMut(&str),
+) -> Result<String, String> {
+    let snapshot: Snapshot = Arc::default();
+    let mut text = String::new();
+    let mut attempt = 0usize;
+    loop {
+        let agent = build_agent(ctx, preamble, tools())?;
+        let stream = agent
+            .stream_chat(prompt.clone(), history.clone())
+            .max_turns(MAX_TURNS)
+            // Several delegate calls in one turn run side by side.
+            .tool_concurrency(parallel)
+            .add_hook(UiHook::new(ctx.clone(), label, snapshot.clone()))
+            .await;
+        let (part, err) = drive(ctx, stream, to_ui, &mut on_text).await;
+        text.push_str(&part);
+        let Some(err) = err else {
+            return Ok(text);
+        };
+        if err.starts_with(crate::cancel::STOPPED) || is_cancelled(&ctx.run_id) {
+            return cancelled_result(text);
+        }
+        if err.contains(GUARD_STOP) || attempt >= ctx.req.max_retries {
+            return Err(err);
+        }
+        attempt += 1;
+        let who = label.map(|l| format!("{l}: ")).unwrap_or_default();
+        emit_text(
+            &ctx.app,
+            &ctx.run_id,
+            format!(
+                "\n\n⚠️ {who}{} — retrying in {}s ({attempt}/{})…\n\n",
+                one_line(&err, 200),
+                RETRY_DELAY.as_secs(),
+                ctx.req.max_retries
+            ),
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(RETRY_DELAY) => {}
+            _ = crate::cancel::cancel_signal(&ctx.run_id) => return cancelled_result(text),
+        }
+        // Resume from the request that failed; before the first request
+        // there is no snapshot and the original prompt goes out again.
+        if let Some((p, h)) = snapshot.lock().unwrap().take() {
+            prompt = p;
+            history = h;
+        }
+    }
 }
 
 /// Runs one helper agent to completion. Its tool cards join the run's
@@ -549,17 +626,10 @@ async fn run_subagent(ctx: &RunCtx, def: &SubagentDef, task: &str, card: Option<
         def.name,
         def.prompt.trim()
     );
-    let hook = UiHook::new(ctx.clone(), Some(&def.name));
-    let agent = build_agent(ctx, &preamble, fs_tools(ctx))?;
-    let stream = agent
-        .stream_chat(task.to_string(), Vec::<Message>::new())
-        .max_turns(MAX_TURNS)
-        .add_hook(hook)
-        .await;
     let summary = format!("{}: {}", def.name, one_line(task, 80));
     let mut partial = String::new();
     let mut shown = 0usize;
-    let result = drive(ctx, stream, false, |t| {
+    let result = run_with_retry(ctx, &preamble, || fs_tools(ctx), Some(&def.name), Message::user(task), Vec::new(), 1, false, |t| {
         partial.push_str(t);
         // Live progress in the delegate card, throttled.
         if let Some(idx) = card {
@@ -606,27 +676,22 @@ pub(super) async fn run(
         started: std::time::Instant::now(),
     };
 
-    let helpers: Vec<&SubagentDef> = req.subagents.iter().filter(|s| !s.name.trim().is_empty()).collect();
-    let mut tools = fs_tools(&ctx);
+    let has_helpers = req.subagents.iter().any(|s| !s.name.trim().is_empty());
     let mut preamble = system.to_string();
-    if !helpers.is_empty() {
-        tools.push(delegate_tool(&ctx));
+    if has_helpers {
         preamble.push_str(&format!(
             "\n\nHelper agents are available through the `delegate` tool (up to {parallel} at once). They are optional: do simple or tightly coupled work yourself, and delegate only self-contained parts that match a helper's specialty."
         ));
     }
-
-    let agent = build_agent(&ctx, &preamble, tools)?;
+    let tools = || {
+        let mut t = fs_tools(&ctx);
+        if has_helpers {
+            t.push(delegate_tool(&ctx));
+        }
+        t
+    };
     let (history, prompt) = to_messages(req, &turns);
-    let stream = agent
-        .stream_chat(prompt, history)
-        .max_turns(MAX_TURNS)
-        // Several delegate calls in one turn run side by side.
-        .tool_concurrency(parallel)
-        .add_hook(UiHook::new(ctx.clone(), None))
-        .await;
-
-    let text = drive(&ctx, stream, true, |_| {}).await?;
+    let text = run_with_retry(&ctx, &preamble, tools, None, prompt, history, parallel, true, |_| {}).await?;
     if text.trim().is_empty() && ctx.counter.load(Ordering::SeqCst) == 0 {
         return Err(
             "the model returned an empty answer — its output may have been reasoning-only; retry, or try another model/effort level".into(),

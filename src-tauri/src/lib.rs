@@ -406,7 +406,6 @@ pub fn run() {
             ssh::ssh_list_scripts,
             ssh::ssh_save_script,
             ssh::ssh_delete_script,
-            ssh::ssh_run_script,
             ssh::ssh_shell_open,
             ssh::ssh_shell_input,
             ssh::ssh_shell_resize,

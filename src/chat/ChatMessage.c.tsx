@@ -26,7 +26,7 @@ export function MessageBody({ text }: { text: string }) {
       </div>
       {long && (
         <button
-          className="flex items-center gap-1 self-start text-[11px] text-[var(--accent)]"
+          className="flex items-center gap-1 self-start text-[11px] text-[var(--text-muted)]"
           onClick={() => setOpen(!open)}
         >
           {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
@@ -291,7 +291,7 @@ export function ChatMessage({
 
   if (role === "user") {
     return (
-      <div className="group relative -mx-3 flex flex-col gap-1.5 rounded-xl px-3 py-2 transition-colors hover:bg-[var(--hover-bg)]">
+      <div className="bg-[var(--hover-bg)] group relative -mx-3 flex flex-col gap-1.5 rounded-xl px-3 py-2 transition-colors">
         {images && images.length > 0 && (
           <div className="flex flex-wrap gap-2">
             {images.map((img, i) => (
@@ -318,7 +318,7 @@ export function ChatMessage({
         ) : (
           <>
             <MessageBody text={text} />
-            <div className="absolute right-2 top-1.5 flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+            <div className="absolute right-2 bottom-1.5 flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
               <CopyButton text={text} title="Copy prompt" />
               {onEdit && (
                 <ActionButton title="Edit and resend" onClick={() => setEditing(true)}>

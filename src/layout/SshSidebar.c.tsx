@@ -43,6 +43,7 @@ export function SshSidebar({
   onSelectConn,
   onCloseConn,
   onOpenPanel,
+  onPasteScript,
   onShowView,
   onAdd,
   onOpenSettings,
@@ -66,6 +67,8 @@ export function SshSidebar({
   onSelectConn: (connId: string) => void;
   onCloseConn: (connId: string) => void;
   onOpenPanel: (target: { kind: "server" | "key" | "script"; id: string }) => void;
+  /** Pastes a script into the terminal on screen; null when no terminal is. */
+  onPasteScript: ((script: SshScript) => void) | null;
   onShowView: (v: "units" | "ssh-logs") => void;
   onAdd: (tab: UnitsTab) => void;
   onOpenSettings: () => void;
@@ -340,15 +343,44 @@ export function SshSidebar({
             "scripts",
             scripts.map((s) => {
               const active = activePanel?.kind === "script" && activePanel.id === s.id;
+              const rowKey = "script:" + s.id;
               return (
-                <button
+                <div
                   key={s.id}
-                  className={ROW + " w-full " + (active ? ROW_ACTIVE : ROW_HOVER)}
-                  onClick={() => onOpenPanel({ kind: "script", id: s.id })}
+                  className="relative"
+                  onMouseEnter={() => setHovered(rowKey)}
+                  onMouseLeave={() => setHovered((h) => (h === rowKey ? null : h))}
                 >
-                  <FileCode2 size={13} strokeWidth={1.5} className="shrink-0 text-[var(--text-muted)]" />
-                  <span className="truncate">{s.name}</span>
-                </button>
+                  <button
+                    className={ROW + " w-full " + (active ? ROW_ACTIVE : ROW_HOVER)}
+                    // With a terminal on screen the script is pasted into it;
+                    // otherwise the click opens the script's form.
+                    onClick={() =>
+                      onPasteScript ? onPasteScript(s) : onOpenPanel({ kind: "script", id: s.id })
+                    }
+                    title={onPasteScript ? "Paste into the terminal" : "Open a terminal to paste this script — click to edit"}
+                  >
+                    <FileCode2 size={13} strokeWidth={1.5} className="shrink-0 text-[var(--text-muted)]" />
+                    <span className="truncate">{s.name}</span>
+                  </button>
+                  <div
+                    className={
+                      "absolute right-0.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5 bg-gradient-to-l from-[var(--row-solid-gradient)] via-[var(--row-solid-gradient)] to-transparent pl-4 transition-opacity duration-100 " +
+                      (hovered === rowKey ? "opacity-100" : "pointer-events-none opacity-0")
+                    }
+                  >
+                    <button
+                      className={ROW_ICON}
+                      title="Edit script"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onOpenPanel({ kind: "script", id: s.id });
+                      }}
+                    >
+                      <Settings size={13} strokeWidth={1.5} />
+                    </button>
+                  </div>
+                </div>
               );
             })
           )}

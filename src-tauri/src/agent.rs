@@ -216,6 +216,14 @@ pub struct AgentRequest {
     /// How many subagents may work at the same time (0/1 = one at a time).
     #[serde(default)]
     pub max_agents: usize,
+    /// Retries of a failed model request (any API/stream error) before the
+    /// run gives up. Settings → Agent; default 5.
+    #[serde(default = "default_retries")]
+    pub max_retries: usize,
+}
+
+fn default_retries() -> usize {
+    5
 }
 
 /// A user-defined helper agent: the main agent decides which task (if any)

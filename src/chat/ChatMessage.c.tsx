@@ -256,7 +256,7 @@ function ChatMessageView({
   onInspectStep,
   onInspectImage,
 }: {
-  role: "user" | "agent";
+  role: "user" | "agent" | "compact";
   text: string;
   segments?: Segment[];
   /** True while this turn is still being produced. */
@@ -450,7 +450,11 @@ function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?: boolea
         value={cacheRate + "%"}
         title={"Cached prompt tokens: " + usage.cached_tokens + " of " + (usage.prompt_tokens + usage.cached_tokens)}
       />
-      <HudCell label="time" value={secs > 0 ? secs.toFixed(1) + "s" : "—"} title="Wall time of the generation so far" />
+      <HudCell
+        label="time"
+        value={secs > 0 ? formatDuration(secs * 1000) : "—"}
+        title={secs > 0 ? `Wall time of the generation so far: ${secs.toFixed(1)} s` : "Wall time of the generation so far"}
+      />
       {streaming && (
         <span className="flex items-center gap-1 text-[9.5px] uppercase tracking-wide text-[var(--accent)]">
           <Loader2 size={9} className="animate-spin" /> live

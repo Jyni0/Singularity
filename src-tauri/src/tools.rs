@@ -14,7 +14,12 @@ use std::time::Duration;
 /// Largest file we will read into the model context.
 const MAX_READ_BYTES: usize = 200_000;
 /// Largest command output returned to the model.
-const MAX_OUTPUT_BYTES: usize = 30_000;
+const MAX_OUTPUT_BYTES: usize = 20_000;
+/// Lines read_file returns when no end_line is given — a whole 5k-line
+/// file used to land in the context (and be re-sent on every step).
+const READ_DEFAULT_LINES: usize = 2_000;
+/// Longer lines (minified bundles, data blobs) are cut in read_file.
+const READ_MAX_LINE_CHARS: usize = 2_000;
 /// How long a single command may run.
 const COMMAND_TIMEOUT_SECS: u64 = 120;
 
@@ -301,7 +306,9 @@ pub fn read_file(root: &Path, path: &str, start_line: Option<usize>, end_line: O
 
     let lines: Vec<&str> = text.lines().collect();
     let from = start_line.unwrap_or(1).max(1);
-    let to = end_line.unwrap_or(lines.len()).min(lines.len());
+    let to = end_line
+        .unwrap_or_else(|| from.saturating_add(READ_DEFAULT_LINES - 1))
+        .min(lines.len());
 
     if from > lines.len() {
         return ToolResult::err(format!(
@@ -312,7 +319,22 @@ pub fn read_file(root: &Path, path: &str, start_line: Option<usize>, end_line: O
 
     let mut out = format!("{path} (lines {from}-{to} of {})\n", lines.len());
     for (i, line) in lines[from - 1..to].iter().enumerate() {
-        out.push_str(&format!("{:>5}  {}\n", from + i, line));
+        match line.char_indices().nth(READ_MAX_LINE_CHARS) {
+            Some((cut, _)) => out.push_str(&format!(
+                "{:>5}  {} … [line cut, {} more chars]\n",
+                from + i,
+                &line[..cut],
+                line[cut..].chars().count()
+            )),
+            None => out.push_str(&format!("{:>5}  {}\n", from + i, line)),
+        }
+    }
+    if end_line.is_none() && to < lines.len() {
+        out.push_str(&format!(
+            "… {} more lines. Read on with start_line={} (or grep for what you need).\n",
+            lines.len() - to,
+            to + 1
+        ));
     }
     ToolResult::ok(out)
 }
@@ -331,13 +353,17 @@ pub fn write_file(root: &Path, path: &str, content: &str) -> ToolResult {
     // Snapshot the previous content (None for a brand-new file) so the UI can
     // show what exactly changed.
     let old = std::fs::read_to_string(&full).ok();
+    let broken = crate::syntax::introduced(&full, old.as_deref(), content).unwrap_or_default();
     match std::fs::write(&full, content) {
-        Ok(()) => ToolResult::ok(format!(
-            "wrote {path} ({} bytes, {} lines)",
-            content.len(),
-            content.lines().count()
-        ))
-        .with_change(path, old, content.to_string()),
+        Ok(()) => {
+            let summary = format!("wrote {path} ({} bytes, {} lines)", content.len(), content.lines().count());
+            let res = if broken.is_empty() {
+                ToolResult::ok(summary)
+            } else {
+                ToolResult::err(format!("{summary}\n\n{}", crate::syntax::report(path, content, &broken)))
+            };
+            res.with_change(path, old, content.to_string())
+        }
         Err(e) => ToolResult::err(format!("cannot write {path}: {e}")),
     }
 }
@@ -369,8 +395,13 @@ pub fn edit_file(root: &Path, path: &str, old: &str, new: &str) -> ToolResult {
         }
     };
     let updated = format!("{}{}{}", &text[..start], new, &text[end..]);
+    let broken = crate::syntax::introduced(&full, Some(&text), &updated).unwrap_or_default();
     match std::fs::write(&full, &updated) {
-        Ok(()) => ToolResult::ok(format!("edited {path}")).with_change(path, Some(text), updated),
+        Ok(()) if broken.is_empty() => ToolResult::ok(format!("edited {path}")).with_change(path, Some(text), updated),
+        Ok(()) => ToolResult::err(format!("edited {path}
+
+{}", crate::syntax::report(path, &updated, &broken)))
+            .with_change(path, Some(text), updated),
         Err(e) => ToolResult::err(format!("cannot write {path}: {e}")),
     }
 }
@@ -525,24 +556,39 @@ pub fn grep(root: &Path, pattern: &str, subdir: Option<&str>) -> ToolResult {
 ///
 /// Several hunks may follow each other in one diff. An empty SEARCH side
 /// means "create the file with the REPLACE content" (new-file hunk).
+///
+/// Models get the markers slightly wrong all the time (6 or 8 angle
+/// brackets, lowercase, a missing final `>>>>>>> REPLACE`, code fences
+/// around the code), and some send a unified diff instead — all of that is
+/// accepted rather than failing with "no blocks found" in a loop.
 pub fn parse_patch(diff: &str) -> Vec<(String, String)> {
+    static OPEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^<{5,9}\s*(SEARCH|ORIGINAL|FIND)\b").unwrap());
+    static MID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^={5,9}\s*$").unwrap());
+    static CLOSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^>{5,9}\s*(REPLACE|UPDATED)\b").unwrap());
     let mut hunks: Vec<(String, String)> = Vec::new();
     let mut search: Option<Vec<String>> = None;
     let mut replace: Option<Vec<String>> = None;
+    let push = |hunks: &mut Vec<(String, String)>, s: Vec<String>, r: Vec<String>| {
+        hunks.push((unfence(&s).join("\n"), unfence(&r).join("\n")));
+    };
     for line in diff.lines() {
         let t = line.trim();
-        if t == "<<<<<<< SEARCH" {
+        if OPEN.is_match(t) {
+            // A new block while one is still open closes the previous one.
+            if let (Some(s), Some(r)) = (search.take(), replace.take()) {
+                push(&mut hunks, s, r);
+            }
             search = Some(Vec::new());
             replace = None;
             continue;
         }
-        if t == "=======" && search.is_some() && replace.is_none() {
+        if MID.is_match(t) && search.is_some() && replace.is_none() {
             replace = Some(Vec::new());
             continue;
         }
-        if t == ">>>>>>> REPLACE" {
+        if CLOSE.is_match(t) {
             if let (Some(s), Some(r)) = (search.take(), replace.take()) {
-                hunks.push((s.join("\n"), r.join("\n")));
+                push(&mut hunks, s, r);
             }
             continue;
         }
@@ -552,8 +598,150 @@ pub fn parse_patch(diff: &str) -> Vec<(String, String)> {
             s.push(line.to_string());
         }
     }
+    // The last block without its closing marker.
+    if let (Some(s), Some(r)) = (search, replace) {
+        let mut r = r;
+        while r.last().is_some_and(|l| l.trim().starts_with("```") || l.trim().is_empty()) {
+            r.pop();
+        }
+        push(&mut hunks, s, r);
+    }
+    if hunks.is_empty() {
+        hunks = parse_unified(diff);
+    }
     hunks
 }
+
+/// Drops a code fence the model wrapped around one side of a block.
+fn unfence(lines: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = lines.to_vec();
+    if v.first().is_some_and(|l| l.trim_start().starts_with("```")) {
+        v.remove(0);
+        if v.last().is_some_and(|l| l.trim() == "```") {
+            v.pop();
+        }
+    }
+    v
+}
+
+/// A unified diff (`@@ … @@` hunks with ` `/`-`/`+` lines) as SEARCH/REPLACE
+/// pairs: context + removed lines are what to find, context + added lines
+/// what to put there. Line numbers in the headers are ignored.
+fn parse_unified(diff: &str) -> Vec<(String, String)> {
+    let mut hunks = Vec::new();
+    let (mut old, mut new): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    let mut inside = false;
+    let mut flush = |old: &mut Vec<&str>, new: &mut Vec<&str>| {
+        if old.iter().any(|l| !l.trim().is_empty()) && old != new {
+            hunks.push((old.join("\n"), new.join("\n")));
+        }
+        old.clear();
+        new.clear();
+    };
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            flush(&mut old, &mut new);
+            inside = true;
+            continue;
+        }
+        if line.starts_with("---") || line.starts_with("+++") || line.starts_with("diff ") || line.starts_with("index ") {
+            flush(&mut old, &mut new);
+            inside = false;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('-') {
+            old.push(rest);
+        } else if let Some(rest) = line.strip_prefix('+') {
+            new.push(rest);
+        } else if let Some(rest) = line.strip_prefix(' ') {
+            old.push(rest);
+            new.push(rest);
+        } else if line.is_empty() {
+            old.push("");
+            new.push("");
+        } else if line.starts_with('\\') {
+            // "\ No newline at end of file"
+        } else {
+            flush(&mut old, &mut new);
+            inside = false;
+        }
+    }
+    flush(&mut old, &mut new);
+    hunks
+}
+
+/// Character-bigram similarity (Dice) of two texts, whitespace-insensitive.
+fn similarity(a: &str, b: &str) -> f64 {
+    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (a, b) = (norm(a), norm(b));
+    if a == b {
+        return 1.0;
+    }
+    let grams = |s: &str| {
+        let c: Vec<char> = s.chars().collect();
+        let mut m: std::collections::HashMap<(char, char), usize> = std::collections::HashMap::new();
+        for w in c.windows(2) {
+            *m.entry((w[0], w[1])).or_default() += 1;
+        }
+        (m, c.len().saturating_sub(1))
+    };
+    let ((ga, na), (gb, nb)) = (grams(&a), grams(&b));
+    if na + nb == 0 {
+        return 0.0;
+    }
+    let common: usize = ga.iter().map(|(k, n)| (*n).min(*gb.get(k).unwrap_or(&0))).sum();
+    2.0 * common as f64 / (na + nb) as f64
+}
+
+/// The region of `hay` most similar to `needle`, as (first line index,
+/// line count, score, best score of a DIFFERENT region). A window always
+/// holds exactly as many non-blank lines as the needle — a window one line
+/// longer used to swallow the next line (a closing tag) when replaced.
+fn closest_region(hay: &str, needle: &str) -> Option<(usize, usize, f64, f64)> {
+    let lines: Vec<&str> = hay.lines().collect();
+    let want: Vec<&str> = needle.lines().filter(|l| !l.trim().is_empty()).collect();
+    if want.is_empty() || lines.is_empty() || lines.len() > 20_000 {
+        return None;
+    }
+    let target = want.join("\n");
+    let first = want[0].trim();
+    let mut scored: Vec<(usize, usize, f64)> = Vec::new();
+    for i in 0..lines.len() {
+        if lines[i].trim().is_empty() {
+            continue;
+        }
+        // Cheap prefilter: the window must start near the needle's first line.
+        if want.len() > 2 && similarity(lines[i], first) < 0.5 {
+            continue;
+        }
+        let mut j = i;
+        let mut window: Vec<&str> = Vec::with_capacity(want.len());
+        while j < lines.len() && window.len() < want.len() {
+            if !lines[j].trim().is_empty() {
+                window.push(lines[j]);
+            }
+            j += 1;
+        }
+        if window.len() < want.len() {
+            break;
+        }
+        scored.push((i, j - i, similarity(&window.join("\n"), &target)));
+    }
+    let best = scored.iter().copied().max_by(|a, b| a.2.total_cmp(&b.2))?;
+    // Runner-up that does not overlap the best window.
+    let second = scored
+        .iter()
+        .filter(|c| c.0 + c.1 <= best.0 || c.0 >= best.0 + best.1)
+        .map(|c| c.2)
+        .fold(0.0f64, f64::max);
+    Some((best.0, best.1, best.2, second))
+}
+
+/// Similarity above which a unique closest region is patched directly.
+const FUZZY_APPLY: f64 = 0.9;
 
 /// Applies a SEARCH/REPLACE diff to one file — the diff-only edit path.
 ///
@@ -570,8 +758,9 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
     let hunks = parse_patch(diff);
     if hunks.is_empty() {
         return ToolResult::err(
-            "no SEARCH/REPLACE blocks found in the diff. Expected format:\n\
-             <<<<<<< SEARCH\n<exact existing code>\n=======\n<new code>\n>>>>>>> REPLACE",
+            "no SEARCH/REPLACE blocks found in the diff. Put each change in `diff` exactly like this (markers on their own lines):\n\
+             <<<<<<< SEARCH\n<exact existing lines>\n=======\n<new lines>\n>>>>>>> REPLACE\n\
+             To replace the whole file use write_file instead.",
         );
     }
 
@@ -606,9 +795,16 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
             }
         }
         let content = format!("{}\n", hunks[0].1);
+        let broken = crate::syntax::introduced(&full, None, &content).unwrap_or_default();
         return match std::fs::write(&full, &content) {
-            Ok(()) => ToolResult::ok(format!("created {path} ({} bytes)", content.len()))
+            Ok(()) if broken.is_empty() => ToolResult::ok(format!("created {path} ({} bytes)", content.len()))
                 .with_change(path, None, content),
+            Ok(()) => ToolResult::err(format!(
+                "created {path} ({} bytes)\n\n{}",
+                content.len(),
+                crate::syntax::report(path, &content, &broken)
+            ))
+            .with_change(path, None, content),
             Err(e) => ToolResult::err(format!("cannot write {path}: {e}")),
         };
     }
@@ -621,6 +817,7 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
     let mut current = text.unwrap_or_default();
     let mut applied = 0usize;
     let mut errors: Vec<String> = Vec::new();
+    let mut fuzzy: Vec<String> = Vec::new();
     for (i, (search, replace)) in hunks.iter().enumerate() {
         let (needle, replace) = (match_endings(&current, search), match_endings(&current, replace));
         match locate(&current, &needle, &replace) {
@@ -628,26 +825,82 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
                 current = format!("{}{}{}", &current[..start], replace, &current[end..]);
                 applied += 1;
             }
-            Err(0) => errors.push(format!(
-                "hunk {i}: SEARCH text not found in {path} — read the file again and copy the exact lines"
-            )),
+            Err(0) => match closest_region(&current, &needle) {
+                // Nearly identical and clearly the only candidate: the model
+                // mistyped a character or two — apply to the real lines.
+                Some((at, len, score, second)) if score >= FUZZY_APPLY && second < score - 0.1 => {
+                    let eol = if current.contains("\r\n") { "\r\n" } else { "\n" };
+                    let mut lines: Vec<&str> = current.split(eol).collect();
+                    let tail_nl = current.ends_with(eol);
+                    if tail_nl {
+                        lines.pop();
+                    }
+                    let mut out: Vec<String> = lines[..at].iter().map(|l| l.to_string()).collect();
+                    out.extend(replace.split(eol).map(|l| l.trim_end_matches('\r').to_string()));
+                    out.extend(lines[at + len..].iter().map(|l| l.to_string()));
+                    current = out.join(eol);
+                    if tail_nl {
+                        current.push_str(eol);
+                    }
+                    applied += 1;
+                    fuzzy.push(format!("hunk {i}: SEARCH did not match exactly — applied to the closest lines {}-{} ({:.0}% similar); read them back to check", at + 1, at + len, score * 100.0));
+                }
+                Some((at, len, score, _)) if score >= 0.5 => {
+                    let lines: Vec<&str> = current.lines().collect();
+                    let from = at.saturating_sub(2);
+                    let to = (at + len + 2).min(lines.len());
+                    let snippet: String = (from..to).map(|n| format!("{:>5}  {}\n", n + 1, lines[n])).collect();
+                    errors.push(format!(
+                        "hunk {i}: SEARCH text not found in {path}. The closest part of the file ({:.0}% similar) is lines {}-{} — copy SEARCH from it EXACTLY (without the line numbers):\n{snippet}",
+                        score * 100.0,
+                        at + 1,
+                        at + len
+                    ));
+                }
+                _ => errors.push(format!(
+                    "hunk {i}: SEARCH text not found in {path} and nothing similar exists — read_file it and copy the exact lines, or use write_file to rewrite the whole file"
+                )),
+            },
             Err(count) => errors.push(format!(
                 "hunk {i}: SEARCH text appears {count} times in {path} — add surrounding lines to make it unique"
             )),
         }
     }
 
+    // Syntax check (tree-sitter): what did this edit break?
+    let broken = crate::syntax::introduced(&full, original.as_deref(), &current).unwrap_or_default();
+    if !broken.is_empty() && !fuzzy.is_empty() {
+        // A guessed (non-exact) placement that breaks the syntax is almost
+        // certainly the wrong place — keep the file as it was.
+        return ToolResult::err(format!(
+            "{}\nNothing was changed: SEARCH did not match exactly, and applying it to the closest lines broke the syntax. \
+             read_file the region and send SEARCH copied exactly.",
+            crate::syntax::report(path, &current, &broken)
+        ));
+    }
     if applied == 0 {
-        return ToolResult::err(errors.join("\n"));
+        return ToolResult::err(format!(
+            "{}\nNothing was changed. Do not resend the same diff: fix SEARCH from the lines above, \
+             or rewrite the whole file with write_file if most of it changes.",
+            errors.join("\n")
+        ));
     }
     match std::fs::write(&full, &current) {
         Ok(()) => {
             let mut out = format!("patched {path}: {applied}/{} hunks applied", hunks.len());
+            if !fuzzy.is_empty() {
+                out.push('\n');
+                out.push_str(&fuzzy.join("\n"));
+            }
             if !errors.is_empty() {
                 out.push_str("\nFAILED:\n");
                 out.push_str(&errors.join("\n"));
             }
-            let res = if errors.is_empty() {
+            if !broken.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(&crate::syntax::report(path, &current, &broken));
+            }
+            let res = if errors.is_empty() && broken.is_empty() {
                 ToolResult::ok(out)
             } else {
                 // Partially applied — report as an error so the model reacts,
@@ -806,7 +1059,11 @@ fn quiet_env(c: &mut Command) {
             .chain(std::env::split_paths(&path))
             .filter(|d| {
                 let key = d.to_string_lossy().to_lowercase().trim_end_matches(['\\', '/']).to_string();
-                let keep = d.is_dir() && len + key.len() < 8000 && seen.insert(key.clone());
+                // `cargo run` / `tauri dev` prepend hundreds of native build
+                // folders (target\debug\build\…) that pushed node, git and
+                // python past the limit — "'npm' is not recognized".
+                let cargo_build = key.contains(r"\target\debug\build\") || key.contains(r"\target\release\build\");
+                let keep = !cargo_build && d.is_dir() && len + key.len() < 8000 && seen.insert(key.clone());
                 if keep {
                     len += key.len() + 1;
                 }
@@ -913,6 +1170,29 @@ const UNIX_ONLY: &[&str] = &[
 
 /// A one-line next step for the classic failures, so the model changes
 /// approach instead of retrying the same broken command.
+/// A command that quit on an interactive question it could not ask
+/// (commands get no input) — the hint says how to answer it up front.
+fn cancelled_prompt(text: &str) -> Option<String> {
+    let low = text.to_lowercase();
+    let cancelled = ["operation cancelled", "operation canceled", "aborted by user", "prompt was cancelled", "user force closed the prompt"]
+        .iter()
+        .any(|m| low.contains(m));
+    if !cancelled {
+        return None;
+    }
+    let mut hint = String::from(
+        "NOT DONE: the command stopped at an interactive question — commands get no input, so it was cancelled. \
+         Answer it with flags instead (--yes / -y / --force / --template …).",
+    );
+    if low.contains("create-vite") || low.contains("create vite") {
+        hint.push_str(
+            " create-vite cancels in a non-empty folder: scaffold into a new empty folder \
+             (npm create vite@latest my-app -- --template react-ts) or pass --overwrite to empty this one.",
+        );
+    }
+    Some(hint)
+}
+
 fn failure_hint(shell: Shell, command: &str, code: i32, text: &str) -> Option<String> {
     let low = text.to_lowercase();
     let first = command
@@ -988,6 +1268,190 @@ fn clip_middle(text: String, max: usize) -> String {
     format!("{}\n\n… output truncated …\n\n{}", &text[..head_end], &text[tail_start..])
 }
 
+/// Commands that start a server or watcher and never exit on their own.
+/// Models kept running `npm run dev` in the foreground, waited out the
+/// timeout and got it killed — these go to the background by themselves.
+static LONG_RUNNING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)
+        \b(npm|pnpm|yarn|bun)\s+(run\s+)?(dev|start|serve|watch|preview)\b
+        | (^|[\s&;|])(npx\s+)?(vite|nodemon|live-server|http-server|webpack-dev-server|serve)\s*($|[\s&;|])
+        | \bvite\s+(dev|serve|preview)\b
+        | \b(next|nuxt|astro|remix|gatsby|expo)\s+(dev|start|develop)\b
+        | \bng\s+serve\b | \btauri\s+dev\b | \bcargo\s+watch\b | \bwebpack\s+serve\b
+        | \bpython[0-9.]*\s+-m\s+http\.server\b | \bflask\s+run\b | \buvicorn\b | \bgunicorn\b
+        | \bmanage\.py\s+runserver\b | \brails\s+s(erver)?\b | \bphp\s+-S\b | \bartisan\s+serve\b
+        | \bhugo\s+server\b | \bjekyll\s+serve\b | \bjupyter\s+(notebook|lab)\b | \bdotnet\s+watch\b
+        | \bdocker(-|\s+)compose\s+up\b
+        | \s--watch\b",
+    )
+    .unwrap()
+});
+
+/// A dev server / watcher / `compose up` without `-d`.
+pub fn looks_long_running(command: &str) -> bool {
+    let c = command.to_lowercase();
+    if c.contains("compose") && (c.contains(" -d") || c.contains("--detach")) {
+        return false;
+    }
+    LONG_RUNNING.is_match(&c) && !c.contains("vite build")
+}
+
+/// Files a fresh repository may already hold; scaffolders still refuse
+/// such a folder, but nothing in it conflicts with a new project.
+const SCAFFOLD_IGNORABLE: &[&str] = &[
+    ".git", ".gitignore", ".gitattributes", ".github", ".vscode", ".idea", ".singularity", ".claude",
+    "readme.md", "readme", "readme.txt", "license", "license.md", "license.txt", ".ds_store", "thumbs.db",
+];
+
+/// `npm create vite@latest . -- --template react-ts` → the target folder
+/// token ("."), with its byte offset in the command. Only a lone project
+/// generator command (no `&&` chains) is recognized.
+fn scaffold_target(command: &str) -> Option<(String, usize)> {
+    let c = command.trim();
+    if c.contains("&&") || c.contains(';') || c.contains('|') {
+        return None;
+    }
+    let tokens: Vec<(usize, &str)> = c
+        .split_whitespace()
+        .scan(0usize, |pos, t| {
+            let at = c[*pos..].find(t).map(|i| *pos + i).unwrap_or(*pos);
+            *pos = at + t.len();
+            Some((at, t))
+        })
+        .collect();
+    let word = |i: usize| tokens.get(i).map(|t| t.1.to_lowercase()).unwrap_or_default();
+    // Index of the generator package token.
+    let pkg = match word(0).as_str() {
+        "npm" | "pnpm" | "yarn" | "bun" if matches!(word(1).as_str(), "create" | "init") && tokens.len() > 2 => 2,
+        "npx" | "bunx" => (1..tokens.len()).find(|&i| !tokens[i].1.starts_with('-'))?,
+        "pnpm" if word(1) == "dlx" => (2..tokens.len()).find(|&i| !tokens[i].1.starts_with('-'))?,
+        _ => return None,
+    };
+    let name = word(pkg);
+    let bare = name.trim_start_matches('@');
+    let is_generator = name.starts_with("create-") || bare.contains("/create-") || (pkg == 2 && matches!(word(1).as_str(), "create" | "init"));
+    if !is_generator {
+        return None;
+    }
+    // First positional argument after the package: the target folder.
+    let mut i = pkg + 1;
+    while i < tokens.len() {
+        let t = tokens[i].1;
+        if t == "--" {
+            return None; // flags only — the generator asks for a name
+        }
+        if !t.starts_with('-') {
+            return Some((t.trim_matches(['"', '\'']).to_string(), tokens[i].0));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Moves everything from `from` into `to`, keeping files that already
+/// exist there. Returns the names kept.
+fn merge_into(from: &Path, to: &Path) -> std::io::Result<Vec<String>> {
+    let mut kept = Vec::new();
+    for e in std::fs::read_dir(from)?.flatten() {
+        let dest = to.join(e.file_name());
+        if dest.exists() {
+            kept.push(e.file_name().to_string_lossy().to_string());
+            continue;
+        }
+        if std::fs::rename(e.path(), &dest).is_err() {
+            copy_dir_or_file(&e.path(), &dest)?;
+        }
+    }
+    let _ = std::fs::remove_dir_all(from);
+    Ok(kept)
+}
+
+fn copy_dir_or_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for e in std::fs::read_dir(from)?.flatten() {
+            copy_dir_or_file(&e.path(), &to.join(e.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(from, to).map(|_| ())
+    }
+}
+
+/// Project generators (create-vite, create-next-app…) cancel with exit
+/// code 0 in a non-empty folder — models kept retrying and giving up.
+/// A folder holding only README / .git / .gitignore is scaffolded through
+/// a temporary sibling and merged in; a folder with real files is refused
+/// up front with the exact alternatives.
+fn scaffold_guard(root: &Path, workdir: &Path, command: &str, shell: Shell, timeout_secs: Option<u64>) -> Option<ToolResult> {
+    let (target, at) = scaffold_target(command)?;
+    let dir = if target == "." || target == "./" {
+        workdir.to_path_buf()
+    } else if Path::new(&target).is_absolute() {
+        PathBuf::from(&target)
+    } else {
+        workdir.join(&target)
+    };
+    let entries: Vec<String> = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .map(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            if e.path().is_dir() { format!("{n}/") } else { n }
+        })
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    let real: Vec<&String> = entries
+        .iter()
+        .filter(|n| !SCAFFOLD_IGNORABLE.contains(&n.trim_end_matches('/').to_lowercase().as_str()))
+        .collect();
+    let tmp_name = format!(".scaffold-{}", std::process::id());
+    let rewritten = format!("{}{}{}", &command[..at], tmp_name, &command[at + target.len()..]);
+    if real.is_empty() {
+        let parent = dir.parent().unwrap_or(workdir);
+        let tmp = parent.join(&tmp_name);
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Run the generator in the parent so the temporary folder lands next to the target.
+        let rel_cmd = format!("{}{}{}", &command[..at], tmp_name, &command[at + target.len()..]);
+        let res = run_command(root, &rel_cmd, Some(&parent.display().to_string()), timeout_secs, Some(shell.name()), false);
+        if !res.ok || !tmp.is_dir() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Some(res);
+        }
+        return Some(match merge_into(&tmp, &dir) {
+            Ok(kept) => {
+                let note = if kept.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Kept your existing {} (the template's version was not copied).", kept.join(", "))
+                };
+                ToolResult::ok(format!(
+                    "{}\n\nScaffolded into {} (the folder already had {}, so the generator ran in a temporary folder and the files were moved in).{note}",
+                    res.output,
+                    dir.display(),
+                    entries.join(", ")
+                ))
+            }
+            Err(e) => ToolResult::err(format!("scaffolded into {} but could not move the files into {}: {e}", tmp.display(), dir.display())),
+        });
+    }
+    let shown: Vec<&str> = real.iter().take(12).map(|s| s.as_str()).collect();
+    let suggestion = rewritten.replace(&tmp_name, "app");
+    Some(ToolResult::err(format!(
+        "NOT RUN: {} is not empty ({}{}). Project generators cancel in a non-empty folder.\n\
+         Do one of these:\n\
+         - scaffold into a new subfolder: {suggestion}\n\
+         - if these files are leftovers of YOUR earlier attempt in this task, delete them with file_op, then run the command again\n\
+         - only if the user agreed to lose them: add --overwrite (create-vite) to empty the folder",
+        dir.display(),
+        shown.join(", "),
+        if real.len() > shown.len() { ", …" } else { "" }
+    )))
+}
+
 /// How long a background command is watched before the tool returns.
 const BACKGROUND_WATCH: Duration = Duration::from_secs(5);
 
@@ -1006,6 +1470,8 @@ pub fn run_command(
 ) -> ToolResult {
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(COMMAND_TIMEOUT_SECS).clamp(1, 600));
     let shell = shell.and_then(Shell::parse).unwrap_or_else(default_shell);
+    let auto_bg = !background && looks_long_running(command);
+    let background = background || auto_bg;
 
     // Relative cwd joins the workspace; unset means the workspace itself.
     let workdir = match cwd.map(str::trim) {
@@ -1019,6 +1485,11 @@ pub fn run_command(
         return ToolResult::err(format!("working directory does not exist.\n{}", not_found(root, cwd.unwrap_or(""))));
     }
     let where_ = format!("[{} in {}]", shell.name(), workdir.display());
+    if !background {
+        if let Some(res) = scaffold_guard(root, &workdir, command, shell, timeout_secs) {
+            return res;
+        }
+    }
 
     let mut proc = shell_process(shell, command);
     proc.current_dir(&workdir);
@@ -1048,6 +1519,7 @@ pub fn run_command(
         Ok(c) => c,
         Err(e) => return ToolResult::err(format!("cannot start {}: {e}", shell.name())),
     };
+    let job = ProcJob::attach(&child, background);
 
     if background {
         let started = std::time::Instant::now();
@@ -1060,6 +1532,16 @@ pub fn run_command(
         };
         let log = std::fs::read(&log_path).map(|b| strip_ansi(&decode_console(&b))).unwrap_or_default();
         let log = clip_middle(log, 6_000);
+        let orphans = status.is_some() && job.as_ref().is_some_and(|j| j.active() > 0);
+        if orphans {
+            let id = crate::bg::register(child, job, command, &workdir.display().to_string(), shell.name(), log_path);
+            return ToolResult::ok(format!(
+                "the shell exited, but what it started keeps running — background task #{id} {where_}\n\
+                 later output: background {{action:\"output\", id:{id}}} · stop: background {{action:\"stop\", id:{id}}}\n\
+                 --- output so far ---\n{}",
+                if log.trim().is_empty() { "(nothing yet)".into() } else { log }
+            ));
+        }
         return match status {
             Some(st) => {
                 let code = st.code().unwrap_or(-1);
@@ -1068,10 +1550,12 @@ pub fn run_command(
             }
             None => {
                 let pid = child.id();
-                let stop = if cfg!(windows) { format!("taskkill /T /F /PID {pid}") } else { format!("kill {pid}") };
+                let id = crate::bg::register(child, job, command, &workdir.display().to_string(), shell.name(), log_path);
                 ToolResult::ok(format!(
-                    "running in the background, pid {pid} {where_}\nfull log: {} (read_file it for later output)\nstop it with: {stop}\n--- output so far ---\n{}",
-                    log_path.display(),
+                    "{}running in the background as task #{id} (pid {pid}) {where_}\n\
+                     later output: background {{action:\"output\", id:{id}}} · stop: background {{action:\"stop\", id:{id}}}\n\
+                     --- output so far ---\n{}",
+                    if auto_bg { "(a server/watcher never exits, so it was started in the background) " } else { "" },
                     if log.trim().is_empty() { "(nothing yet)".into() } else { log }
                 ))
             }
@@ -1092,6 +1576,9 @@ pub fn run_command(
             Ok(Some(st)) => break st,
             Ok(None) => {
                 if started.elapsed() > timeout {
+                    if let Some(j) = &job {
+                        j.kill();
+                    }
                     kill_tree(&mut child);
                     let partial = String::from_utf8_lossy(&out_thread.join().unwrap_or_default()).into_owned();
                     return ToolResult::err(format!(
@@ -1124,7 +1611,16 @@ pub fn run_command(
 
     let code = status.code().unwrap_or(-1);
     let mut body = format!("exit code {code} {where_}\n{text}");
+    // Exit code 0 that is really a failure: an interactive prompt hit the
+    // closed stdin and the tool gave up ("Operation cancelled" from
+    // create-vite in a non-empty folder). Reported as success, the agent
+    // carried on as if the project had been scaffolded.
     if status.success() {
+        if let Some(hint) = cancelled_prompt(&text) {
+            body.push_str("\n\n");
+            body.push_str(&hint);
+            return ToolResult::err(body);
+        }
         ToolResult::ok(body)
     } else {
         if let Some(hint) = failure_hint(shell, command, code, &text) {
@@ -1146,7 +1642,98 @@ fn drain(pipe: Option<impl std::io::Read>) -> Vec<u8> {
 
 /// Kills a command and everything it started (a shell's children survive a
 /// plain kill on Windows).
-fn kill_tree(child: &mut std::process::Child) {
+/// Every process a command starts, grouped so they can be killed together.
+/// On Windows a Job Object: `taskkill /T` walks parent links, and those
+/// break in chains like bash → npm → cmd → node — the dev server survived
+/// "Stop" and kept serving. Processes started inside the job stay in it,
+/// and closing the handle (app exit) kills them too.
+pub struct ProcJob {
+    #[cfg(windows)]
+    handle: isize,
+}
+
+// The handle is only used through thread-safe kernel calls.
+unsafe impl Send for ProcJob {}
+unsafe impl Sync for ProcJob {}
+
+impl ProcJob {
+    /// Puts a just-spawned process (and so all its future children) in a new
+    /// job. `kill_on_close`: dropping the job kills what is left (background
+    /// tasks — so nothing outlives the app); off for plain commands, whose
+    /// deliberate leftovers (`code .`, a browser it opened) must survive.
+    pub fn attach(child: &std::process::Child, kill_on_close: bool) -> Option<ProcJob> {
+        #[cfg(windows)]
+        unsafe {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::JobObjects::*;
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            if kill_on_close {
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+            }
+            if AssignProcessToJobObject(job, child.as_raw_handle() as _) == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(ProcJob { handle: job as isize })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (child, kill_on_close);
+            None
+        }
+    }
+
+    /// Processes still alive in the job (the shell may be gone while the
+    /// server it started runs on). Unknown → 0.
+    pub fn active(&self) -> u32 {
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::System::JobObjects::*;
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+            let ok = QueryInformationJobObject(
+                self.handle as _,
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            );
+            if ok != 0 {
+                return info.ActiveProcesses;
+            }
+        }
+        0
+    }
+
+    /// Kills every process in the job.
+    pub fn kill(&self) {
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle as _, 1);
+        }
+    }
+}
+
+impl Drop for ProcJob {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle as _);
+        }
+    }
+}
+
+pub fn kill_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1377,6 +1964,11 @@ pub fn git(root: &Path, subcommand: &str, args: &[String], cwd: Option<&str>) ->
 /// Strategy: strict UTF-8 first (cross-platform tools, modern builds); if that
 /// fails, fall back to the system ANSI codepage via encoding_rs (which maps
 /// cp866/cp1251 correctly for the Russian locale).
+/// Process output as clean text: console code page decoded, ANSI stripped.
+pub fn console_text(bytes: &[u8]) -> String {
+    strip_ansi(&decode_console(bytes))
+}
+
 pub fn decode_console(bytes: &[u8]) -> String {
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_string();
@@ -1393,8 +1985,15 @@ pub fn decode_console(bytes: &[u8]) -> String {
 /* ---------- Dispatch ---------- */
 
 /// Executes a tool by name. Unknown names are reported, not panicked on.
+/// Serializes file-mutating tools: several tool calls (and helper agents)
+/// run in parallel, and two read-modify-write patches of one file must not
+/// interleave. Reads, searches and commands stay fully parallel.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult {
     let s = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    let _write = matches!(name, "write_file" | "edit_file" | "apply_patch" | "file_op")
+        .then(|| WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
 
     match name {
         "read_file" => read_file(
@@ -1403,7 +2002,17 @@ pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult
             args.get("start_line").and_then(|v| v.as_u64()).map(|v| v as usize),
             args.get("end_line").and_then(|v| v.as_u64()).map(|v| v as usize),
         ),
-        "write_file" => write_file(root, s("path"), s("content")),
+        // The model rewrites EXISTING files only; new files go through
+        // apply_patch create:true with its wrong-path guard.
+        "write_file" => match resolve(root, s("path")) {
+            Ok(full) if full.is_file() => write_file(root, s("path"), s("content")),
+            Ok(_) => ToolResult::err(format!(
+                "{}\nwrite_file only rewrites an existing file. For a NEW file use apply_patch with create:true.",
+                not_found(root, s("path"))
+            )),
+            Err(e) => ToolResult::err(e),
+        },
+        "background" => crate::bg::tool(args),
         "edit_file" => edit_file(root, s("path"), s("old_text"), s("new_text")),
         "apply_patch" => apply_patch(
             root,
@@ -1547,6 +2156,210 @@ mod tests {
             let pid = bg.output.split("pid ").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
             let _ = run_command(&dir, &format!("taskkill /T /F /PID {pid}"), None, None, Some("cmd"), false);
         }
+    }
+
+    #[test]
+    fn edits_that_break_syntax_are_reported() {
+        let dir = std::env::temp_dir().join(format!("sg-syntax-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("App.tsx"), "export function App() {
+  return (
+    <div>
+      <h1>Hi</h1>
+    </div>
+  );
+}
+").unwrap();
+        // Drops the closing </div>: written, but reported as an error with the line.
+        let diff = "<<<<<<< SEARCH
+      <h1>Hi</h1>
+    </div>
+=======
+      <h1>Hello</h1>
+>>>>>>> REPLACE";
+        let res = apply_patch(&dir, "App.tsx", diff, false);
+        assert!(!res.ok && res.output.contains("SYNTAX ERRORS"), "{}", res.output);
+        // A clean edit stays a plain success.
+        let fix = "<<<<<<< SEARCH
+      <h1>Hello</h1>
+=======
+      <h1>Hello</h1>
+    </div>
+>>>>>>> REPLACE";
+        let res = apply_patch(&dir, "App.tsx", fix, false);
+        assert!(res.ok, "{}", res.output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelled_prompts_are_failures() {
+        let out = "> npx\n> create-vite . --template react-ts\n\n—  Operation cancelled\n";
+        let hint = cancelled_prompt(out).expect("detected");
+        assert!(hint.contains("--overwrite"));
+        assert!(cancelled_prompt("added 12 packages").is_none());
+    }
+
+    #[test]
+    fn patch_parser_is_lenient() {
+        // Wrong marker lengths, lowercase, fenced code, missing final marker.
+        let odd = "<<<<<< search
+```ts
+old line
+```
+========
+new line
+";
+        assert_eq!(parse_patch(odd), vec![("old line".to_string(), "new line".to_string())]);
+        // A unified diff instead of SEARCH/REPLACE.
+        let uni = "--- a/x.ts
++++ b/x.ts
+@@ -1,3 +1,3 @@
+ keep
+-old
++new
+ tail
+";
+        assert_eq!(parse_patch(uni), vec![("keep
+old
+tail".to_string(), "keep
+new
+tail".to_string())]);
+    }
+
+    #[test]
+    fn near_miss_patches_apply_or_show_the_real_lines() {
+        let dir = std::env::temp_dir().join(format!("sg-fuzzy-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let body = "export function Hero() {
+  const title = \"Welcome to the site\";
+  return <h1 className=\"hero\">{title}</h1>;
+}
+";
+        std::fs::write(dir.join("Hero.tsx"), body).unwrap();
+        // One character off ("Welcom"): applied to the real lines.
+        let near = "<<<<<<< SEARCH
+  const title = \"Welcom to the site\";
+  return <h1 className=\"hero\">{title}</h1>;
+=======
+  const title = \"Hi\";
+  return <h1 className=\"hero\">{title}</h1>;
+>>>>>>> REPLACE";
+        let res = apply_patch(&dir, "Hero.tsx", near, false);
+        assert!(res.ok && res.output.contains("closest lines"), "{}", res.output);
+        let now = std::fs::read_to_string(dir.join("Hero.tsx")).unwrap();
+        assert!(now.contains("\"Hi\"") && now.starts_with("export function Hero()") && now.ends_with("}
+"), "{now}");
+        // Too different to apply: the error quotes the real lines.
+        let far = "<<<<<<< SEARCH
+export function Hero(props) {
+  const heading = props.t;
+=======
+x
+>>>>>>> REPLACE";
+        let res = apply_patch(&dir, "Hero.tsx", far, false);
+        assert!(!res.ok && res.output.contains("closest part") && res.output.contains("    1  export function Hero()"), "{}", res.output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scaffold_targets_are_found() {
+        assert_eq!(scaffold_target("npm create vite@latest . -- --template react-ts").map(|t| t.0), Some(".".into()));
+        assert_eq!(scaffold_target("npx -y create-next-app@latest web --ts").map(|t| t.0), Some("web".into()));
+        assert_eq!(scaffold_target("pnpm create vite my-app --template vue").map(|t| t.0), Some("my-app".into()));
+        assert_eq!(scaffold_target("npm create vite@latest -- --template react").map(|t| t.0), None);
+        assert_eq!(scaffold_target("npm install vite"), None);
+        assert_eq!(scaffold_target("npx vite build"), None);
+        let (t, at) = scaffold_target("npm create vite@latest . -- --template react-ts").unwrap();
+        assert_eq!(&"npm create vite@latest . -- --template react-ts"[at..at + t.len()], ".");
+    }
+
+    #[test]
+    fn scaffold_refuses_a_folder_with_real_files() {
+        let dir = std::env::temp_dir().join(format!("sg-scaffold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("public")).unwrap();
+        std::fs::write(dir.join("index.html"), "x").unwrap();
+        let res = scaffold_guard(&dir, &dir, "npm create vite@latest . -- --template react-ts", default_shell(), None).unwrap();
+        assert!(!res.ok && res.output.contains("NOT RUN") && res.output.contains("index.html"), "{}", res.output);
+        assert!(res.output.contains("npm create vite@latest app -- --template react-ts"), "{}", res.output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "downloads create-vite"]
+    fn scaffold_merges_into_a_fresh_repo() {
+        let dir = std::env::temp_dir().join(format!("sg-scaffold-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("README.md"), "mine").unwrap();
+        std::fs::write(dir.join(".gitignore"), "mine").unwrap();
+        let res = run_command(&dir, "npm create vite@latest . -- --template react-ts", None, Some(180), None, false);
+        assert!(res.ok, "{}", res.output);
+        assert!(dir.join("package.json").is_file() && dir.join("src").is_dir(), "{}", res.output);
+        assert_eq!(std::fs::read_to_string(dir.join("README.md")).unwrap(), "mine");
+        assert!(!std::fs::read_dir(&dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with(".scaffold-")));
+        println!("{}", res.output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn stopping_a_background_task_kills_orphaned_servers() {
+        // cmd starts node detached and exits at once: node is an orphan that
+        // taskkill /T on the (dead) shell never reached.
+        let dir = std::env::temp_dir();
+        let port = 47000 + (std::process::id() % 1000) as u16;
+        let script = dir.join(format!("sg-orphan-{port}.js"));
+        std::fs::write(&script, format!("require('http').createServer((q,r)=>r.end('ok')).listen({port})")).unwrap();
+        let cmd = format!("start /b node {}", script.display());
+        let res = run_command(&dir, &cmd, None, None, Some("cmd"), true);
+        let up = |p: u16| std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], p).into(), Duration::from_millis(300)).is_ok();
+        let mut ready = false;
+        for _ in 0..50 {
+            if up(port) {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let log = crate::bg::list().into_iter().find(|t| t.command == cmd).map(|t| crate::bg::output(t.id, 2000).map(|o| o.1).unwrap_or_default());
+        assert!(ready, "server did not start: {}
+{log:?}", res.output);
+        let id = crate::bg::list().into_iter().find(|t| t.command == cmd).map(|t| t.id);
+        if let Some(id) = id {
+            crate::bg::stop(id).unwrap();
+        } else {
+            // cmd exited within the watch window: the job was dropped with it,
+            // which must have killed the server as well.
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!up(port), "the server survived the stop");
+    }
+
+    #[test]
+    fn dev_servers_go_to_the_background() {
+        for c in ["npm run dev", "pnpm dev", "yarn start", "cd web && npm run dev -- --port 3000", "npx vite", "vite", "python -m http.server 8000", "docker compose up", "tsc --watch", "npm run tauri dev"] {
+            assert!(looks_long_running(c), "{c}");
+        }
+        for c in ["npm run build", "npm install", "npx vite build", "docker compose up -d", "cargo build", "npm test", "npm create vite@latest app", "git status", "npm i -D serve-static"] {
+            assert!(!looks_long_running(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn background_tasks_are_listed_read_and_stopped() {
+        let dir = std::env::temp_dir();
+        let cmd = if cfg!(windows) { "ping -n 30 127.0.0.1" } else { "sleep 30" };
+        let started = run_command(&dir, cmd, None, None, None, true);
+        assert!(started.ok && started.output.contains("task #"), "{}", started.output);
+        let id: u64 = started.output.split("task #").nth(1).unwrap().split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap();
+        let list = crate::bg::tool(&serde_json::json!({"action": "list"}));
+        assert!(list.output.contains(&format!("#{id} [running")), "{}", list.output);
+        let out = crate::bg::tool(&serde_json::json!({"action": "output", "id": id}));
+        assert!(out.ok, "{}", out.output);
+        let stop = crate::bg::tool(&serde_json::json!({"action": "stop", "id": id}));
+        assert!(stop.ok && stop.output.contains("stopped"), "{}", stop.output);
+        assert!(crate::bg::list().iter().any(|t| t.id == id as u32 && !t.running));
     }
 
     #[test]

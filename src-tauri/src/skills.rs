@@ -30,7 +30,8 @@ pub struct Skill {
     pub description: String,
     /// Folder that holds SKILL.md.
     pub dir: String,
-    /// "user" (app data, editable) or "project" (inside the workspace).
+    /// "builtin" (ships with the app), "user" (app data, editable) or
+    /// "project" (inside the workspace).
     pub source: String,
     pub enabled: bool,
 }
@@ -86,6 +87,48 @@ fn load_state(app: &AppHandle) -> State {
 fn save_state(app: &AppHandle, st: &State) -> Result<(), String> {
     let text = serde_json::to_string_pretty(st).map_err(|e| e.to_string())?;
     std::fs::write(state_path(app)?, text).map_err(|e| format!("cannot save skill state: {e}"))
+}
+
+/* ---------- Built-in skills ---------- */
+
+/// Skills shipped with the app (general coding workflows). They are
+/// written to <app data>/builtin-skills on first use so they load like any
+/// other skill folder; a user or project skill of the same name replaces
+/// one, and each can be switched off in Settings → Skills.
+const BUILTIN: &[(&str, &str)] = &[
+    ("code-review", include_str!("skills_builtin/code-review.md")),
+    ("commit", include_str!("skills_builtin/commit.md")),
+    ("debug", include_str!("skills_builtin/debug.md")),
+    ("frontend-design", include_str!("skills_builtin/frontend-design.md")),
+    ("init", include_str!("skills_builtin/init.md")),
+    ("mcp-builder", include_str!("skills_builtin/mcp-builder.md")),
+    ("new-project", include_str!("skills_builtin/new-project.md")),
+    ("office-files", include_str!("skills_builtin/office-files.md")),
+    ("performance", include_str!("skills_builtin/performance.md")),
+    ("readme", include_str!("skills_builtin/readme.md")),
+    ("security-review", include_str!("skills_builtin/security-review.md")),
+    ("simplify", include_str!("skills_builtin/simplify.md")),
+    ("skill-creator", include_str!("skills_builtin/skill-creator.md")),
+    ("upgrade-deps", include_str!("skills_builtin/upgrade-deps.md")),
+    ("webapp-testing", include_str!("skills_builtin/webapp-testing.md")),
+    ("write-tests", include_str!("skills_builtin/write-tests.md")),
+];
+
+fn builtin_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("no data directory: {e}"))?
+        .join("builtin-skills");
+    for (name, text) in BUILTIN {
+        let md = dir.join(name).join("SKILL.md");
+        // Rewritten when the app ships a new version of the text.
+        if std::fs::read_to_string(&md).ok().as_deref() != Some(*text) {
+            std::fs::create_dir_all(md.parent().unwrap()).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            std::fs::write(&md, text).map_err(|e| format!("cannot write built-in skill {name}: {e}"))?;
+        }
+    }
+    Ok(dir)
 }
 
 /* ---------- SKILL.md parsing ---------- */
@@ -219,10 +262,14 @@ fn scan(root: &Path, source: &str) -> Vec<Skill> {
 }
 
 /// Every skill visible for this workspace. A project skill shadows a user
-/// skill of the same name.
+/// skill of the same name, and both shadow a built-in one.
 pub fn list(app: &AppHandle, workspace: &str) -> Result<Vec<Skill>, String> {
     let st = load_state(app);
-    let mut out = scan(&user_root(app)?, "user");
+    let mut out = builtin_root(app).map(|r| scan(&r, "builtin")).unwrap_or_default();
+    for s in scan(&user_root(app)?, "user") {
+        out.retain(|x| x.name != s.name);
+        out.push(s);
+    }
     for root in project_roots(workspace) {
         for s in scan(&root, "project") {
             out.retain(|x| x.name != s.name);
@@ -501,6 +548,17 @@ pub fn skills_folder(app: AppHandle) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_skills_parse() {
+        for (name, text) in super::BUILTIN {
+            let (n, d, body) = parse_skill_md(text);
+            assert_eq!(n.as_deref(), Some(*name));
+            assert!(d.is_some_and(|d| d.len() > 20 && !d.contains('\\')), "{name}");
+            assert!(body.len() > 200, "{name}");
+            validate_name(name).unwrap();
+        }
+    }
 
     #[test]
     fn parses_front_matter_and_body() {

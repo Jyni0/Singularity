@@ -38,6 +38,7 @@ import {
 import * as db from "../core/db.r";
 import { Switch } from "../ui/Switch.c";
 import { ScrollBox } from "../ui/ScrollArea.c";
+import { ModelCaps } from "./ModelCaps.c";
 
 const SBUTTON =
   "flex h-[30px] shrink-0 items-center justify-center gap-1.5 rounded-md bg-[var(--bg-elevated)] px-3 text-[12px] text-[var(--text-main)] transition-colors hover:bg-[var(--bg-input)] disabled:cursor-not-allowed disabled:opacity-50";
@@ -856,10 +857,8 @@ function ProviderCard({
                         key={m.id}
                         className="group flex items-center gap-2 rounded-md px-2 py-1 text-[12px] text-[var(--text-main)] hover:bg-[var(--hover-bg)]"
                       >
-                        <span className="truncate font-mono">{m.name}</span>
-                        <span className="ml-auto shrink-0 text-[11px] text-[var(--text-dim)]">
-                          {m.meta}
-                        </span>
+                        <span className="min-w-0 flex-1 truncate font-mono" title={m.model_id}>{m.name}</span>
+                        <ModelCaps kind={provider.kind} baseUrl={provider.base_url} modelId={m.model_id} />
                         <button
                           className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-[var(--text-dim)] opacity-0 transition-opacity hover:text-[var(--diff-del)] group-hover:opacity-100"
                           onClick={() => removeModelRow(m.id)}

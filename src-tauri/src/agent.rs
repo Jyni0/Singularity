@@ -15,6 +15,7 @@ mod expand;
 mod model;
 mod prompt;
 mod runtime;
+pub use runtime::ContextPart;
 
 use crate::tools;
 use serde::{Deserialize, Serialize};
@@ -204,6 +205,9 @@ pub struct AgentRequest {
     /// stay in the database; the ssh_exec tool resolves them server-side).
     #[serde(default)]
     pub ssh_units: Vec<SshUnitRef>,
+    /// Built-in tools switched off in Settings → Plugins (by tool name).
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
     /// Stable provider id — the key the limiter budgets requests under.
     #[serde(default)]
     pub provider_id: String,
@@ -256,6 +260,20 @@ pub struct SshUnitRef {
 
 fn default_auth() -> String {
     "key".to_string()
+}
+
+/// What the next request of a conversation would carry, part by part
+/// (system prompt, tool schemas, history…) with estimated tokens — the
+/// context gauge under the prompt box.
+pub async fn agent_context(
+    app: AppHandle,
+    req: AgentRequest,
+    turns: Vec<crate::chat::ChatTurn>,
+) -> Result<Vec<runtime::ContextPart>, String> {
+    let root = Path::new(&req.workspace).to_path_buf();
+    let system = if req.system.trim().is_empty() { prompt::default_system() } else { req.system.clone() };
+    let turns = context::trim_history(turns);
+    runtime::context_info(&app, &req, &system, &root, turns).await
 }
 
 /// Runs the agent loop, streaming text and reporting each tool call.
@@ -417,6 +435,12 @@ pub struct RunUsage {
     pub cached_tokens: u64,
     /// Wall time of the run so far, ms — the frontend derives tokens/sec.
     pub elapsed_ms: u64,
+    /// Input tokens of the run's FIRST model call as the provider counted
+    /// them (cache reads included) — the real size of that request.
+    pub first_input: u64,
+    /// Our estimate of that same request (context_info's method): the
+    /// context gauge scales its estimates by first_input / first_est.
+    pub first_est: u64,
 }
 
 /// Token accounting as reported by OpenAI-compatible providers (plain chat).

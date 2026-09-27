@@ -14,7 +14,8 @@ export type Segment =
   | { kind: "usage"; usage: db.RunUsage };
 
 export interface Msg {
-  role: "user" | "agent";
+  /** "compact" = a /compact summary: the model sees it instead of everything before it. */
+  role: "user" | "agent" | "compact";
   /** Full text of the turn — what gets stored and sent back as history. */
   text: string;
   /** Interleaved prose and tool calls, newest last. Live turns only. */
@@ -35,8 +36,9 @@ export interface Msg {
  */
 export type PanelTabSpec =
   | { id: string; type: "file"; label: string; path: string }
-  | { id: string; type: "command"; label: string; stepIndex: number }
-  | { id: string; type: "tool"; label: string; stepIndex: number }
+  /** stepIndex restarts at 1 in every run — msgIndex says WHICH turn. */
+  | { id: string; type: "command"; label: string; msgIndex: number; stepIndex: number }
+  | { id: string; type: "tool"; label: string; msgIndex: number; stepIndex: number }
   | { id: string; type: "image"; label: string; image: db.StoredImage };
 
 /** The panel while it is open: its tab list plus the active tab id. */

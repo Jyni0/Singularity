@@ -215,7 +215,7 @@ struct Stdio {
 
 /// Finds `npx` → `npx.cmd` etc. on Windows, where a bare name without the
 /// extension cannot be spawned directly.
-fn resolve_program(cmd: &str) -> std::path::PathBuf {
+pub(crate) fn resolve_program(cmd: &str) -> std::path::PathBuf {
     let p = std::path::Path::new(cmd);
     if !cfg!(windows) || p.extension().is_some() || cmd.contains(['/', '\\']) {
         return p.to_path_buf();

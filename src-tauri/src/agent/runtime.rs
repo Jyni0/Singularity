@@ -43,6 +43,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
 
+/// Upper bound of "Max agents at once".
+pub(super) const MAX_AGENTS: usize = 52;
+/// Name of the built-in general-purpose helper.
+const WORKER: &str = "worker";
+
 /* ---------- Shared run state ---------- */
 
 /// State shared by the main agent, its hook, its tools and every subagent of
@@ -53,8 +58,12 @@ struct RunCtx {
     run_id: String,
     req: Arc<AgentRequest>,
     root: PathBuf,
-    /// Rig internal call id → UI step index.
-    steps: Arc<Mutex<HashMap<String, usize>>>,
+    /// Rig internal call id → the UI cards opened under it. Normally one per
+    /// id, but gateways / local servers can hand several parallel calls the
+    /// same id — each (id, call fingerprint) then keeps a card of its own
+    /// instead of all of them overwriting one ("list_dir shown as a failed
+    /// Edit").
+    steps: Arc<Mutex<HashMap<String, Vec<CallCard>>>>,
     /// Next step index (shared by main agent and subagents).
     counter: Arc<AtomicUsize>,
     /// One Allow/Deny banner at a time, even with parallel tool calls.
@@ -81,14 +90,70 @@ impl RunCtx {
         self.cwd.lock().unwrap().clone()
     }
 
-    fn step_for(&self, internal_id: &str) -> usize {
+    fn next_index(&self) -> usize {
+        self.counter.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Card of a call whose arguments are still streaming.
+    fn live_step(&self, internal_id: &str) -> usize {
         let mut map = self.steps.lock().unwrap();
-        *map.entry(internal_id.to_string())
-            .or_insert_with(|| self.counter.fetch_add(1, Ordering::SeqCst) + 1)
+        let cards = map.entry(internal_id.to_string()).or_default();
+        if let Some(c) = cards.iter().find(|c| c.call.is_none()) {
+            return c.index;
+        }
+        let index = self.next_index();
+        cards.push(CallCard { call: None, index, done: false });
+        index
+    }
+
+    /// Card of a call about to run: the live card of its id if one is still
+    /// unclaimed, else a new one.
+    fn call_step(&self, internal_id: &str, fingerprint: &str) -> usize {
+        let mut map = self.steps.lock().unwrap();
+        let cards = map.entry(internal_id.to_string()).or_default();
+        if let Some(c) = cards.iter_mut().find(|c| c.call.is_none()) {
+            c.call = Some(fingerprint.to_string());
+            return c.index;
+        }
+        let index = self.next_index();
+        cards.push(CallCard { call: Some(fingerprint.to_string()), index, done: false });
+        index
+    }
+
+    /// How many calls ran under this Rig call id (> 1 = the gateway reused it).
+    fn cards_under(&self, internal_id: &str) -> usize {
+        self.steps.lock().unwrap().get(internal_id).map_or(0, |c| c.iter().filter(|c| c.call.is_some()).count())
+    }
+
+    /// Card a finished call's result belongs to: the one opened for exactly
+    /// this call (id + fingerprint).
+    fn result_step(&self, internal_id: &str, fingerprint: &str) -> usize {
+        let mut map = self.steps.lock().unwrap();
+        let cards = map.entry(internal_id.to_string()).or_default();
+        let pick = cards
+            .iter()
+            .position(|c| !c.done && c.call.as_deref() == Some(fingerprint))
+            .or_else(|| cards.iter().position(|c| !c.done && c.call.is_none()));
+        match pick {
+            Some(i) => {
+                cards[i].done = true;
+                cards[i].index
+            }
+            None => {
+                let index = self.next_index();
+                cards.push(CallCard { call: Some(fingerprint.to_string()), index, done: true });
+                index
+            }
+        }
     }
 
     fn add_usage(&self, input: u64, output: u64, cached: u64) {
         let mut u = self.usage.lock().unwrap();
+        if u.first_input == 0 {
+            // Anthropic reports cache reads apart from input; the OpenAI
+            // family includes them in it.
+            u.first_input = if self.req.kind == "anthropic-messages" { input + cached } else { input };
+        }
         u.prompt_tokens += input;
         u.completion_tokens += output;
         u.cached_tokens += cached;
@@ -101,6 +166,133 @@ impl RunCtx {
 /// sees the raw string, the tool the parsed value; both map to this.
 fn canonical(args: &Value) -> String {
     serde_json::to_string(args).unwrap_or_default()
+}
+
+/// One UI card under a Rig call id.
+struct CallCard {
+    /// Fingerprint (`tool(args)`) of the call that claimed it; None while
+    /// its arguments are still streaming.
+    call: Option<String>,
+    index: usize,
+    done: bool,
+}
+
+/// Arguments as an object: some providers send them as a JSON *string*
+/// (`"{\"command\":…}"`), which the hook and the tool then saw differently.
+fn norm_args(args: &Value) -> Value {
+    match args {
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| args.clone()),
+        _ => args.clone(),
+    }
+}
+
+/// Parses the raw argument text the hooks get.
+fn parse_args(raw: &str) -> Value {
+    norm_args(&serde_json::from_str(raw).unwrap_or(json!({})))
+}
+
+/// `tool(args)` — identifies one call independent of Rig's call id.
+fn fingerprint(tool: &str, args: &Value) -> String {
+    format!("{tool}({})", canonical(&norm_args(args)))
+}
+
+/// Tool results by call fingerprint, filled by the tools themselves. The
+/// hook reads the card's result from here: Rig's per-call ToolContext is
+/// keyed by its call id, and calls that share an id also shared (and
+/// overwrote) each other's result.
+static RESULTS: Mutex<Option<HashMap<String, Vec<tools::ToolResult>>>> = Mutex::new(None);
+
+fn stash_result(fingerprint: String, res: &tools::ToolResult) {
+    if let Ok(mut g) = RESULTS.lock() {
+        g.get_or_insert_with(HashMap::new).entry(fingerprint).or_default().push(res.clone());
+    }
+}
+
+fn take_result(fingerprint: &str) -> Option<tools::ToolResult> {
+    let mut g = RESULTS.lock().ok()?;
+    let map = g.as_mut()?;
+    let key = if map.contains_key(fingerprint) {
+        fingerprint.to_string()
+    } else {
+        // Same tool, arguments serialized a little differently: accept it
+        // only when exactly one result of that tool is waiting.
+        let tool = fingerprint.split('(').next().unwrap_or("");
+        let prefix = format!("{tool}(");
+        let mut same = map.keys().filter(|k| k.starts_with(&prefix));
+        match (same.next(), same.next()) {
+            (Some(k), None) => k.clone(),
+            _ => return None,
+        }
+    };
+    let fingerprint = key.as_str();
+    let list = map.get_mut(fingerprint)?;
+    let res = (!list.is_empty()).then(|| list.remove(0));
+    if list.is_empty() {
+        map.remove(fingerprint);
+    }
+    res
+}
+
+/* ---------- Context editing ---------- */
+
+/// Text size of one tool result.
+fn result_chars(r: &rig_agent::core::completion::message::ToolResult) -> usize {
+    use rig_agent::core::completion::message::ToolResultContent;
+    r.content
+        .iter()
+        .map(|c| match c {
+            ToolResultContent::Text(t) => t.text.len(),
+            ToolResultContent::Json { value } => value.to_string().len(),
+            ToolResultContent::Image(_) => 1_000,
+        })
+        .sum()
+}
+
+/// Returns the history to send with the oldest bulky tool results stubbed
+/// (None = send it unchanged). `cleared` is the hook's watermark: it only
+/// ever moves forward, and only when the history outgrew the trigger.
+fn clear_old_results(history: &[Message], cleared: &mut usize) -> Option<Vec<Message>> {
+    use rig_agent::core::completion::message::ToolResultContent;
+    // Clearable results in order: (message, content index, size). A helper's
+    // report and loaded skill instructions are the agent's working notes —
+    // they are never cleared.
+    let mut results = Vec::new();
+    for (mi, m) in history.iter().enumerate() {
+        if let Message::User { content } = m {
+            for (ci, c) in content.iter().enumerate() {
+                if let UserContent::ToolResult(r) = c {
+                    let size = result_chars(r);
+                    if size >= CLEAR_MIN_CHARS && r.name != "delegate" && r.name != "skill" {
+                        results.push((mi, ci, size));
+                    }
+                }
+            }
+        }
+    }
+    let clearable = results.len().saturating_sub(CLEAR_KEEP_RECENT);
+    *cleared = (*cleared).min(clearable);
+    let total: usize = history.iter().map(|m| serde_json::to_string(m).map(|j| j.len()).unwrap_or(0)).sum();
+    let freed = |n: usize| results[..n].iter().map(|r| r.2.saturating_sub(CLEARED_STUB.len())).sum::<usize>();
+    if total.saturating_sub(freed(*cleared)) > CLEAR_TRIGGER_CHARS {
+        while *cleared < clearable && total.saturating_sub(freed(*cleared)) > CLEAR_TARGET_CHARS {
+            *cleared += 1;
+        }
+    }
+    if *cleared == 0 {
+        return None;
+    }
+    let mut out = history.to_vec();
+    for &(mi, ci, _) in &results[..*cleared] {
+        if let Message::User { content } = &mut out[mi] {
+            if let Some(UserContent::ToolResult(r)) = content.get_mut(ci) {
+                r.content = vec![ToolResultContent::text(CLEARED_STUB)];
+            }
+        }
+    }
+    Some(out)
 }
 
 /* ---------- Hook: live cards, approvals, guard, limiter ---------- */
@@ -121,6 +313,19 @@ const REPEAT_SKIP_AT: usize = 3;
 const REPEAT_STOP_AT: usize = 5;
 /// Marker of the repeat guard's stop — deliberate, never retried.
 const GUARD_STOP: &str = "the model repeated the same action";
+/// Context editing — the client-side twin of Anthropic's `clear_tool_uses`:
+/// once the conversation inside a run grows past CLEAR_TRIGGER_CHARS, the
+/// OLDEST bulky tool results are replaced by a stub until it is back under
+/// CLEAR_TARGET_CHARS. The most recent results always stay. Clearing jumps
+/// in big steps and then holds still, so the prompt prefix stays byte-stable
+/// between jumps and the provider's prompt cache keeps hitting.
+const CLEAR_TRIGGER_CHARS: usize = 160_000;
+const CLEAR_TARGET_CHARS: usize = 80_000;
+/// Newest tool results that are never cleared.
+const CLEAR_KEEP_RECENT: usize = 6;
+/// Results shorter than this are not worth clearing.
+const CLEAR_MIN_CHARS: usize = 600;
+const CLEARED_STUB: &str = "[older tool result cleared to save context — call the tool again if you still need it]";
 /// Pause between retries of a failed model request.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -136,6 +341,8 @@ struct UiHook {
     permit: Mutex<Option<crate::limiter::Permit>>,
     live: Mutex<HashMap<String, LiveCall>>,
     last_call: Mutex<(String, usize)>,
+    /// How many of the clearable tool results (oldest first) are stubbed.
+    cleared: Mutex<usize>,
 }
 
 impl UiHook {
@@ -147,6 +354,7 @@ impl UiHook {
             permit: Mutex::new(None),
             live: Mutex::new(HashMap::new()),
             last_call: Mutex::new((String::new(), 0)),
+            cleared: Mutex::new(0),
         }
     }
 
@@ -168,7 +376,11 @@ impl AgentHook for UiHook {
         let key = if req.provider_id.is_empty() { req.base_url.clone() } else { req.provider_id.clone() };
         let permit = crate::limiter::acquire(&key, req.rate_limit_rpm, req.concurrency, &self.ctx.run_id).await;
         *self.permit.lock().unwrap() = Some(permit);
-        CompletionCallAction::Continue
+        let mut cleared = self.cleared.lock().unwrap();
+        match clear_old_results(event.history, &mut cleared) {
+            Some(history) => CompletionCallAction::patch(rig_agent::agent::RequestPatch::new().history(history)),
+            None => CompletionCallAction::Continue,
+        }
     }
 
     /// The provider slot is free once the stream ends — tools and approval
@@ -199,7 +411,7 @@ impl AgentHook for UiHook {
             }
         };
         if let Some((name, input)) = update {
-            let idx = self.ctx.step_for(event.internal_call_id);
+            let idx = self.ctx.live_step(event.internal_call_id);
             self.step(idx, &name, input, false, &tools::ToolResult::ok(""));
         }
         ObservationAction::Continue
@@ -210,9 +422,12 @@ impl AgentHook for UiHook {
         if is_cancelled(&self.ctx.run_id) {
             return ToolCallAction::Stop(crate::cancel::STOPPED.to_string());
         }
-        let args: Value = serde_json::from_str(event.args).unwrap_or(json!({}));
+        let args = parse_args(event.args);
         let summary = summarize(event.tool_name, &args);
-        let idx = self.ctx.step_for(event.internal_call_id);
+        let idx = self.ctx.call_step(event.internal_call_id, &fingerprint(event.tool_name, &args));
+        // The streamed-args buffer of this id is done; a later call that
+        // reuses the id must not inherit its name and arguments.
+        self.live.lock().unwrap().remove(event.internal_call_id);
         if event.tool_name == "delegate" {
             self.ctx.delegate_cards.lock().unwrap().insert(canonical(&args), idx);
         }
@@ -279,13 +494,16 @@ impl AgentHook for UiHook {
     /// After execution: close the card with the real result (the tool left
     /// its full `ToolResult`, diff included, in the context).
     async fn on_tool_result(&self, _ctx: &HookContext, event: ToolResultEvent<'_>) -> ToolResultAction {
-        let args: Value = serde_json::from_str(event.args).unwrap_or(json!({}));
-        let idx = self.ctx.step_for(event.internal_call_id);
-        let res = event
-            .tool_context
-            .result::<tools::ToolResult>()
-            .cloned()
-            .unwrap_or_else(|| tools::ToolResult::err(event.presentation.render()));
+        let args = parse_args(event.args);
+        let fp = fingerprint(event.tool_name, &args);
+        let shared_id = self.ctx.cards_under(event.internal_call_id) > 1;
+        let idx = self.ctx.result_step(event.internal_call_id, &fp);
+        // Rig's ToolContext is per call id — with a reused id it may hold
+        // ANOTHER call's result ("npm install" showing a list_dir listing),
+        // so it is only trusted when the id is unique.
+        let res = take_result(&fp)
+            .or_else(|| (!shared_id).then(|| event.tool_context.result::<tools::ToolResult>().cloned()).flatten())
+            .unwrap_or_else(|| tools::ToolResult::ok(event.presentation.render()));
         self.step(idx, event.tool_name, summarize(event.tool_name, &args), true, &res);
         ToolResultAction::Keep
     }
@@ -504,6 +722,8 @@ fn fs_tools(ctx: &RunCtx) -> Vec<DynamicTool> {
                     let c = c.clone();
                     let tool_name = tool_name.clone();
                     Box::pin(async move {
+                        let args = norm_args(&args);
+                        let fp = fingerprint(&tool_name, &args);
                         let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let res = match tool_name.as_str() {
                             "ssh_exec" => run_ssh_tool(&c.app, &c.req, &args).await,
@@ -526,6 +746,7 @@ fn fs_tools(ctx: &RunCtx) -> Vec<DynamicTool> {
                             }
                         };
                         let text = model_text(&res);
+                        stash_result(fp, &res);
                         tctx.insert_result(res);
                         Ok(ToolOutput::text(text))
                     })
@@ -583,6 +804,8 @@ fn delegate_tool(ctx: &RunCtx) -> DynamicTool {
         tool_fn(move |tctx, args| {
             let c = c.clone();
             Box::pin(async move {
+                let args = norm_args(&args);
+                let fp = fingerprint("delegate", &args);
                 let name = args.get("agent").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let card = c.delegate_cards.lock().unwrap().get(&canonical(&args)).copied();
@@ -598,6 +821,7 @@ fn delegate_tool(ctx: &RunCtx) -> DynamicTool {
                     }
                 };
                 let text = model_text(&res);
+                stash_result(fp, &res);
                 tctx.insert_result(res);
                 Ok(ToolOutput::text(text))
             })
@@ -622,6 +846,8 @@ fn skill_tool(skills: Arc<Vec<crate::skills::Skill>>) -> DynamicTool {
         tool_fn(move |tctx, args| {
             let skills = skills.clone();
             Box::pin(async move {
+                let args = norm_args(&args);
+                let fp = fingerprint("skill", &args);
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let file = args.get("file").and_then(|v| v.as_str());
                 let res = match skills.iter().find(|s| s.name == name) {
@@ -632,6 +858,7 @@ fn skill_tool(skills: Arc<Vec<crate::skills::Skill>>) -> DynamicTool {
                     },
                 };
                 let text = model_text(&res);
+                stash_result(fp, &res);
                 tctx.insert_result(res);
                 Ok(ToolOutput::text(text))
             })
@@ -702,12 +929,15 @@ fn mcp_tool(b: &McpBinding) -> DynamicTool {
         format!("{} (MCP server {})", b.tool.description.trim(), b.server.name)
     };
     let (server, tool_name) = (b.server.clone(), b.tool.name.clone());
+    let model_name = b.name.clone();
     DynamicTool::new(
         b.name.clone(),
         desc,
         b.tool.input_schema.clone(),
         tool_fn(move |tctx, args| {
             let (server, tool_name) = (server.clone(), tool_name.clone());
+            let args = norm_args(&args);
+            let fp = fingerprint(&model_name, &args);
             Box::pin(async move {
                 let res = match crate::mcp::call(&server, &tool_name, args).await {
                     Ok((text, false)) => tools::ToolResult::ok(text),
@@ -715,6 +945,7 @@ fn mcp_tool(b: &McpBinding) -> DynamicTool {
                     Err(e) => tools::ToolResult::err(e),
                 };
                 let text = model_text(&res);
+                stash_result(fp, &res);
                 tctx.insert_result(res);
                 Ok(ToolOutput::text(text))
             })
@@ -959,7 +1190,10 @@ async fn run_subagent(ctx: &RunCtx, def: &SubagentDef, task: &str, card: Option<
     let summary = format!("{}: {}", def.name, one_line(task, 80));
     let mut partial = String::new();
     let mut shown = 0usize;
-    let result = run_with_retry(ctx, &preamble, || fs_tools(ctx), Some(&def.name), Message::user(task), Vec::new(), 1, false, |t| {
+    // Helpers batch their own independent tool calls too (several reads /
+    // searches in one turn run side by side).
+    let parallel = ctx.req.max_agents.clamp(1, 8);
+    let result = run_with_retry(ctx, &preamble, || fs_tools(ctx), Some(&def.name), Message::user(task), Vec::new(), parallel, false, |t| {
         partial.push_str(t);
         // Live progress in the delegate card, throttled.
         if let Some(idx) = card {
@@ -977,6 +1211,123 @@ async fn run_subagent(ctx: &RunCtx, def: &SubagentDef, task: &str, card: Option<
 }
 
 /// The main run.
+/// The request with the built-in helper added: with room for more than one
+/// agent, a general-purpose helper is always there — parallel work no
+/// longer depends on the user defining subagents.
+fn with_worker(req: &AgentRequest) -> AgentRequest {
+    let mut req = req.clone();
+    if req.max_agents.clamp(1, MAX_AGENTS) > 1 && !req.subagents.iter().any(|s| s.name == WORKER) {
+        req.subagents.push(SubagentDef {
+            name: WORKER.into(),
+            description: "General-purpose helper for ANY self-contained part of the task: exploring or reading an area of the codebase, researching on the web, implementing a change confined to its own files, running and fixing tests. Give it everything it needs in `task`.".into(),
+            prompt: "Work fast: batch independent tool calls into one turn.".into(),
+        });
+    }
+    req
+}
+
+fn has_helpers(req: &AgentRequest) -> bool {
+    req.subagents.iter().any(|s| !s.name.trim().is_empty())
+}
+
+/// The system prompt as labelled sections; joined, they are the preamble.
+/// The context view measures the very same sections.
+fn preamble_sections(
+    system: &str,
+    req: &AgentRequest,
+    root: &Path,
+    skills: &[crate::skills::Skill],
+    mcp_count: usize,
+) -> Vec<(&'static str, String)> {
+    let parallel = req.max_agents.clamp(1, MAX_AGENTS);
+    let mut out: Vec<(&'static str, String)> = vec![("System prompt", system.to_string())];
+    // Facts the model otherwise guesses wrong: which OS and shell, where it
+    // is, and today's date (for web searches and "latest version" questions).
+    // Only name the tools this run has (Settings → Plugins can switch some off).
+    let on = |name: &str| !req.disabled_tools.iter().any(|d| d == name);
+    let mut prefer = String::from(
+        "Prefer the dedicated tools over shell one-liners: find_files / list_dir / grep to look around, \
+         read_file to read, apply_patch to edit, file_op to create folders or move / copy / delete",
+    );
+    if on("git") {
+        prefer.push_str(", git for git");
+    }
+    if on("web_search") || on("web_fetch") {
+        prefer.push_str(", web_search + web_fetch for anything on the internet (never curl/wget for reading pages)");
+    }
+    prefer.push_str(". ");
+    if on("run_command") {
+        prefer.push_str(
+            "Use run_command for builds, tests, package managers and project scripts; \
+             start dev servers and watchers with background:true. \
+             When a command fails, read its error and hint and change the approach — never rerun it unchanged.",
+        );
+    }
+    let mut env = format!(
+        "\n\nEnvironment:\n- {}\n- Workspace: {} (the starting working directory; change_dir moves it)\n- Today: {}\n{prefer}",
+        tools::shell_summary(),
+        root.display(),
+        today()
+    );
+    if has_helpers(req) {
+        env.push_str(&format!(
+            "\n\nHelper agents are available through the `delegate` tool — up to {parallel} work AT THE SAME TIME. \
+             Use them aggressively for throughput: split any task with independent parts (several files, modules, \
+             questions, searches) into self-contained sub-tasks and delegate them ALL IN ONE TURN so they run in parallel, \
+             then integrate their reports. Keep tightly coupled or tiny work for yourself."
+        ));
+    }
+    // Parallel tool calls: independent reads / searches / commands in one
+    // turn run side by side instead of one round-trip each.
+    env.push_str(
+        "\n\nSpeed: whenever several tool calls do not depend on each other (reading several files, several searches, \
+         listing folders), issue them together in ONE turn — they run in parallel. Avoid one-call-per-turn crawling.",
+    );
+    if mcp_count > 0 {
+        env.push_str(
+            "\n\nTools named mcp__<server>__<tool> come from MCP servers the user connected; use them when they fit the task better than the built-in tools.",
+        );
+    }
+    out.push(("Environment & working rules", env));
+    if !skills.is_empty() {
+        let mut list = String::from(
+            "\n\nSkills — instruction packs for particular kinds of tasks. When the request matches a skill's description, call the `skill` tool with its name BEFORE you start, then follow it:",
+        );
+        for s in skills {
+            list.push_str(&format!("\n- {}: {}", s.name, one_line(&s.description, 300)));
+        }
+        out.push(("Skills list", list));
+    }
+    out
+}
+
+/// /commands, invoked skills and @mentions → what the model reads. File IO
+/// and git run off the async workers.
+async fn expand_turns(
+    skills: Arc<Vec<crate::skills::Skill>>,
+    root: &Path,
+    turns: Vec<crate::chat::ChatTurn>,
+) -> Result<Vec<crate::chat::ChatTurn>, String> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let is_user = |r: &str| r != "agent" && r != "assistant";
+        let last_user = turns.iter().rposition(|t| is_user(&t.role));
+        turns
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut t)| {
+                if is_user(&t.role) {
+                    t.text = super::expand::user_turn(&t.text, &skills, &root, Some(i) == last_user);
+                }
+                t
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| format!("prompt expansion failed: {e}"))
+}
+
+/// The main run.
 pub(super) async fn run(
     app: &AppHandle,
     run_id: &str,
@@ -985,7 +1336,8 @@ pub(super) async fn run(
     root: &Path,
     turns: Vec<crate::chat::ChatTurn>,
 ) -> Result<String, String> {
-    let parallel = req.max_agents.max(1);
+    let parallel = req.max_agents.clamp(1, MAX_AGENTS);
+    let req = &with_worker(req);
     let counter = Arc::new(AtomicUsize::new(0));
     let skills = Arc::new(crate::skills::for_run(app, &req.workspace));
     let mcp = load_mcp(app, run_id, &counter).await;
@@ -1008,6 +1360,8 @@ pub(super) async fn run(
             completion_tokens: 0,
             cached_tokens: 0,
             elapsed_ms: 0,
+            first_input: 0,
+            first_est: 0,
         })),
         started: std::time::Instant::now(),
         mcp_tools: Arc::new(
@@ -1019,40 +1373,11 @@ pub(super) async fn run(
         no_temperature: Arc::default(),
     };
 
-    let has_helpers = req.subagents.iter().any(|s| !s.name.trim().is_empty());
-    let mut preamble = system.to_string();
-    // Facts the model otherwise guesses wrong: which OS and shell, where it
-    // is, and today's date (for web searches and "latest version" questions).
-    preamble.push_str(&format!(
-        "\n\nEnvironment:\n- {}\n- Workspace: {} (the starting working directory; change_dir moves it)\n- Today: {}\n\
-         Prefer the dedicated tools over shell one-liners: find_files / list_dir / grep to look around, \
-         read_file to read, apply_patch to edit, file_op to create folders or move / copy / delete, git for git, \
-         web_search + web_fetch for anything on the internet (never curl/wget for reading pages). \
-         Use run_command for builds, tests, package managers and project scripts; \
-         start dev servers and watchers with background:true. \
-         When a command fails, read its error and hint and change the approach — never rerun it unchanged.",
-        tools::shell_summary(),
-        root.display(),
-        today()
-    ));
-    if has_helpers {
-        preamble.push_str(&format!(
-            "\n\nHelper agents are available through the `delegate` tool (up to {parallel} at once). They are optional: do simple or tightly coupled work yourself, and delegate only self-contained parts that match a helper's specialty."
-        ));
-    }
-    if !skills.is_empty() {
-        preamble.push_str(
-            "\n\nSkills — instruction packs for particular kinds of tasks. When the request matches a skill's description, call the `skill` tool with its name BEFORE you start, then follow it:",
-        );
-        for s in skills.iter() {
-            preamble.push_str(&format!("\n- {}: {}", s.name, one_line(&s.description, 300)));
-        }
-    }
-    if !mcp.is_empty() {
-        preamble.push_str(
-            "\n\nTools named mcp__<server>__<tool> come from MCP servers the user connected; use them when they fit the task better than the built-in tools.",
-        );
-    }
+    let has_helpers = has_helpers(req);
+    let preamble: String = preamble_sections(system, req, root, &skills, mcp.len())
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect();
     let tools = || {
         let mut t = fs_tools(&ctx);
         if has_helpers {
@@ -1064,35 +1389,166 @@ pub(super) async fn run(
         t.extend(mcp.iter().map(mcp_tool));
         t
     };
-    // /commands, invoked skills and @mentions → what the model reads. File
-    // IO and git run off the async workers.
-    let turns = {
-        let (skills, root) = (skills.clone(), root.to_path_buf());
-        tokio::task::spawn_blocking(move || {
-            let is_user = |r: &str| r != "agent" && r != "assistant";
-            let last_user = turns.iter().rposition(|t| is_user(&t.role));
-            turns
-                .into_iter()
-                .enumerate()
-                .map(|(i, mut t)| {
-                    if is_user(&t.role) {
-                        t.text = super::expand::user_turn(&t.text, &skills, &root, Some(i) == last_user);
-                    }
-                    t
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|e| format!("prompt expansion failed: {e}"))?
-    };
+    let turns = expand_turns(skills.clone(), root, turns).await?;
+    ctx.usage.lock().unwrap().first_est =
+        measure(req, system, root, &skills, &mcp, &turns).iter().map(|p| p.tokens as u64).sum();
     let (history, prompt) = to_messages(req, &turns);
-    let text = run_with_retry(&ctx, &preamble, tools, None, prompt, history, parallel, true, |_| {}).await?;
+    // The main agent may run many tool calls of one turn at once (parallel
+    // reads, several delegations); at least a handful even with one helper.
+    let tool_parallel = parallel.max(8);
+    let text = run_with_retry(&ctx, &preamble, tools, None, prompt, history, tool_parallel, true, |_| {}).await?;
     if text.trim().is_empty() && ctx.counter.load(Ordering::SeqCst) == 0 {
         return Err(
             "the model returned an empty answer — its output may have been reasoning-only; retry, or try another model/effort level".into(),
         );
     }
     Ok(text)
+}
+
+/* ---------- Context view ---------- */
+
+/// Rough token count: ~4 characters per token for ASCII (English, code),
+/// ~2.5 for other scripts (Cyrillic, CJK tokenize denser). Real tokenizers
+/// differ by model; this is for the "how full is it" gauge.
+pub(crate) fn est_tokens(text: &str) -> usize {
+    let (mut ascii, mut other) = (0usize, 0usize);
+    for c in text.chars() {
+        if c.is_ascii() {
+            ascii += 1;
+        } else {
+            other += 1;
+        }
+    }
+    (ascii as f64 / 4.0 + other as f64 / 2.5).ceil() as usize
+}
+
+/// One line inside a context category (a tool, a skill, a kind of message).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContextItem {
+    pub name: String,
+    pub tokens: usize,
+}
+
+/// One category of what the next request carries.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContextPart {
+    pub label: String,
+    /// "messages" | "tools" | "mcp" | "skills" | "system" — picks the color.
+    pub group: &'static str,
+    pub tokens: usize,
+    pub items: Vec<ContextItem>,
+}
+
+fn item(name: impl Into<String>, text: &str) -> ContextItem {
+    ContextItem { name: name.into(), tokens: est_tokens(text) }
+}
+
+fn category(label: &str, group: &'static str, mut items: Vec<ContextItem>) -> ContextPart {
+    items.sort_by(|a, b| b.tokens.cmp(&a.tokens));
+    ContextPart { label: label.into(), group, tokens: items.iter().map(|i| i.tokens).sum(), items }
+}
+
+/// What the NEXT agent request of this conversation would send, measured
+/// category by category — the same preamble, tool list and trimmed,
+/// expanded history the run builds. (Inside a run the history then grows
+/// with tool calls and results; context editing trims those.)
+pub(super) async fn context_info(
+    app: &AppHandle,
+    req: &AgentRequest,
+    system: &str,
+    root: &Path,
+    turns: Vec<crate::chat::ChatTurn>,
+) -> Result<Vec<ContextPart>, String> {
+    let req = &with_worker(req);
+    let counter = AtomicUsize::new(0);
+    let skills = Arc::new(crate::skills::for_run(app, &req.workspace));
+    let mcp = load_mcp(app, "context-info", &counter).await;
+    let turns = expand_turns(skills.clone(), root, turns).await?;
+    Ok(measure(req, system, root, &skills, &mcp, &turns))
+}
+
+/// Estimated tokens per category of one request (see context_info). The
+/// run measures its first request the same way, which calibrates this.
+fn measure(
+    req: &AgentRequest,
+    system: &str,
+    root: &Path,
+    skills: &[crate::skills::Skill],
+    mcp: &[McpBinding],
+    turns: &[crate::chat::ChatTurn],
+) -> Vec<ContextPart> {
+    let mut parts = Vec::new();
+
+    // Messages: the conversation history + the latest prompt.
+    let is_user = |r: &str| r != "agent" && r != "assistant";
+    let last_user = turns.iter().rposition(|t| is_user(&t.role));
+    let (mut user, mut agent, mut n_user, mut n_agent) = (String::new(), String::new(), 0, 0);
+    for (i, t) in turns.iter().enumerate() {
+        if Some(i) == last_user {
+            continue;
+        }
+        if is_user(&t.role) {
+            user.push_str(&t.text);
+            n_user += 1;
+        } else {
+            agent.push_str(&t.text);
+            n_agent += 1;
+        }
+    }
+    let mut msgs = Vec::new();
+    if n_user > 0 {
+        msgs.push(item(format!("Your earlier messages ({n_user})"), &user));
+    }
+    if n_agent > 0 {
+        msgs.push(item(format!("Agent replies ({n_agent}, clipped)"), &agent));
+    }
+    if let Some(i) = last_user {
+        msgs.push(item("Latest message (with @files expanded)", &turns[i].text));
+    }
+    parts.push(category("Messages", "messages", msgs));
+
+    // System tools: each built-in schema as sent (name + description + params).
+    let mut tools_items: Vec<ContextItem> = tool_specs(req)
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|spec| item(spec["name"].as_str().unwrap_or("tool"), &spec.to_string()))
+        .collect();
+    if has_helpers(req) {
+        let roster: String = req.subagents.iter().map(|s| format!("- {}: {}\n", s.name, s.description)).collect();
+        tools_items.push(item("delegate", &format!("{roster}{}", " ".repeat(420))));
+    }
+    if !skills.is_empty() {
+        let names = skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(",");
+        tools_items.push(item("skill", &format!("{names}{}", " ".repeat(450))));
+    }
+    parts.push(category("System tools", "tools", tools_items));
+
+    if !mcp.is_empty() {
+        let items = mcp
+            .iter()
+            .map(|b| item(format!("{} · {}", b.server.name, b.tool.name), &format!("{}{}{}", b.name, b.tool.description, b.tool.input_schema)))
+            .collect();
+        parts.push(category("MCP tools", "mcp", items));
+    }
+
+    let sections = preamble_sections(system, req, root, skills, mcp.len());
+    if !skills.is_empty() {
+        // Only name + description ride along; a skill's body loads on use.
+        let items = skills
+            .iter()
+            .map(|sk| item(sk.name.clone(), &format!("\n- {}: {}", sk.name, one_line(&sk.description, 300))))
+            .collect();
+        parts.push(category("Skills", "skills", items));
+    }
+    let sys_items = sections
+        .iter()
+        .filter(|(label, _)| *label != "Skills list")
+        .map(|(label, text)| item(*label, text))
+        .collect();
+    parts.push(category("System prompt", "system", sys_items));
+    parts
 }
 
 /// Today's date (UTC) as YYYY-MM-DD.
@@ -1117,6 +1573,36 @@ fn today() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_tool_results_are_cleared_in_steps() {
+        let stub_count = |h: &[Message]| {
+            h.iter()
+                .filter(|m| serde_json::to_string(m).unwrap().contains("older tool result cleared"))
+                .count()
+        };
+        // 30 bulky results ≈ 300k chars: well past the trigger.
+        let mut history = vec![Message::user("task")];
+        for i in 0..30 {
+            history.push(Message::tool_result(format!("c{i}"), "read_file", "x".repeat(10_000)));
+        }
+        history.push(Message::tool_result("d", "delegate", "y".repeat(10_000)));
+        let mut cleared = 0;
+        let out = clear_old_results(&history, &mut cleared).expect("history over the trigger is edited");
+        assert!(cleared > 0 && cleared <= 30 - CLEAR_KEEP_RECENT);
+        assert_eq!(stub_count(&out), cleared);
+        // The newest results and the helper's report stay verbatim.
+        assert!(serde_json::to_string(&out[30]).unwrap().contains("xxxx"));
+        assert!(serde_json::to_string(out.last().unwrap()).unwrap().contains("yyyy"));
+        // Next turn with one more small result: the watermark holds (cache-stable).
+        history.push(Message::tool_result("e", "list_dir", "z"));
+        let before = cleared;
+        clear_old_results(&history, &mut cleared);
+        assert_eq!(cleared, before);
+        // Small histories are sent untouched.
+        let mut zero = 0;
+        assert!(clear_old_results(&history[..3], &mut zero).is_none());
+    }
 
     #[test]
     fn today_is_a_date() {
@@ -1149,6 +1635,14 @@ mod tests {
     fn live_summary_uses_full_json_when_complete() {
         assert_eq!(live_summary("list_dir", r#"{"path":"src"}"#), "src");
         assert!(live_summary("apply_patch", r#"{"path":"a.rs","diff":"<<<"#).starts_with("a.rs"));
+    }
+
+    #[test]
+    fn string_encoded_args_match() {
+        let obj = json!({"command": "npm install", "cwd": "web"});
+        let as_string = Value::String(obj.to_string());
+        assert_eq!(fingerprint("run_command", &obj), fingerprint("run_command", &as_string));
+        assert_eq!(parse_args(&serde_json::to_string(&obj.to_string()).unwrap()), obj);
     }
 
     #[test]

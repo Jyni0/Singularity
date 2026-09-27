@@ -65,16 +65,16 @@ export function AgentsSettings({
         <Sep />
         <SettingRow
           title="Max agents at once"
-          hint="How many helper agents may work in parallel (1–8). They share the provider's rate limits."
+          hint="How many agents may work in parallel (1–52). Above 1 a built-in “worker” helper is always available, and the agent splits work across helpers and runs independent tool calls side by side. They share the provider's rate limits — raise its Concurrency too."
         >
           <input
             type="number"
             min={1}
-            max={8}
+            max={52}
             className={`${SINPUT} w-[90px]`}
             value={maxAgents}
             onChange={(e) => {
-              const n = Math.min(8, Math.max(1, Number(e.target.value) || 1));
+              const n = Math.min(52, Math.max(1, Math.floor(Number(e.target.value)) || 1));
               onMaxAgents(n);
             }}
           />

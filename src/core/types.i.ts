@@ -323,7 +323,7 @@ export interface Gateway {
 
 export interface StoredMessage {
   conversation_id: string;
-  role: "user" | "agent";
+  role: "user" | "agent" | "compact";
   text: string;
   created_at: number;
   /** How long the model spent producing this turn (agent messages only). */

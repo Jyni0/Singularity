@@ -86,6 +86,7 @@ function readActivity(segments: Segment[] | undefined): { activity: Activity; de
         return { activity: "reading", detail: subject(input) };
       case "run_command":
       case "ssh_exec":
+      case "background":
         return { activity: "running", detail: "" };
       case "delegate":
         return { activity: "delegating", detail: input.replace(/^\[[^\]]+\] /, "").split(":")[0].trim() };

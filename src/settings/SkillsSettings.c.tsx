@@ -245,9 +245,9 @@ export function SkillsSettings({ workspace }: { workspace: string }) {
                   <Sparkles size={14} className={s.enabled ? "shrink-0 text-[var(--accent)]" : "shrink-0 text-[var(--text-dim)]"} />
                   <span className="shrink-0 font-mono text-[12.5px] font-medium text-[var(--text-main)]">/{s.name}</span>
                   <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text-dim)]">{s.description || "No description"}</span>
-                  {s.source === "project" && (
+                  {s.source !== "user" && (
                     <span className="shrink-0 rounded border border-[var(--border)] px-1.5 text-[10px] text-[var(--text-dim)]" title={s.dir}>
-                      project
+                      {s.source === "builtin" ? "built-in" : "project"}
                     </span>
                   )}
                   <span onClick={(e) => e.stopPropagation()}>
@@ -271,7 +271,13 @@ export function SkillsSettings({ workspace }: { workspace: string }) {
               {isOpen && preview && (
                 <div className="flex flex-col gap-2 px-1.5 pb-2 pt-1">
                   <div className="text-[11px] text-[var(--text-dim)]">
-                    Project skill — edit it in <span className="font-mono">{preview.dir}</span>
+                    {s.source === "builtin" ? (
+                      <>Built-in skill — read-only. A skill of yours with the same name replaces it.</>
+                    ) : (
+                      <>
+                        Project skill — edit it in <span className="font-mono">{preview.dir}</span>
+                      </>
+                    )}
                   </div>
                   <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 font-mono text-[11.5px] text-[var(--text-main)]">
                     {preview.body}

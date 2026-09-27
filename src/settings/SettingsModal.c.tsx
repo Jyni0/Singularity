@@ -17,6 +17,7 @@ import { LogsSettings } from "./LogsSettings.c";
 import { SkillsSettings } from "./SkillsSettings.c";
 import { GEN_ANIMATIONS, type GenAnimation } from "../ui/GenerationGlow.c";
 import { McpSettings } from "./McpSettings.c";
+import { PluginsSettings } from "./PluginsSettings.c";
 
 export type SettingsSection =
   | "general"
@@ -26,6 +27,7 @@ export type SettingsSection =
   | "models"
   | "agents"
   | "skills"
+  | "plugins"
   | "mcp"
   | "terminal"
   | "logs"
@@ -142,6 +144,7 @@ export function SettingsModal({
           { id: "general", label: "General" },
           { id: "models", label: "Models" },
           { id: "agents", label: "Agent" },
+          { id: "plugins", label: "Plugins" },
           { id: "skills", label: "Skills" },
           { id: "mcp", label: "MCP Servers" },
         ]
@@ -171,6 +174,7 @@ export function SettingsModal({
     general: ["General", "Appearance, theme and workspace defaults"],
     models: ["Models", "Connect providers and manage the models they expose"],
     agents: ["Agent", "Helper subagents and how many can work at once"],
+    plugins: ["Plugins", "What the agent can do — built-in tools and one-click add-ons"],
     skills: ["Skills", "Instruction packs the agent loads when a task matches — or you call with /name"],
     mcp: ["MCP Servers", "External tool servers (Model Context Protocol) the agent can use"],
     permissions: ["Global Permissions", "Tool and filesystem access rules"],
@@ -315,6 +319,8 @@ export function SettingsModal({
           {effectiveSection === "skills" && <SkillsSettings workspace={workspace} />}
 
           {effectiveSection === "mcp" && <McpSettings />}
+
+          {effectiveSection === "plugins" && <PluginsSettings />}
 
           {effectiveSection === "terminal" && <TerminalSettings />}
 

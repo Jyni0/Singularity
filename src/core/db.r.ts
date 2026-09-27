@@ -415,7 +415,7 @@ export async function truncateFromUserMessage(conversationId: string, nth: numbe
 
 export async function appendMessage(
   conversationId: string,
-  role: "user" | "agent",
+  role: "user" | "agent" | "compact",
   text: string,
   meta: MessageMeta = {}
 ): Promise<void> {
@@ -912,7 +912,7 @@ async function invokeDiscovery(provider: Provider, apiKey: string): Promise<Disc
 /* ---------- Inference ---------- */
 
 export interface ChatTurn {
-  role: "user" | "agent";
+  role: "user" | "agent" | "compact";
   text: string;
 }
 
@@ -1062,14 +1062,14 @@ export interface AgentRequest {
    * only — credentials stay in the database and are resolved server-side.
    */
   ssh_units?: { id: string; name: string; host: string }[];
+  /** Built-in tools switched off in Settings → Plugins. */
+  disabled_tools?: string[];
   /** Provider row id — the limiter budgets requests under this key. */
   provider_id?: string;
   /** Max requests/minute for the provider (0 = unlimited). */
   rate_limit_rpm?: number;
   /** Max parallel requests (0 = unlimited). */
   concurrency?: number;
-  /** Sampling temperature; omitted = the provider's default. */
-  temperature?: number | null;
   /** Helper agents the main agent may delegate to (Settings → Agent). */
   subagents?: Subagent[];
   /** How many helper agents may work at the same time. */
@@ -1115,7 +1115,7 @@ export async function loadMaxRetries(): Promise<number> {
 /** How many helper agents may run at once (default 2). */
 export async function loadMaxAgents(): Promise<number> {
   const n = Number(await getSetting("max_agents"));
-  return Number.isFinite(n) && n >= 1 ? Math.min(n, 8) : 2;
+  return Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), 52) : 2;
 }
 
 /**
@@ -1131,6 +1131,10 @@ export interface RunUsage {
   cached_tokens: number;
   /** Wall time of the run so far, ms. */
   elapsed_ms?: number;
+  /** Agent runs: the provider's input count of the run's first request… */
+  first_input?: number;
+  /** …and our estimate of the same request (calibrates the context gauge). */
+  first_est?: number;
 }
 
 export interface AgentStepEvent {
@@ -1865,6 +1869,102 @@ export async function sshConnected(): Promise<string[]> {
   return sshInvoke<string[]>("ssh_connected");
 }
 
+/* ---------- Context gauge + prices ---------- */
+
+/** One category of what the next agent request carries (estimated tokens). */
+export interface ContextPart {
+  label: string;
+  group: "messages" | "tools" | "mcp" | "skills" | "system";
+  tokens: number;
+  /** The category's lines: tools, skills, kinds of messages. */
+  items: { name: string; tokens: number }[];
+}
+
+/** What the next request of a conversation would send, part by part. */
+export async function agentContext(request: AgentRequest, turns: ChatTurn[]): Promise<ContextPart[]> {
+  if (!inTauri) return [];
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<ContextPart[]>("agent_context", { request, turns });
+}
+
+/** Context window and USD prices per million tokens (null = unknown). */
+export interface ModelInfo {
+  context: number | null;
+  inputPerMtok: number | null;
+  outputPerMtok: number | null;
+  cacheReadPerMtok: number | null;
+  /** "ollama" | "openrouter" | "" */
+  source: string;
+  matched: string;
+  local: boolean;
+  /** Longest answer, tokens. */
+  maxOutput: number | null;
+  /** Capabilities; null = unknown. */
+  vision: boolean | null;
+  tools: boolean | null;
+  reasoning: boolean | null;
+}
+
+const modelInfoCache = new Map<string, Promise<ModelInfo>>();
+
+/** Cached per provider+model for the session (the catalog is cached in Rust too). */
+export function modelInfo(kind: string, baseUrl: string, model: string): Promise<ModelInfo> {
+  const key = `${kind}|${baseUrl}|${model}`;
+  let p = modelInfoCache.get(key);
+  if (!p) {
+    p = inTauri
+      ? import("@tauri-apps/api/core").then(({ invoke }) => invoke<ModelInfo>("model_info", { kind, baseUrl, model }))
+      : Promise.resolve({ context: null, inputPerMtok: null, outputPerMtok: null, cacheReadPerMtok: null, source: "", matched: "", local: false, maxOutput: null, vision: null, tools: null, reasoning: null });
+    p.catch(() => modelInfoCache.delete(key));
+    modelInfoCache.set(key, p);
+  }
+  return p;
+}
+
+/* ---------- Background tasks (run_command background:true) ---------- */
+
+/** A long-running command the agent started (dev server, watcher, build). */
+export interface BgTask {
+  id: number;
+  pid: number;
+  command: string;
+  cwd: string;
+  shell: string;
+  logPath: string;
+  /** Unix seconds. */
+  started: number;
+  running: boolean;
+  exitCode: number | null;
+  /** Stopped by the user or the agent (not a crash). */
+  stopped: boolean;
+}
+
+async function bgInvoke<T>(cmd: string, args: Record<string, unknown> = {}): Promise<T> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(cmd, args);
+}
+
+/** Every background task, newest first. */
+export async function bgList(): Promise<BgTask[]> {
+  if (!inTauri) return [];
+  return bgInvoke<BgTask[]>("bg_list");
+}
+
+/** The tail of a task's output (ANSI stripped). */
+export async function bgOutput(id: number, maxChars = 40_000): Promise<string> {
+  return bgInvoke<string>("bg_output", { id, maxChars });
+}
+
+/** Stops a task and everything it started. */
+export async function bgStop(id: number): Promise<void> {
+  await bgInvoke("bg_stop", { id });
+}
+
+/** Forgets a finished task (and deletes its log). */
+export async function bgRemove(id: number): Promise<void> {
+  await bgInvoke("bg_remove", { id });
+}
+
 /* ---------- Interactive terminal (PTY) ---------- */
 
 /**
@@ -2174,7 +2274,7 @@ export interface Skill {
   name: string;
   description: string;
   dir: string;
-  source: "user" | "project";
+  source: "builtin" | "user" | "project";
   enabled: boolean;
 }
 
@@ -2252,6 +2352,11 @@ export async function saveMcpServer(server: McpServer): Promise<string> {
 
 export async function deleteMcpServer(id: string): Promise<void> {
   await tauriInvoke("mcp_delete", { id });
+}
+
+/** Installs an add-on's npm package into the app's folder (plugins.rs); returns how to start it. */
+export async function pluginInstall(id: string, pkg: string): Promise<{ command: string; args: string[] }> {
+  return tauriInvoke<{ command: string; args: string[] }>("plugin_install", { id, package: pkg });
 }
 
 /** Starts the server and lists its tools (Settings → MCP "Test"). */

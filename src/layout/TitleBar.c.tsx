@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "motion/react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { X, Minus, Square, Copy } from "lucide-react";
 import { inTauri } from "../utils/env.u";
+import { shortcutKey } from "../utils/keys.u";
 import { UpdateButton, requestUpdateCheck } from "./UpdateButton.c";
 
 type AppMode = "agent" | "ssh";
@@ -137,8 +138,8 @@ export function TitleBar({
       let combo = "";
       if (e.key === "F11") combo = "F11";
       else if (e.ctrlKey && !e.shiftKey && !inTerminal(e.target)) {
-        const k = e.key.length === 1 ? e.key.toUpperCase() : e.key;
-        combo = "Ctrl+" + k;
+        // Physical key, so Ctrl+N works on any keyboard layout (e.g. Russian).
+        combo = "Ctrl+" + shortcutKey(e);
       }
       if (!combo) return;
       for (const entries of Object.values(menusRef.current)) {

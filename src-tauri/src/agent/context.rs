@@ -15,7 +15,14 @@ pub(super) fn trim_history(turns: Vec<crate::chat::ChatTurn>) -> Vec<crate::chat
     while start < turns.len() && is_agent(&turns[start].role) {
         start += 1;
     }
-    turns
+    // A /compact summary heads the first turn; it stands for everything
+    // before it and must survive the cut — it moves onto the first kept turn.
+    let pinned = (start > 0)
+        .then(|| turns.first())
+        .flatten()
+        .filter(|t| t.text.starts_with(COMPACT_MARKER))
+        .map(|t| t.text.split(COMPACT_SEPARATOR).next().unwrap_or(&t.text).to_string());
+    let mut out: Vec<crate::chat::ChatTurn> = turns
         .into_iter()
         .skip(start)
         .map(|mut t| {
@@ -24,8 +31,21 @@ pub(super) fn trim_history(turns: Vec<crate::chat::ChatTurn>) -> Vec<crate::chat
             }
             t
         })
-        .collect()
+        .collect();
+    if let (Some(summary), Some(first)) = (pinned, out.first_mut()) {
+        first.text = format!("{summary}{COMPACT_SEPARATOR}{}", first.text);
+    }
+    out
 }
+
+/// Heads a compacted history (the frontend's COMPACT_MARKER).
+const COMPACT_MARKER: &str = "[Summary of the earlier conversation — older messages were compacted]";
+/// Separates the summary from the message it rides on.
+const COMPACT_SEPARATOR: &str = "
+
+---
+
+";
 
 /// Keeps only the LAST keep_chars characters (prefixed by an elision mark).
 pub(super) fn clip_head(s: &str, keep_chars: usize) -> String {
@@ -65,6 +85,22 @@ mod tests {
         assert_eq!(out[0].role, "user");
         assert_eq!(out.last().unwrap().text, "now");
         assert!(out.iter().all(|t| t.text.chars().count() <= HISTORY_AGENT_CHARS + 20));
+    }
+
+    #[test]
+    fn compact_summary_survives_the_cut() {
+        let turn = |role: &str, text: String| crate::chat::ChatTurn { role: role.into(), text };
+        let mut turns = vec![turn("user", format!("{COMPACT_MARKER}
+we built X{COMPACT_SEPARATOR}first"))];
+        turns.push(turn("agent", "a".into()));
+        for i in 0..20 {
+            turns.push(turn("user", format!("q{i}")));
+            turns.push(turn("agent", "x".into()));
+        }
+        turns.push(turn("user", "now".into()));
+        let out = trim_history(turns);
+        assert!(out[0].text.starts_with(COMPACT_MARKER) && out[0].text.contains("we built X"), "{}", out[0].text);
+        assert!(!out[0].text.contains("first"));
     }
 
     #[test]

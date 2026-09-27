@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { shortcutKey } from "../utils/keys.u";
 import { motion } from "motion/react";
 import {
   Folder,
@@ -463,7 +464,7 @@ export function FilesView({
   const onListKey = (ev: React.KeyboardEvent) => {
     if ((ev.target as HTMLElement).tagName === "INPUT") return;
     const mod = ev.ctrlKey || ev.metaKey;
-    if (mod && ev.key.toLowerCase() === "a") {
+    if (mod && shortcutKey(ev) === "A") {
       ev.preventDefault();
       setSelected(new Set(visible.map((v) => v.path)));
     } else if (ev.key === "Delete" && selectedEntries.length > 0) {
@@ -496,7 +497,7 @@ export function FilesView({
   useEffect(() => {
     if (file) return;
     const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "f") {
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && shortcutKey(e) === "F") {
         e.preventDefault();
         setQuery((q) => q ?? "");
         requestAnimationFrame(() => searchRef.current?.select());

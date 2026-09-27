@@ -10,7 +10,7 @@
 import { useState, type ReactNode } from "react";
 import { ScrollBox } from "../ui/ScrollArea.c";
 import { FileIcon, baseName, dirName } from "./FileIcon.c";
-import { Bot, Brain, Check, Copy, Eye, FileDiff, FilePlus2, FolderOpen, Loader2, Pencil, Search, Server, Terminal, Wrench, ChevronRight, Sparkles, Plug, FileSearch, CornerDownRight, FolderCog, GitBranch, Globe, Link2 } from "lucide-react";
+import { Bot, Brain, Check, Copy, Eye, FileDiff, FilePlus2, FolderOpen, Loader2, Pencil, Search, Server, Terminal, Wrench, ChevronRight, Sparkles, Plug, FileSearch, CornerDownRight, FolderCog, GitBranch, Globe, Link2, Activity } from "lucide-react";
 
 /* ---------- Inline formatting ---------- */
 
@@ -406,6 +406,7 @@ const TOOL_META: Record<string, { icon: typeof Terminal; label: string }> = {
   git: { icon: GitBranch, label: "Git" },
   web_search: { icon: Globe, label: "Web search" },
   web_fetch: { icon: Link2, label: "Fetch" },
+  background: { icon: Activity, label: "Task" },
 };
 
 /** `mcp__github__create_issue` → "github · create_issue". */

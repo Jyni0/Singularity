@@ -9,6 +9,10 @@ mod db;
 mod discovery;
 mod oauth;
 mod proxy;
+mod bg;
+mod syntax;
+mod pricing;
+mod plugins;
 mod runs;
 mod safety;
 mod skills;
@@ -156,6 +160,16 @@ async fn agent_run(
     out
 }
 
+/// The context gauge: what the next request of a conversation would carry.
+#[tauri::command]
+async fn agent_context(
+    app: tauri::AppHandle,
+    request: agent::AgentRequest,
+    turns: Vec<chat::ChatTurn>,
+) -> Result<Vec<agent::ContextPart>, String> {
+    agent::agent_context(app, request, turns).await
+}
+
 /// The user's answer to an `agent://confirm` request (allow/deny a command).
 #[tauri::command]
 fn agent_confirm(run_id: String, approve: bool) {
@@ -283,6 +297,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             agent_workspace,
+            agent_context,
+            pricing::model_info,
+            plugins::plugin_install,
             set_agent_workspace,
             current_agent_workspace,
             google_sign_in,
@@ -316,6 +333,10 @@ pub fn run() {
             tray::tray_resize,
             ssh_connect,
             ssh_connected,
+            bg::bg_list,
+            bg::bg_output,
+            bg::bg_stop,
+            bg::bg_remove,
             ssh::ssh_list_servers,
             ssh::ssh_save_server,
             ssh::ssh_reorder_units,
@@ -355,6 +376,8 @@ pub fn run() {
             // MCP servers are child processes — stop them with the app.
             if let tauri::RunEvent::Exit = event {
                 mcp::shutdown();
+                // Background tasks the agent started die with the app too.
+                bg::shutdown();
                 // Remove the tray icon explicitly: an icon the process never
                 // removed stays as a "ghost" in the tray until hovered.
                 if let Some(tray) = app_handle.remove_tray_by_id(tray::TRAY_ID) {

@@ -12,6 +12,7 @@
  *  - reload re-attach: a run that survived a WebView reload is replayed from
  *    the Rust buffer and followed to its end.
  */
+import { loadDisabledTools } from "../core/plugins.u";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import type { Dispatch, SetStateAction } from "react";
@@ -21,6 +22,57 @@ import { composePrompt } from "../utils/attachments.u";
 import type { Msg, Segment } from "../chat/message.i";
 import { storedToMsg } from "../chat/message.u";
 
+/** Opens a compacted history: the summary rides in front of the first
+ *  message after it (also recognised by the Rust history trimmer). */
+export const COMPACT_MARKER = "[Summary of the earlier conversation — older messages were compacted]";
+
+/**
+ * The history as the model receives it. After a /compact, the latest
+ * summary replaces everything before it: it is prefixed to the first user
+ * message that follows (roles keep alternating for every provider).
+ */
+export function modelTurns(history: Msg[]): db.ChatTurn[] {
+  const at = history.map((m) => m.role).lastIndexOf("compact");
+  const plain = (list: Msg[]) =>
+    list.filter((m) => m.role !== "compact").map((m) => ({ role: m.role, text: m.text }));
+  if (at < 0) return plain(history);
+  const summary = `${COMPACT_MARKER}\n${history[at].text.trim()}`;
+  const rest = plain(history.slice(at + 1));
+  const first = rest.findIndex((t) => t.role === "user");
+  if (first < 0) return [{ role: "user", text: summary }];
+  const out = rest.slice(first);
+  out[0] = { role: "user", text: `${summary}\n\n---\n\n${out[0].text}` };
+  return out;
+}
+
+/** Everything the context gauge shows for one conversation. */
+export interface ContextReport {
+  parts: db.ContextPart[];
+  info: db.ModelInfo;
+  modelName: string;
+  providerKind: string;
+  /** Token totals of every run of this conversation (usage segments). */
+  spent: { prompt: number; completion: number; cached: number; runs: number };
+  /** Real / estimated tokens of the last run's first request (the parts
+   *  are already scaled by it); null = nothing to calibrate against yet. */
+  calibration: number | null;
+}
+
+const COMPACT_SYSTEM =
+  "You compress a conversation between a user and a coding agent into a summary the agent will continue from. " +
+  "The summary REPLACES the conversation, so anything left out is forgotten.";
+
+const COMPACT_REQUEST =
+  "Summarize the conversation below so the work can continue seamlessly. Use these sections:\n" +
+  "1. Requests and intent — everything the user asked for, in their own terms, including corrections.\n" +
+  "2. Key technical context — stack, conventions, constraints, decisions made and why.\n" +
+  "3. Files and code — exact paths touched or important, what changed in each, key snippets only when essential.\n" +
+  "4. Errors and fixes — what went wrong and how it was solved.\n" +
+  "5. Pending — tasks not done yet.\n" +
+  "6. Current state and next step.\n" +
+  "Be complete but dense: keep exact names, paths, commands and numbers; drop chit-chat and dead ends. " +
+  "Write in the language the user writes in. Output only the summary.";
+
 /** Buffer key for the "new chat" view before a conversation exists. */
 export const DRAFT_ID = "__new__";
 
@@ -29,8 +81,6 @@ export interface ChatSelection {
   gatewayId: string;
   modelId: string;
   effort: Effort;
-  /** null = the provider's default temperature. */
-  temperature: number | null;
 }
 
 export type RunPhase = "thinking" | "streaming";
@@ -41,6 +91,8 @@ export interface QueuedPrompt {
   text: string;
   attachments: Attachment[];
   selection: ChatSelection;
+  /** Project of the conversation — the auto-run needs it to send. */
+  project: string;
 }
 
 export interface UseChatOptions {
@@ -270,6 +322,177 @@ export function useChat(options: UseChatOptions) {
    * Streams one agent turn for `history` (whose last entry is the user
    * prompt, already persisted) into the conversation's buffer, then saves it.
    */
+  /** The agent request of one run (also measured by the context gauge). */
+  const agentRequest = (
+    provider: Provider,
+    cred: { apiKey: string; auth: "key" | "bearer" },
+    model: string,
+    selection: ChatSelection,
+    projectName: string,
+    workspace: string,
+    images: db.ImageAttachment[] = []
+  ): db.AgentRequest => {
+    const o = opts.current;
+    const project = o.projects.find((p) => p.name === projectName);
+    const permMode = project?.permMode ?? "default";
+    const autoRun = permMode === "bypass" ? true : permMode === "ask" ? false : o.globalAutoRun;
+    return {
+      kind: provider.kind,
+      base_url: provider.base_url,
+      api_key: cred.apiKey,
+      auth: cred.auth,
+      model,
+      system: "",
+      workspace,
+      effort: selection.effort,
+      auto_run: autoRun,
+      images,
+      provider_id: provider.id,
+      rate_limit_rpm: provider.rate_limit_rpm ?? 0,
+      concurrency: provider.concurrency ?? 0,
+      subagents: o.subagents.filter((s) => s.enabled && s.name.trim()),
+      max_agents: o.maxAgents,
+      max_retries: o.maxRetries,
+      ssh_units: o.sshServers.map((s) => ({ id: s.id, name: s.name, host: s.host })),
+      disabled_tools: loadDisabledTools(),
+    };
+  };
+
+  /** Provider, model row and credentials of a selection — or why not. */
+  const resolveModel = async (selection: ChatSelection) => {
+    const o = opts.current;
+    const provider = o.providers.find((p) => p.id === selection.gatewayId);
+    const modelRow = o.models.find((m) => m.provider_id === selection.gatewayId && m.model_id === selection.modelId);
+    if (!provider || !modelRow) return { error: "No model selected — add a provider in Settings → Models." } as const;
+    const cred = await db.credentialFor(provider, {
+      clientId: localStorage.getItem("google_client_id") ?? "",
+      clientSecret: localStorage.getItem("google_client_secret") ?? "",
+    });
+    if (cred.error) return { error: `${provider.name}: ${cred.error}` } as const;
+    return { provider, modelRow, cred } as const;
+  };
+
+  const workspaceOf = (projectName: string) => {
+    const o = opts.current;
+    const p = o.projects.find((x) => x.name === projectName);
+    return p?.path?.trim() || o.appWorkspace || o.workspace;
+  };
+
+  /** The context gauge's data: next request's parts, model window/prices, spend so far. */
+  const contextFor = async (convId: string | null, projectName: string, selection: ChatSelection): Promise<ContextReport | null> => {
+    const r = await resolveModel(selection);
+    if ("error" in r || !r.provider) return null;
+    const { provider, modelRow, cred } = r;
+    const history = convId ? convMsgsRef.current[convId] ?? [] : [];
+    const request = agentRequest(provider, cred, modelRow.model_id, selection, projectName, workspaceOf(projectName));
+    const [parts, info] = await Promise.all([
+      db.agentContext(request, modelTurns(history)).catch(() => [] as db.ContextPart[]),
+      db.modelInfo(provider.kind, provider.base_url, modelRow.model_id),
+    ]);
+    const spent = { prompt: 0, completion: 0, cached: 0, runs: 0 };
+    let calibration: number | null = null;
+    for (const m of history) {
+      for (const seg of m.segments ?? []) {
+        if (seg.kind !== "usage") continue;
+        spent.prompt += seg.usage.prompt_tokens;
+        spent.completion += seg.usage.completion_tokens;
+        spent.cached += seg.usage.cached_tokens;
+        spent.runs += 1;
+        // The provider's own count of a request we also estimated: the
+        // ratio corrects the chars→tokens guess for this model's tokenizer
+        // (and hidden overhead like tool-use framing). The latest run wins.
+        const { first_input: real, first_est: est } = seg.usage;
+        if (real && est && est > 200) calibration = Math.min(3, Math.max(0.4, real / est));
+      }
+    }
+    const scaled = calibration === null
+      ? parts
+      : parts.map((p) => ({
+          ...p,
+          tokens: Math.round(p.tokens * calibration!),
+          items: p.items.map((it) => ({ ...it, tokens: Math.round(it.tokens * calibration!) })),
+        }));
+    return { parts: scaled, info, spent, calibration, modelName: modelRow.name || modelRow.model_id, providerKind: provider.kind };
+  };
+
+  /**
+   * /compact: the model summarizes the conversation; the summary is saved
+   * as a "compact" message and from then on sent INSTEAD of everything
+   * before it. `focus` = what the summary should keep in detail.
+   */
+  const compact = async (convId: string, focus = ""): Promise<string | null> => {
+    if (busy.current.has(convId) || activeRunsRef.current[convId]) return "The agent is still working — compact after it finishes.";
+    const selection = lastSelection.current ?? fallbackSelection();
+    if (!selection) return "No model selected.";
+    const r = await resolveModel(selection);
+    if ("error" in r) return r.error ?? "No model selected.";
+    const { provider, modelRow, cred } = r;
+    const turns = modelTurns(convMsgsRef.current[convId] ?? []);
+    if (turns.length === 0) return "Nothing to compact yet.";
+    // One transcript in one user message: every provider accepts it, and
+    // very long old answers are clipped (their tail holds the outcome).
+    const clip = (t: string, n: number) => (t.length > n ? `[…] ${t.slice(t.length - n)}` : t);
+    const transcript = turns
+      .map((t) => (t.role === "user" ? `USER:\n${clip(t.text, 12_000)}` : `AGENT:\n${clip(t.text, 6_000)}`))
+      .join("\n\n");
+    const ask = `${COMPACT_REQUEST}${focus.trim() ? `\nKeep especially detailed: ${focus.trim()}` : ""}\n\n<conversation>\n${transcript}\n</conversation>`;
+
+    busy.current.add(convId);
+    const runId = `compact-${Date.now()}`;
+    updateConvMsgs(convId, (prev) => [...prev, { role: "compact", text: "" }]);
+    setActiveRuns((prev) => ({ ...prev, [convId]: runId }));
+    setRunPhase((prev) => ({ ...prev, [convId]: "thinking" }));
+    const startedAt = Date.now();
+    let text = "";
+    try {
+      text = await db.streamChat(
+        runId,
+        {
+          kind: provider.kind,
+          base_url: provider.base_url,
+          api_key: cred.apiKey,
+          auth: cred.auth,
+          model: modelRow.model_id,
+          effort: "low",
+          images: [],
+          provider_id: provider.id,
+          rate_limit_rpm: provider.rate_limit_rpm ?? 0,
+          concurrency: provider.concurrency ?? 0,
+          system: COMPACT_SYSTEM,
+        },
+        [{ role: "user", text: ask }],
+        (delta) => {
+          setRunPhase((prev) => ({ ...prev, [convId]: "streaming" }));
+          updateConvMsgs(convId, (prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "compact") next[next.length - 1] = { ...last, text: last.text + delta };
+            return next;
+          });
+        }
+      );
+      if (!text.trim()) throw new Error("the model returned an empty summary");
+      const durationMs = Date.now() - startedAt;
+      updateConvMsgs(convId, (prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last?.role === "compact") next[next.length - 1] = { ...last, text, durationMs };
+        return next;
+      });
+      await db.appendMessage(convId, "compact", text, { durationMs });
+      opts.current.onActivity(convId);
+      return null;
+    } catch (e) {
+      // Nothing is saved: the full history stays in effect.
+      updateConvMsgs(convId, (prev) => (prev.at(-1)?.role === "compact" ? prev.slice(0, -1) : prev));
+      return `Compact failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      busy.current.delete(convId);
+      dropKey(setActiveRuns, convId);
+      dropKey(setRunPhase, convId);
+    }
+  };
+
   const runTurn = async (
     convId: string,
     projectName: string,
@@ -335,35 +558,13 @@ export function useChat(options: UseChatOptions) {
       applyEvent(convId, { kind: "text", delta });
     };
 
-    const turns = history.map((m) => ({ role: m.role, text: m.text }));
-    const project = o.projects.find((p) => p.name === projectName);
-    const permMode = project?.permMode ?? "default";
-    const autoRun = permMode === "bypass" ? true : permMode === "ask" ? false : o.globalAutoRun;
+    const turns = modelTurns(history);
 
     try {
       const answer = o.agentMode
         ? await db.runAgent(
             runId,
-            {
-              kind: provider.kind,
-              base_url: provider.base_url,
-              api_key: cred.apiKey,
-              auth: cred.auth,
-              model: modelRow.model_id,
-              system: "",
-              workspace: runWorkspace,
-              effort: selection.effort,
-              temperature: selection.temperature,
-              auto_run: autoRun,
-              images,
-              provider_id: provider.id,
-              rate_limit_rpm: provider.rate_limit_rpm ?? 0,
-              concurrency: provider.concurrency ?? 0,
-              subagents: o.subagents.filter((s) => s.enabled && s.name.trim()),
-              max_agents: o.maxAgents,
-              max_retries: o.maxRetries,
-              ssh_units: o.sshServers.map((s) => ({ id: s.id, name: s.name, host: s.host })),
-            },
+            agentRequest(provider, cred, modelRow.model_id, selection, projectName, runWorkspace, images),
             turns,
             {
               onText,
@@ -488,6 +689,7 @@ export function useChat(options: UseChatOptions) {
           text,
           attachments,
           selection,
+          project: target.project,
         };
         setQueues((prev) => ({ ...prev, [target.id]: [...(prev[target.id] ?? []), item] }));
         queuesRef.current = { ...queuesRef.current, [target.id]: [...(queuesRef.current[target.id] ?? []), item] };
@@ -526,7 +728,8 @@ export function useChat(options: UseChatOptions) {
     } finally {
       busy.current.delete(convId);
     }
-    // Next queued follow-up — unless the user pressed Stop.
+    // Next queued follow-up — unless the user pressed Stop. (The effect
+    // below also catches runs that did not start here.)
     if (!paused.current.has(convId)) void runQueued(convId, projectName);
     return convId;
   };
@@ -542,12 +745,24 @@ export function useChat(options: UseChatOptions) {
 
   /** Sends the first queued prompt (or the one with `id`) into the chat. */
   const runQueued = async (convId: string, project: string, id?: string) => {
-    if (busy.current.has(convId)) return;
+    if (busy.current.has(convId) || activeRunsRef.current[convId]) return;
     const first = id ?? queuesRef.current[convId]?.[0]?.id;
     if (!first) return;
     const item = takeQueued(convId, first);
     if (item) await send(item.text, { project, id: convId }, item.selection, item.attachments);
   };
+
+  // Auto-send the queue whenever a conversation goes idle — whatever started
+  // the run that just ended (a send, edit-and-resend, a run re-attached
+  // after a reload, a failed turn). Stop pauses it until sent by hand.
+  const runQueuedRef = useRef(runQueued);
+  runQueuedRef.current = runQueued;
+  useEffect(() => {
+    for (const [convId, items] of Object.entries(queues)) {
+      if (!items.length || activeRuns[convId] || busy.current.has(convId) || paused.current.has(convId)) continue;
+      void runQueuedRef.current(convId, items[0].project);
+    }
+  }, [queues, activeRuns]);
 
   /**
    * Rewinds the conversation to the user message at `index`, replaces its
@@ -575,11 +790,9 @@ export function useChat(options: UseChatOptions) {
   const fallbackSelection = (): ChatSelection | null => {
     const picked = opts.current.pickedModel;
     if (!picked) return null;
-    const t = localStorage.getItem("temperature");
     return {
       ...picked,
       effort: (localStorage.getItem("effort") as Effort) || "medium",
-      temperature: t === null || t === "" ? null : Number(t),
     };
   };
 
@@ -753,6 +966,9 @@ export function useChat(options: UseChatOptions) {
     erroredConv,
     confirmReqs,
     send,
+    /** /compact and the context gauge. */
+    compact,
+    contextFor,
     /** Follow-up prompts queued per conversation. */
     queues,
     takeQueued,

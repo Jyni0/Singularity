@@ -1,27 +1,28 @@
 import { useState, useEffect, useRef, useMemo } from "react";
+import type { ReactNode } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Send, X, Square, Mic, Loader2, Paperclip, FileText, Folder, GitBranch, SquarePen, Zap, Rabbit, Scale, Brain,
   Sparkles, Plug, ListChecks, SearchCode, BookOpen, Wrench, FlaskConical, GitCommitHorizontal,
-  ListPlus, Pencil, Play, CornerDownRight,
+  ListPlus, Pencil, Play, CornerDownRight, Minimize2,
 } from "lucide-react";
 import * as db from "../core/db.r";
 import type { Project, Gateway, Attachment, Effort } from "../core/types.i";
 import type { ChatSelection, QueuedPrompt } from "../hooks/useChat.h";
 import { toAttachments, formatSize } from "../utils/attachments.u";
 import { useDictation } from "../hooks/useDictation.h";
+import { BackgroundTasks } from "./BackgroundTasks.c";
 import { useOverlayThumb } from "../hooks/useOverlayThumb.h";
 import { Thumb } from "../ui/Thumb.c";
 
 import { ModelSelector } from "./ModelSelector.c";
 import { ProjectPicker } from "./ProjectPicker.c";
 import { EffortChip } from "./EffortChip.c";
-import { TemperatureChip } from "./TemperatureChip.c";
 import { ComposerMenu, type ComposerItem } from "./ComposerMenu.c";
 import { detectTrigger, mentionText, rankFiles, replaceToken, splitPath } from "./composer.u";
 
 /** What a `/` action asks the app to do. */
-export type PromptCommand = "new" | "skills" | "mcp";
+export type PromptCommand = "new" | "skills" | "mcp" | "compact";
 
 /** A `/` entry: runs at once (action) or stays in the prompt (template —
  *  expanded by the agent, see src-tauri/src/agent/expand.rs). */
@@ -51,6 +52,7 @@ const ACTIONS: SlashDef[] = [
   { name: "think", hint: "Effort: think harder", icon: <Brain {...ICON} />, kind: "action" },
   { name: "skills", hint: "Manage skills", icon: <Sparkles {...ICON} />, kind: "action" },
   { name: "mcp", hint: "Manage MCP servers", icon: <Plug {...ICON} />, kind: "action" },
+  { name: "compact", hint: "Summarize the chat to free context (/compact [what to keep])", icon: <Minimize2 {...ICON} />, kind: "action" },
 ];
 
 /** Workspace listings are cached this long (ms) between @ menus. */
@@ -72,6 +74,7 @@ export function PromptBox({
   queued = [],
   onTakeQueued,
   onRunQueued,
+  contextMeter,
 }: {
   onSend: (text: string, selection: ChatSelection, attachments: Attachment[]) => void;
   projects: Project[];
@@ -88,8 +91,11 @@ export function PromptBox({
   onPickModel?: (next: { gatewayId: string; modelId: string }) => void;
   /** Folder the prompt's run works in — the @ menu lists its files. */
   workspace?: string;
-  /** `/new`, `/skills`, `/mcp` — handled by the app. */
-  onCommand?: (cmd: PromptCommand) => void;
+  /** `/new`, `/skills`, `/mcp`, `/compact [focus]` — handled by the app;
+   *  a returned message is shown under the prompt. */
+  onCommand?: (cmd: PromptCommand, arg?: string) => void | Promise<string | null | void>;
+  /** The context gauge, shown in the toolbar. */
+  contextMeter?: ReactNode;
   /** Follow-ups written while the agent works; they run one by one after it. */
   queued?: QueuedPrompt[];
   /** Removes a queued prompt and returns it (Edit / Delete). */
@@ -103,11 +109,6 @@ export function PromptBox({
   const [effort, setEffort] = useState<Effort>(
     () => (localStorage.getItem("effort") as Effort) || "medium"
   );
-  /** Sampling temperature — null keeps the provider default. */
-  const [temperature, setTemperature] = useState<number | null>(() => {
-    const t = localStorage.getItem("temperature");
-    return t === null || t === "" ? null : Number(t);
-  });
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -234,6 +235,9 @@ export function PromptBox({
       case "skills":
       case "mcp":
         onCommand?.(name);
+        return true;
+      case "compact":
+        void Promise.resolve(onCommand?.("compact")).then((msg) => setNotice(msg || null));
         return true;
     }
     return false;
@@ -398,14 +402,17 @@ export function PromptBox({
     localStorage.setItem("effort", next);
   };
 
-  const pickTemperature = (next: number | null) => {
-    setTemperature(next);
-    localStorage.setItem("temperature", next === null ? "" : String(next));
-  };
-
   const send = () => {
     // A prompt can be just attachments — that is a legitimate request.
     if (!text.trim() && attachments.length === 0) return;
+    // "/compact <what to keep>" takes an argument.
+    const compactArg = /^\/compact\s+([\s\S]+)$/i.exec(text.trim());
+    if (compactArg && attachments.length === 0) {
+      void Promise.resolve(onCommand?.("compact", compactArg[1])).then((msg) => setNotice(msg || null));
+      setText("");
+      requestAnimationFrame(autoGrow);
+      return;
+    }
     // A bare action command ("/new") runs instead of being sent.
     const bare = /^\/([\w-]+)$/.exec(text.trim());
     if (bare && attachments.length === 0 && runAction(bare[1].toLowerCase())) {
@@ -415,7 +422,7 @@ export function PromptBox({
     }
     // Sending cancels an in-flight recording instead of transcribing it.
     speech.cancel();
-    onSend(text.trim(), { gatewayId, modelId, effort, temperature }, attachments);
+    onSend(text.trim(), { gatewayId, modelId, effort }, attachments);
     setText("");
     setAttachments([]);
     setNotice(null);
@@ -423,8 +430,8 @@ export function PromptBox({
   };
 
   return (
-    <div className={`flex w-full justify-center ${centered ? "" : "px-6 pb-4"}`}>
-      <div className="flex w-full max-w-[760px] flex-col">
+    <div className={`flex w-full justify-center ${centered ? "" : "pb-4"}`}>
+      <div className="flex w-full max-w-[784px] flex-col">
         {centered && (
           <div className="mb-4 flex justify-center">
             {/* Project settings moved to Settings → Projects; nothing here. */}
@@ -461,6 +468,8 @@ export function PromptBox({
               />
             )}
           </AnimatePresence>
+          {/* Dev servers / watchers the agent left running: watch and stop them. */}
+          <BackgroundTasks />
           {/* Queued follow-ups: sent in order once the running task ends. */}
           {queued.length > 0 && (
             <div className="flex flex-col gap-1 px-3 pt-3">
@@ -616,11 +625,10 @@ export function PromptBox({
               />
               {/* Reasoning effort — low is fast, high thinks harder. */}
               <EffortChip effort={effort} onPick={pickEffort} />
-              {/* Sampling temperature — Auto keeps the provider default. */}
-              <TemperatureChip value={temperature} onPick={pickTemperature} />
             </div>
 
             <div className="flex shrink-0 items-center gap-1">
+              {contextMeter}
               {/* Hidden file input driven by the paperclip button */}
               <input
                 ref={fileInput}

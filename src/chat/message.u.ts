@@ -89,6 +89,7 @@ export function toolLabel(step: db.AgentStepEvent): string {
     git: "Git",
     web_search: "Web",
     web_fetch: "Fetch",
+    background: "Task",
   };
   return verb[step.name] ?? step.name.replace(/^mcp__(.+?)__/, "$1 · ");
 }

@@ -112,8 +112,9 @@ function TabBody({ tab, msgs }: { tab: PanelTabSpec; msgs: Msg[] }) {
     );
   }
 
-  // command / tool - both resolve a single step by its index.
-  const step = steps.find((s) => s.index === tab.stepIndex);
+  // command / tool - one step of one turn (indices restart every run, so
+  // the index alone found another run's step: "npm run dev" showing a delete).
+  const step = collectSteps(msgs[tab.msgIndex] ? [msgs[tab.msgIndex]] : []).find((s) => s.index === tab.stepIndex);
   if (!step) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center p-4 text-[12px] text-[var(--text-dim)]">

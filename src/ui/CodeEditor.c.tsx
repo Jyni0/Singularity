@@ -4,6 +4,7 @@
  * through onChange, and Mod-S calls onSave.
  */
 import { useEffect, useRef } from "react";
+import { shortcutKey } from "../utils/keys.u";
 import { Compartment, EditorState, type Extension } from "@codemirror/state";
 import {
   EditorView,
@@ -211,7 +212,7 @@ export function CodeEditor({
     // Ctrl+F anywhere on the page opens this editor's search, even when the
     // focus is on the toolbar; inside the editor its own keymap handles it.
     const onKey = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.key.toLowerCase() !== "f") return;
+      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || shortcutKey(e) !== "F") return;
       if (view.dom.contains(document.activeElement)) return;
       e.preventDefault();
       view.focus();

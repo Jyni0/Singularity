@@ -16,6 +16,8 @@ import { useChat, DRAFT_ID } from "../hooks/useChat.h";
 import { useScheduledTasks } from "../hooks/useScheduledTasks.h";
 import type { ChatSelection } from "../hooks/useChat.h";
 import { PromptBox, type PromptCommand } from "../chat/PromptBox.c";
+import { ContextMeter } from "../chat/ContextMeter.c";
+import { CompactNote } from "../chat/CompactNote.c";
 import { InspectionPanel } from "../chat/InspectionPanel.c";
 import { TitleBar } from "../layout/TitleBar.c";
 import { Sidebar } from "../layout/Sidebar.c";
@@ -212,7 +214,6 @@ export default function App() {
   /** Scheduled Tasks: each due run is a new background chat in the task's project. */
   const schedule = useScheduledTasks(async (t) => {
     if (!projects.some((p) => p.name === t.project)) return null; // project was deleted
-    const t0 = localStorage.getItem("temperature");
     return chat.send(
       t.prompt,
       null,
@@ -220,7 +221,6 @@ export default function App() {
         gatewayId: t.provider_id,
         modelId: t.model_id,
         effort: (localStorage.getItem("effort") as Effort) || "medium",
-        temperature: t0 === null || t0 === "" ? null : Number(t0),
       },
       [],
       { project: t.project, background: true }
@@ -773,9 +773,13 @@ export default function App() {
   const workspaceOf = (project: string) =>
     projects.find((p) => p.name === project)?.path?.trim() || appWorkspace || workspace;
 
-  /** `/new`, `/skills`, `/mcp` typed in the prompt box. */
-  const onPromptCommand = (cmd: PromptCommand) => {
+  /** `/new`, `/skills`, `/mcp`, `/compact` typed in the prompt box. */
+  const onPromptCommand = (cmd: PromptCommand, arg?: string) => {
     if (cmd === "new") return startNewChat(activeConv?.project ?? newChatProject);
+    if (cmd === "compact") {
+      if (!activeConv) return Promise.resolve("Open a conversation to compact it.");
+      return chat.compact(activeConv.id, arg ?? "");
+    }
     setSettingsSection(cmd);
     setModal("settings");
   };
@@ -1236,6 +1240,12 @@ export default function App() {
                           animate={{ opacity: 1, y: 0 }}
                           transition={{ duration: 0.2, ease: "easeOut" }}
                         >
+                          {m.role === "compact" ? (
+                            <CompactNote
+                              text={m.text}
+                              live={streaming && i === draftMsgs.length - 1}
+                            />
+                          ) : (
                           <ChatMessage
                             role={m.role}
                             text={m.text}
@@ -1262,16 +1272,18 @@ export default function App() {
                                 });
                               } else if (step.name === "run_command") {
                                 openPanelTab({
-                                  id: `cmd:${step.index}`,
+                                  id: `cmd:${i}:${step.index}`,
                                   type: "command",
                                   label: step.input,
+                                  msgIndex: i,
                                   stepIndex: step.index,
                                 });
                               } else {
                                 openPanelTab({
-                                  id: `tool:${step.index}`,
+                                  id: `tool:${i}:${step.index}`,
                                   type: "tool",
                                   label: toolLabel(step),
+                                  msgIndex: i,
                                   stepIndex: step.index,
                                 });
                               }
@@ -1285,6 +1297,7 @@ export default function App() {
                               })
                             }
                           />
+                          )}
                         </motion.div>
                       ))}
                     </AnimatePresence>
@@ -1388,6 +1401,25 @@ export default function App() {
                 queued={activeConv ? chat.queues[activeConv.id] ?? [] : []}
                 onTakeQueued={(id) => (activeConv ? chat.takeQueued(activeConv.id, id) : undefined)}
                 onRunQueued={(id) => activeConv && void chat.runQueued(activeConv.id, activeConv.project, id)}
+                contextMeter={
+                  pickedModel && (
+                    <ContextMeter
+                      load={() =>
+                        chat.contextFor(activeConv?.id ?? null, activeConv?.project ?? NO_PROJECT, {
+                          ...pickedModel,
+                          effort: (localStorage.getItem("effort") as Effort) || "medium",
+                        })
+                      }
+                      refreshKey={`${activeConv?.id ?? ""}|${draftMsgs.length}|${pickedModel.gatewayId}|${pickedModel.modelId}|${maxAgents}`}
+                      busy={streaming}
+                      onCompact={
+                        activeConv
+                          ? () => chat.compact(activeConv.id)
+                          : undefined
+                      }
+                    />
+                  )
+                }
               />
             </div>
           )}

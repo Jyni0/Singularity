@@ -1,6 +1,6 @@
 [package]
 name = "singularity"
-version = "0.4.0"
+version = "0.5.0"
 description = "Next-Gen Agentic Desktop — orchestration workspace for autonomous AI agents"
 authors = ["Singularity"]
 edition = "2021"
@@ -49,9 +49,27 @@ encoding_rs = "0.8"
 rig-core = "0.42"
 rig-agent = "0.42"
 tauri-plugin-single-instance = "2"
+tree-sitter = "0.27.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-json = "0.24.8"
+tree-sitter-css = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-bash = "0.25.1"
+tree-sitter-html = "0.23.2"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-php = "0.24.2"
 
 # WebView2 hooks (same versions wry uses): take Ctrl+F / Ctrl+G / F3 away
 # from the browser's own find bar so the app's search gets them.
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
 windows-core = "0.61"
+# Job objects: stopping a background task kills everything it started
+# (bash → npm → cmd → node survived taskkill /T).
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

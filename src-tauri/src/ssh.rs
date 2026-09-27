@@ -177,9 +177,13 @@ impl russh::client::Handler for ClientHandler {
 
 type Conn = Arc<Handle<ClientHandler>>;
 
-/// Live connection: the russh handle, shared by exec / shells / SFTP.
+/// Live connection: the russh handle, shared by exec and SFTP. Terminals do
+/// NOT ride it — every terminal tab opens its own connection (shell_open).
 struct Pooled {
     handle: Conn,
+    /// How this connection was reached (see `route_of`). Settings that
+    /// change it — e.g. picking a proxy — must not keep reusing the old one.
+    route: String,
 }
 
 static POOL: Mutex<Option<HashMap<String, Arc<Pooled>>>> = Mutex::new(None);
@@ -205,9 +209,38 @@ fn pool_ids() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Ids of currently connected servers (the UI paints status dots from this).
+/// session id → server id of every open terminal (each has its own
+/// connection). A std Mutex so `connected_ids` can stay synchronous.
+static SHELL_SERVERS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+fn shell_servers_set(sid: &str, server_id: Option<&str>) {
+    if let Ok(mut g) = SHELL_SERVERS.lock() {
+        let map = g.get_or_insert_with(HashMap::new);
+        match server_id {
+            Some(id) => {
+                map.insert(sid.to_string(), id.to_string());
+            }
+            None => {
+                map.remove(sid);
+            }
+        }
+    }
+}
+
+/// Ids of currently connected servers (the UI paints status dots from this):
+/// the shared connection or any open terminal counts.
 pub fn connected_ids() -> Vec<String> {
-    pool_ids()
+    let mut ids = pool_ids();
+    if let Ok(g) = SHELL_SERVERS.lock() {
+        if let Some(map) = g.as_ref() {
+            for id in map.values() {
+                if !ids.contains(id) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+    }
+    ids
 }
 
 /* ---------- Database (sqlx → the same singularity.db) ---------- */
@@ -391,13 +424,26 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_OUTPUT: usize = 30_000;
 
-/// Opens (or reuses) a pooled connection to a saved server.
+/// Opens (or reuses) the shared connection (exec / SFTP) to a saved server.
 pub async fn connect(app: &AppHandle, actor: &str, server_id: &str) -> Result<(), String> {
-    if pool_get(server_id).is_some() {
-        return Ok(()); // already connected — idempotent
-    }
     let server = load_server(app, server_id).await?;
-    let outcome = connect_inner(app, &server).await;
+    let route = route_of(app, &server).await;
+    if let Some(conn) = pool_get(server_id) {
+        if conn.route == route {
+            return Ok(()); // already connected — idempotent
+        }
+        // Host / user / proxy changed since this connection opened: retire
+        // only the shared connection (and its SFTP) so new work takes the
+        // new route. Open terminals have their own connections and keep
+        // running untouched.
+        if let Some(old) = pool_take(server_id) {
+            if let Some(map) = SFTP.lock().await.as_mut() {
+                map.remove(server_id);
+            }
+            let _ = old.handle.disconnect(Disconnect::ByApplication, "", "en").await;
+        }
+    }
+    let outcome = connect_inner(app, &server, route).await;
     match &outcome {
         Ok(_) => write_log(app, actor, &server, "connect", true, "").await,
         Err(e) => write_log(app, actor, &server, "connect", false, e).await,
@@ -406,7 +452,45 @@ pub async fn connect(app: &AppHandle, actor: &str, server_id: &str) -> Result<()
     outcome
 }
 
-async fn connect_inner(app: &AppHandle, server: &SshServer) -> Result<(), String> {
+/// Everything that decides where a connection goes: user@host:port plus the
+/// proxy's own endpoint (so editing the proxy also counts as a change).
+async fn route_of(app: &AppHandle, s: &SshServer) -> String {
+    let via = if s.proxy_id.is_empty() {
+        String::new()
+    } else {
+        match crate::proxy::load(app, &s.proxy_id).await {
+            Ok(p) => format!("{}://{}@{}:{}", p.kind, p.username, p.host, p.port),
+            Err(_) => s.proxy_id.clone(),
+        }
+    };
+    format!("{}@{}:{} via {via}", s.username, s.host, s.port)
+}
+
+async fn connect_inner(app: &AppHandle, server: &SshServer, route: String) -> Result<(), String> {
+    let handle = open_session(app, server).await?;
+    // Detect the remote OS once per connection (best-effort, never fatal):
+    // the result drives the server logo in the UI and is cached on the row.
+    let os = detect_os(&handle).await;
+    if !os.is_empty() {
+        if let Some(pool) = sql(app).await {
+            let _ = sqlx::query("UPDATE ssh_servers SET os = $1 WHERE id = $2")
+                .bind(&os)
+                .bind(&server.id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = app.emit("ssh://os", (server.id.clone(), os));
+    }
+    pool_put(
+        server.id.clone(),
+        Arc::new(Pooled { handle, route }),
+    );
+    Ok(())
+}
+
+/// Dials (directly or through the server's proxy), authenticates and pins
+/// the host key — one brand-new SSH connection with the CURRENT settings.
+async fn open_session(app: &AppHandle, server: &SshServer) -> Result<Conn, String> {
     let config = Arc::new(client::Config {
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
@@ -417,7 +501,9 @@ async fn connect_inner(app: &AppHandle, server: &SshServer) -> Result<(), String
         expected: server.host_key.clone(),
         seen: seen.clone(),
     };
-    let session = tokio::time::timeout(CONNECT_TIMEOUT, async {
+    // Proxies (Tor especially) need extra time to build the circuit.
+    let limit = if server.proxy_id.is_empty() { CONNECT_TIMEOUT } else { CONNECT_TIMEOUT * 3 };
+    let session = tokio::time::timeout(limit, async {
         if server.proxy_id.is_empty() {
             return client::connect(config, (server.host.as_str(), server.port), handler)
                 .await
@@ -446,7 +532,10 @@ async fn connect_inner(app: &AppHandle, server: &SshServer) -> Result<(), String
             }
             return Err(e);
         }
-        Err(_) => return Err(format!("connection to {}:{} timed out", server.host, server.port)),
+        Err(_) => {
+            let via = if server.proxy_id.is_empty() { "" } else { " (through the proxy)" };
+            return Err(format!("connection to {}:{}{via} timed out after {}s", server.host, server.port, limit.as_secs()));
+        }
     };
 
     // Auth methods are tried in order and BOTH may be configured at once:
@@ -516,25 +605,7 @@ async fn connect_inner(app: &AppHandle, server: &SshServer) -> Result<(), String
                 .await;
         }
     }
-    // Detect the remote OS once per connection (best-effort, never fatal):
-    // the result drives the server logo in the UI and is cached on the row.
-    let handle = Arc::new(session);
-    let os = detect_os(&handle).await;
-    if !os.is_empty() {
-        if let Some(pool) = sql(app).await {
-            let _ = sqlx::query("UPDATE ssh_servers SET os = $1 WHERE id = $2")
-                .bind(&os)
-                .bind(&server.id)
-                .execute(&pool)
-                .await;
-        }
-        let _ = app.emit("ssh://os", (server.id.clone(), os));
-    }
-    pool_put(
-        server.id.clone(),
-        Arc::new(Pooled { handle }),
-    );
-    Ok(())
+    Ok(Arc::new(session))
 }
 
 /// Best-effort remote OS detection → a token the UI maps to a logo in
@@ -601,9 +672,7 @@ pub async fn exec(
 ) -> Result<String, String> {
     // Auto-connect on demand: neither the UI nor the agent has to babysit
     // the pool; credentials come from the database, not from the request.
-    if pool_get(server_id).is_none() {
-        connect(app, actor, server_id).await?;
-    }
+    connect(app, actor, server_id).await?;
     let conn = pool_get(server_id).ok_or("not connected")?;
     let server = load_server(app, server_id).await?;
 
@@ -693,10 +762,12 @@ async fn exec_inner(conn: &Handle<ClientHandler>, command: &str) -> Result<Strin
     }
 }
 
-/// Closes a pooled connection and every shell/SFTP session riding it.
+/// Explicit "disconnect server": closes the shared connection, its SFTP and
+/// every open terminal of the server.
 pub async fn disconnect(app: &AppHandle, actor: &str, server_id: &str) -> Result<(), String> {
     close_shells(server_id).await;
     let Some(conn) = pool_take(server_id) else {
+        let _ = app.emit("ssh://status", connected_ids());
         return Ok(());
     };
     drop_sftp(server_id);
@@ -739,6 +810,8 @@ struct ShellExit {
 
 struct ShellState {
     server_id: String,
+    /// The terminal's own SSH connection — closed together with the shell.
+    conn: Conn,
     write: tokio::sync::Mutex<ChannelWriteHalf<russh::client::Msg>>,
     buffer: Arc<Mutex<Vec<u8>>>,
 }
@@ -769,13 +842,28 @@ pub async fn shell_open(
     rows: u32,
     term: &str,
 ) -> Result<String, String> {
-    if pool_get(server_id).is_none() {
-        connect(app, actor, server_id).await?;
-    }
-    let conn = pool_get(server_id).ok_or("not connected")?;
+    // Every terminal tab is a NEW connection built from the server's current
+    // settings (proxy included) — not another channel on a shared one — so
+    // tabs are independent and settings changes never kill open terminals.
+    let server = load_server(app, server_id).await?;
+    let conn = match open_session(app, &server).await {
+        Ok(c) => c,
+        Err(e) => {
+            write_log(app, actor, &server, "connect", false, &e).await;
+            return Err(e);
+        }
+    };
+    let via = if server.proxy_id.is_empty() {
+        "direct".to_string()
+    } else {
+        crate::proxy::load(app, &server.proxy_id)
+            .await
+            .map(|p| format!("via proxy '{}'", p.name))
+            .unwrap_or_else(|_| "via proxy".into())
+    };
+    write_log(app, actor, &server, "connect", true, &format!("terminal connection ({via})")).await;
 
     let channel = conn
-        .handle
         .channel_open_session()
         .await
         .map_err(|e| format!("cannot open channel: {e}"))?;
@@ -794,6 +882,7 @@ pub async fn shell_open(
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let state = Arc::new(ShellState {
         server_id: server_id.to_string(),
+        conn: conn.clone(),
         write: tokio::sync::Mutex::new(write),
         buffer: buffer.clone(),
     });
@@ -803,6 +892,8 @@ pub async fn shell_open(
             .get_or_insert_with(HashMap::new)
             .insert(session_id.clone(), state);
     }
+    shell_servers_set(&session_id, Some(server_id));
+    let _ = app.emit("ssh://status", connected_ids());
 
     // Reader task: PTY output → ring buffer + event stream.
     let app2 = app.clone();
@@ -836,13 +927,18 @@ pub async fn shell_open(
             "ssh://shell-exit",
             ShellExit { session_id: sid.clone(), code: exit_code },
         );
-        let mut guard = SHELLS.lock().await;
-        if let Some(map) = guard.as_mut() {
-            map.remove(&sid);
+        {
+            let mut guard = SHELLS.lock().await;
+            if let Some(map) = guard.as_mut() {
+                map.remove(&sid);
+            }
         }
+        // The shell is gone — so is its private connection.
+        let _ = conn.disconnect(Disconnect::ByApplication, "", "en").await;
+        shell_servers_set(&sid, None);
+        let _ = app2.emit("ssh://status", connected_ids());
     });
 
-    let server = load_server(app, server_id).await?;
     write_log(app, actor, &server, "shell", true, "interactive terminal opened").await;
     Ok(session_id)
 }
@@ -902,7 +998,12 @@ pub async fn shell_close(session_id: &str) -> Result<(), String> {
     drop(guard);
     let w = state.write.lock().await;
     let _ = w.eof().await;
-    w.close().await.map_err(|e| format!("close failed: {e}"))
+    let res = w.close().await.map_err(|e| format!("close failed: {e}"));
+    drop(w);
+    // Also end the terminal's own connection (the reader task does the same
+    // when it sees the close; a second disconnect is harmless).
+    let _ = state.conn.disconnect(Disconnect::ByApplication, "", "en").await;
+    res
 }
 
 /// Every live shell: (session_id, server_id) — the frontend attaches to
@@ -973,14 +1074,14 @@ async fn sftp_for(
     actor: &str,
     server_id: &str,
 ) -> Result<Arc<SftpSession>, String> {
+    // connect() first: when the settings changed it swaps the shared
+    // connection and drops the cached SFTP session riding the old one.
+    connect(app, actor, server_id).await?;
     {
         let guard = SFTP.lock().await;
         if let Some(s) = guard.as_ref().and_then(|m| m.get(server_id)) {
             return Ok(Arc::clone(s));
         }
-    }
-    if pool_get(server_id).is_none() {
-        connect(app, actor, server_id).await?;
     }
     let conn = pool_get(server_id).ok_or("not connected")?;
     let channel = conn

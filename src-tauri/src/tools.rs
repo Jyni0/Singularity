@@ -4,9 +4,11 @@
 /// model cannot read `C:\Windows` or write outside the project it was given.
 /// Commands run through the platform shell with a timeout and a captured exit
 /// code, and their output is truncated before it goes back into the context.
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 
 /// Largest file we will read into the model context.
@@ -80,19 +82,184 @@ impl ToolResult {
 /// accepted as-is, because a coding agent has to be able to work on any project
 /// on disk — not only inside its own scratch folder. The workspace therefore
 /// acts as the default location, not as a prison.
-fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
+pub fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let cleaned = normalize_path(path);
+    if cleaned.is_empty() || cleaned == "." {
         return Ok(root.to_path_buf());
     }
 
-    let candidate = Path::new(trimmed);
+    let candidate = Path::new(&cleaned);
     if candidate.is_absolute() {
         return Ok(candidate.to_path_buf());
     }
 
     // A relative path is joined onto the workspace root.
     Ok(root.join(candidate))
+}
+
+/// The user's home folder.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+/// `/c/Users/..` and `/mnt/c/Users/..` (Git Bash / WSL spellings).
+static MSYS_DRIVE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^/(?:mnt/)?([a-zA-Z])(/|$)").unwrap());
+
+/// Repairs the path spellings models keep producing, so a path that exists
+/// is not reported missing: quotes or backticks around it, `file://` URLs,
+/// `~`, `$HOME` / `%USERPROFILE%`, and on Windows the Git Bash / WSL drive
+/// form `/c/Users/..`.
+pub fn normalize_path(path: &str) -> String {
+    let mut p = path.trim();
+    for q in ['"', '\'', '`'] {
+        if p.len() >= 2 && p.starts_with(q) && p.ends_with(q) {
+            p = p[1..p.len() - 1].trim();
+        }
+    }
+    let mut p = p.to_string();
+    if let Some(rest) = p.strip_prefix("file://") {
+        p = rest.to_string();
+        // file:///C:/x → C:/x
+        if cfg!(windows) && p.len() > 2 && p.starts_with('/') && p.as_bytes()[2] == b':' {
+            p.remove(0);
+        }
+    }
+    for var in ["$HOME", "${HOME}", "%USERPROFILE%", "$env:USERPROFILE"] {
+        if let Some(rest) = p.strip_prefix(var) {
+            if let Some(home) = home_dir() {
+                p = format!("{}{rest}", home.display());
+            }
+            break;
+        }
+    }
+    if p == "~" || p.starts_with("~/") || p.starts_with("~\\") {
+        if let Some(home) = home_dir() {
+            p = format!("{}{}", home.display(), &p[1..]);
+        }
+    }
+    if cfg!(windows) {
+        if let Some(c) = MSYS_DRIVE.captures(&p) {
+            let drive = c[1].to_uppercase();
+            let rest = p[c[0].len()..].to_string();
+            p = format!("{drive}:/{rest}");
+        }
+    }
+    p
+}
+
+/// Error text for a path that does not exist, with the workspace's paths
+/// whose file name matches — the model usually guessed the folder wrong,
+/// and a list of real candidates ends the guessing loop.
+pub fn not_found(root: &Path, path: &str) -> String {
+    let full = resolve(root, path).unwrap_or_else(|_| root.join(path));
+    let mut msg = format!("not found: {} (relative paths start at {})", full.display(), root.display());
+    let name = Path::new(&normalize_path(path))
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return msg;
+    }
+    let files = workspace_files(root);
+    let base = |f: &String| f.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_lowercase();
+    let mut hits: Vec<&String> = files.iter().filter(|f| base(f) == name).take(8).collect();
+    if hits.is_empty() {
+        let stem = name.split('.').next().unwrap_or(&name).to_string();
+        if stem.len() >= 3 {
+            hits = files.iter().filter(|f| base(f).contains(&stem)).take(8).collect();
+        }
+    }
+    if hits.is_empty() {
+        msg.push_str("\nNothing with that name exists under the workspace. Use find_files or list_dir to look around instead of guessing.");
+    } else {
+        msg.push_str("\nDid you mean one of these (relative to the workspace)?");
+        for h in hits {
+            msg.push_str("\n  ");
+            msg.push_str(h);
+        }
+    }
+    msg
+}
+
+fn is_missing(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+}
+
+/// Finds the ONE place `needle` occurs in `hay` and returns its byte range
+/// plus the replacement to put there. Exact match first; when that finds
+/// nothing, lines are compared with their indentation and trailing spaces
+/// ignored (the model's usual copy error) and the replacement is
+/// re-indented to the file's actual indentation. Err(n) = found n times.
+pub fn locate(hay: &str, needle: &str, replace: &str) -> Result<(usize, usize, String), usize> {
+    let exact = hay.matches(needle).count();
+    if exact == 1 {
+        let at = hay.find(needle).unwrap_or(0);
+        return Ok((at, at + needle.len(), replace.to_string()));
+    }
+    if exact > 1 {
+        return Err(exact);
+    }
+    let mut want: Vec<&str> = needle.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+    while want.first().is_some_and(|l| l.trim().is_empty()) {
+        want.remove(0);
+    }
+    while want.last().is_some_and(|l| l.trim().is_empty()) {
+        want.pop();
+    }
+    if want.is_empty() {
+        return Err(0);
+    }
+    let mut lines: Vec<(usize, &str)> = Vec::new();
+    let mut off = 0usize;
+    for raw in hay.split('\n') {
+        lines.push((off, raw.strip_suffix('\r').unwrap_or(raw)));
+        off += raw.len() + 1;
+    }
+    if lines.len() < want.len() {
+        return Err(0);
+    }
+    let hits: Vec<usize> = (0..=lines.len() - want.len())
+        .filter(|&i| (0..want.len()).all(|j| lines[i + j].1.trim() == want[j].trim()))
+        .collect();
+    if hits.len() != 1 {
+        return Err(hits.len());
+    }
+    let i = hits[0];
+    let last = lines[i + want.len() - 1];
+    let (start, end) = (lines[i].0, last.0 + last.1.len());
+    let indent = |l: &str| l[..l.len() - l.trim_start().len()].to_string();
+    let (have, real) = (indent(want[0]), indent(lines[i].1));
+    let replace = if have == real {
+        replace.to_string()
+    } else {
+        replace
+            .split('\n')
+            .map(|l| {
+                if l.trim().is_empty() {
+                    l.to_string()
+                } else if let Some(rest) = l.strip_prefix(have.as_str()) {
+                    format!("{real}{rest}")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok((start, end, replace))
+}
+
+/// Brings SEARCH/REPLACE text to the file's line endings (a CRLF file never
+/// matched the model's LF text).
+fn match_endings(file: &str, text: &str) -> String {
+    let lf = text.replace("\r\n", "\n");
+    if file.contains("\r\n") {
+        lf.replace('\n', "\r\n")
+    } else {
+        lf
+    }
 }
 
 /* ---------- Filesystem tools ---------- */
@@ -103,8 +270,12 @@ pub fn read_file(root: &Path, path: &str, start_line: Option<usize>, end_line: O
         Ok(p) => p,
         Err(e) => return ToolResult::err(e),
     };
+    if full.is_dir() {
+        return ToolResult::err(format!("{path} is a directory — use list_dir or find_files"));
+    }
     let bytes = match std::fs::read(&full) {
         Ok(b) => b,
+        Err(e) if is_missing(&e) => return ToolResult::err(not_found(root, path)),
         Err(e) => return ToolResult::err(format!("cannot read {path}: {e}")),
     };
     if bytes.len() > MAX_READ_BYTES {
@@ -179,26 +350,27 @@ pub fn edit_file(root: &Path, path: &str, old: &str, new: &str) -> ToolResult {
     };
     let text = match std::fs::read_to_string(&full) {
         Ok(t) => t,
+        Err(e) if is_missing(&e) => return ToolResult::err(not_found(root, path)),
         Err(e) => return ToolResult::err(format!("cannot read {path}: {e}")),
     };
 
-    let count = text.matches(old).count();
-    if count == 0 {
-        return ToolResult::err(format!(
-            "the search text was not found in {path}. Read the file first and copy the exact text."
-        ));
-    }
-    if count > 1 {
-        return ToolResult::err(format!(
-            "the search text appears {count} times in {path}; include more surrounding lines to make it unique."
-        ));
-    }
-
-    match std::fs::write(&full, text.replacen(old, new, 1)) {
-        Ok(()) => {
-            let updated = text.replacen(old, new, 1);
-            ToolResult::ok(format!("edited {path}")).with_change(path, Some(text), updated)
+    let (old, new) = (match_endings(&text, old), match_endings(&text, new));
+    let (start, end, new) = match locate(&text, &old, &new) {
+        Ok(found) => found,
+        Err(0) => {
+            return ToolResult::err(format!(
+                "the search text was not found in {path}. Read the file first and copy the exact text."
+            ))
         }
+        Err(count) => {
+            return ToolResult::err(format!(
+                "the search text appears {count} times in {path}; include more surrounding lines to make it unique."
+            ))
+        }
+    };
+    let updated = format!("{}{}{}", &text[..start], new, &text[end..]);
+    match std::fs::write(&full, &updated) {
+        Ok(()) => ToolResult::ok(format!("edited {path}")).with_change(path, Some(text), updated),
         Err(e) => ToolResult::err(format!("cannot write {path}: {e}")),
     }
 }
@@ -209,8 +381,11 @@ pub fn list_dir(root: &Path, path: &str) -> ToolResult {
         Ok(p) => p,
         Err(e) => return ToolResult::err(e),
     };
+    if !dir.exists() {
+        return ToolResult::err(not_found(root, path));
+    }
     if !dir.is_dir() {
-        return ToolResult::err(format!("{} is not a directory", dir.display()));
+        return ToolResult::err(format!("{} is a file, not a directory — use read_file", dir.display()));
     }
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
@@ -387,7 +562,7 @@ pub fn parse_patch(diff: &str) -> Vec<(String, String)> {
 /// result of earlier ones). A single hunk with an empty SEARCH creates the
 /// file. Failures are reported per hunk with its index so the model can fix
 /// exactly the broken block and retry.
-pub fn apply_patch(root: &Path, path: &str, diff: &str) -> ToolResult {
+pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolResult {
     let full = match resolve(root, path) {
         Ok(p) => p,
         Err(e) => return ToolResult::err(e),
@@ -403,12 +578,26 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str) -> ToolResult {
     let text = std::fs::read_to_string(&full).ok();
     let original = text.clone();
 
-    // New-file hunk: file absent + exactly one hunk with an empty SEARCH.
+    // New file: absent + create:true + exactly one hunk with an empty
+    // SEARCH. Without the explicit flag a mistyped / invented path used to
+    // be "edited" into existence as a stray new file.
     if text.is_none() {
         let create_only = hunks.len() == 1 && hunks[0].0.trim().is_empty();
-        if !create_only {
+        if !create || !create_only {
             return ToolResult::err(format!(
-                "{path} does not exist. To create it, send ONE hunk with an empty SEARCH side."
+                "{}\nThis file does not exist, so there is nothing to edit — find the real path first. \
+                 Only if you really mean to create a NEW file: set create:true and send ONE hunk with an empty SEARCH side.",
+                not_found(root, path)
+            ));
+        }
+        // A same-named file elsewhere + a folder that does not exist yet is
+        // almost always a wrong guess at an existing file's path.
+        let parent_missing = full.parent().is_some_and(|p| !p.exists());
+        let hint = not_found(root, path);
+        if parent_missing && hint.contains("Did you mean") {
+            return ToolResult::err(format!(
+                "refusing to create {path}: its folder does not exist and a file with the same name is already in the workspace.\n{hint}\n\
+                 Edit the existing file instead, or create the folder first with file_op mkdir if a new file is really intended."
             ));
         }
         if let Some(parent) = full.parent() {
@@ -424,26 +613,28 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str) -> ToolResult {
         };
     }
 
+    if hunks.iter().any(|(s, _)| s.trim().is_empty()) {
+        return ToolResult::err(format!(
+            "{path} already exists — an empty SEARCH side is only for new files. Read the file and put the exact lines to change in SEARCH."
+        ));
+    }
     let mut current = text.unwrap_or_default();
     let mut applied = 0usize;
     let mut errors: Vec<String> = Vec::new();
     for (i, (search, replace)) in hunks.iter().enumerate() {
-        let needle = search.as_str();
-        let count = current.matches(needle).count();
-        if count == 0 {
-            errors.push(format!(
-                "hunk {i}: SEARCH text not found in {path} — read the file and copy the exact text (whitespace matters)"
-            ));
-            continue;
-        }
-        if count > 1 {
-            errors.push(format!(
+        let (needle, replace) = (match_endings(&current, search), match_endings(&current, replace));
+        match locate(&current, &needle, &replace) {
+            Ok((start, end, replace)) => {
+                current = format!("{}{}{}", &current[..start], replace, &current[end..]);
+                applied += 1;
+            }
+            Err(0) => errors.push(format!(
+                "hunk {i}: SEARCH text not found in {path} — read the file again and copy the exact lines"
+            )),
+            Err(count) => errors.push(format!(
                 "hunk {i}: SEARCH text appears {count} times in {path} — add surrounding lines to make it unique"
-            ));
-            continue;
+            )),
         }
-        current = current.replacen(needle, replace.as_str(), 1);
-        applied += 1;
     }
 
     if applied == 0 {
@@ -471,76 +662,454 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str) -> ToolResult {
 
 /* ---------- Shell ---------- */
 
-/// Runs a command in `cwd` (the workspace when unset) and returns its output.
-pub fn run_command(root: &Path, command: &str, cwd: Option<&str>, timeout_secs: Option<u64>) -> ToolResult {
-    let timeout = Duration::from_secs(timeout_secs.unwrap_or(COMMAND_TIMEOUT_SECS).min(600));
+/// The shells a command can run in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shell {
+    /// Git Bash on Windows, bash (or sh) elsewhere.
+    Bash,
+    /// Windows PowerShell 5.1.
+    PowerShell,
+    Cmd,
+}
 
-    // The model may target any folder; fall back to the workspace root.
-    let workdir = match cwd.map(str::trim) {
-        Some(c) if !c.is_empty() => PathBuf::from(c),
-        _ => root.to_path_buf(),
-    };
-    if !workdir.is_dir() {
-        return ToolResult::err(format!("working directory does not exist: {}", workdir.display()));
-    }
-
-    #[cfg(target_os = "windows")]
-    let spawned = {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW keeps a console window from flashing on every call.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        // Force UTF-8 console output (chcp 65001) — without it cmd prints in
-        // the OEM codepage (cp866) and Cyrillic reaches the model as mojibake.
-        let utf8_command = format!("chcp 65001>nul & {command}");
-        Command::new("cmd")
-            .args(["/C", utf8_command.as_str()])
-            .current_dir(&workdir)
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-    };
-
-    #[cfg(not(target_os = "windows"))]
-    let spawned = Command::new("sh")
-        .args(["-c", command])
-        .current_dir(&workdir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
-
-    let mut child = match spawned {
-        Ok(c) => c,
-        Err(e) => return ToolResult::err(format!("cannot start command: {e}")),
-    };
-
-    // Poll instead of blocking so a hanging command cannot stall the agent.
-    let started = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if started.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return ToolResult::err(format!(
-                        "command timed out after {}s and was killed: {command}",
-                        timeout.as_secs()
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(80));
-            }
-            Err(e) => return ToolResult::err(format!("cannot wait for command: {e}")),
+impl Shell {
+    pub fn name(self) -> &'static str {
+        match self {
+            Shell::Bash => "bash",
+            Shell::PowerShell => "powershell",
+            Shell::Cmd => "cmd",
         }
     }
 
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => return ToolResult::err(format!("cannot collect output: {e}")),
+    fn parse(s: &str) -> Option<Shell> {
+        match s.trim().to_lowercase().as_str() {
+            "bash" | "sh" | "zsh" | "git-bash" | "gitbash" => Some(Shell::Bash),
+            "powershell" | "pwsh" | "ps" | "ps1" => Some(Shell::PowerShell),
+            "cmd" | "cmd.exe" | "batch" => Some(Shell::Cmd),
+            _ => None,
+        }
+    }
+}
+
+/// Git for Windows' bash.exe, looked up once: the usual install folders,
+/// then next to a git.exe on PATH. (NOT System32\bash.exe — that is WSL.)
+#[cfg(windows)]
+pub fn git_bash() -> Option<PathBuf> {
+    static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            let mut candidates = Vec::new();
+            for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+                if let Some(base) = std::env::var_os(var).map(PathBuf::from) {
+                    candidates.push(base.join("Git").join("bin").join("bash.exe"));
+                    candidates.push(base.join("Programs").join("Git").join("bin").join("bash.exe"));
+                }
+            }
+            if let Some(path) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&path) {
+                    if dir.join("git.exe").is_file() {
+                        // <git>/cmd/git.exe or <git>/mingw64/bin/git.exe
+                        for up in dir.ancestors().skip(1).take(2) {
+                            candidates.push(up.join("bin").join("bash.exe"));
+                        }
+                    }
+                }
+            }
+            candidates.into_iter().find(|p| p.is_file())
+        })
+        .clone()
+}
+
+/// Where a command runs when the model does not pick a shell. Models write
+/// bash far more reliably than anything else, so bash wins wherever it
+/// exists; plain Windows falls back to PowerShell, whose aliases (ls, cat,
+/// rm, cp, mv, pwd) forgive much more than cmd.
+pub fn default_shell() -> Shell {
+    #[cfg(windows)]
+    {
+        if git_bash().is_some() {
+            Shell::Bash
+        } else {
+            Shell::PowerShell
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Shell::Bash
+    }
+}
+
+/// One paragraph for the prompt: OS and shell facts the model must know
+/// before writing its first command.
+pub fn shell_summary() -> String {
+    #[cfg(windows)]
+    {
+        if git_bash().is_some() {
+            "OS: Windows. run_command uses Git Bash by default: write bash (ls, cat, grep, rm -rf, &&, $VAR). \
+             Paths: C:/Users/me/x or /c/Users/me/x (never unquoted backslashes). \
+             Windows programs (npm, python, cargo, git, dotnet) work as usual. \
+             Pass shell:\"powershell\" or shell:\"cmd\" only for Windows-specific commands."
+                .into()
+        } else {
+            "OS: Windows, no bash installed. run_command uses Windows PowerShell 5.1 by default: \
+             write PowerShell (Get-ChildItem, Remove-Item -Recurse -Force, New-Item -ItemType Directory, \
+             $env:NAME = 'x', `;` between commands — `&&` is not supported). \
+             Unix tools (grep, sed, awk, touch, which, head) do NOT exist; use the built-in tools instead. \
+             shell:\"cmd\" is also available."
+                .into()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        format!("OS: {}. run_command uses bash.", std::env::consts::OS)
+    }
+}
+
+/// Environment for every agent command: no pagers, no prompts, no colour
+/// codes, UTF-8 Python — the classic ways a command hangs or garbles.
+fn quiet_env(c: &mut Command) {
+    for (k, v) in [
+        ("GIT_PAGER", "cat"),
+        ("PAGER", "cat"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("GIT_EDITOR", "true"),
+        ("NO_COLOR", "1"),
+        ("FORCE_COLOR", "0"),
+        ("TERM", "dumb"),
+        ("npm_config_yes", "true"),
+        ("npm_config_fund", "false"),
+        ("npm_config_audit", "false"),
+        ("PIP_NO_INPUT", "1"),
+        ("PYTHONIOENCODING", "utf-8"),
+        ("PYTHONUTF8", "1"),
+        ("PYTHONUNBUFFERED", "1"),
+        ("DEBIAN_FRONTEND", "noninteractive"),
+    ] {
+        c.env(k, v);
+    }
+    // cmd ignores a PATH longer than 8191 chars — it then cannot find even
+    // ping or chcp. System folders first, duplicates and missing folders
+    // dropped, the rest kept while it fits.
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("PATH") {
+        let sys = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()));
+        let first = [
+            sys.join("System32"),
+            sys.clone(),
+            sys.join("System32").join("Wbem"),
+            sys.join("System32").join("WindowsPowerShell").join("v1.0"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        let mut len = 0usize;
+        let dirs: Vec<PathBuf> = first
+            .into_iter()
+            .chain(std::env::split_paths(&path))
+            .filter(|d| {
+                let key = d.to_string_lossy().to_lowercase().trim_end_matches(['\\', '/']).to_string();
+                let keep = d.is_dir() && len + key.len() < 8000 && seen.insert(key.clone());
+                if keep {
+                    len += key.len() + 1;
+                }
+                keep
+            })
+            .collect();
+        if let Ok(joined) = std::env::join_paths(dirs) {
+            c.env("PATH", joined);
+        }
+    }
+    c.stdin(std::process::Stdio::null());
+}
+
+/// `a && b` for Windows PowerShell 5.1, which has no `&&`: `a; if ($?) { b }`.
+/// Only for commands without quotes — inside a string `&&` is text.
+fn ps_and_chain(command: &str) -> String {
+    if !command.contains("&&") || command.contains(['"', '\'']) {
+        return command.to_string();
+    }
+    let parts: Vec<&str> = command.split("&&").map(str::trim).collect();
+    let mut out = parts[0].to_string();
+    for part in &parts[1..] {
+        out.push_str("; if ($?) { ");
+        out.push_str(part);
+    }
+    out.push_str(&" }".repeat(parts.len() - 1));
+    out
+}
+
+/// The OS process for `command` in `shell`.
+fn shell_process(shell: Shell, command: &str) -> Command {
+    #[cfg(windows)]
+    {
+        use base64::Engine;
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW keeps a console window from flashing on every call.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let bash = if shell == Shell::Bash { git_bash() } else { None };
+        let mut c = match (shell, bash) {
+            (Shell::Bash, Some(bash)) => {
+                let mut c = Command::new(bash);
+                // chcp: native Windows programs then print UTF-8, not cp866.
+                c.args(["-c", &format!("chcp.com 65001 >/dev/null 2>&1; {command}")]);
+                c
+            }
+            (Shell::Cmd, _) => {
+                let mut c = Command::new("cmd");
+                c.args(["/C", &format!("chcp 65001>nul & {command}")]);
+                c
+            }
+            // PowerShell — also the stand-in when bash was asked for but is
+            // not installed. -EncodedCommand sidesteps every quoting rule.
+            _ => {
+                let script = format!(
+                    "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$OutputEncoding=[Text.Encoding]::UTF8\n\
+                     $ProgressPreference='SilentlyContinue'\n{}\n\
+                     if (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }} else {{ exit 1 }} }}\nexit 0",
+                    ps_and_chain(command)
+                );
+                let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+                let mut c = Command::new("powershell");
+                c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"])
+                    .arg(base64::engine::general_purpose::STANDARD.encode(utf16));
+                c
+            }
+        };
+        c.creation_flags(CREATE_NO_WINDOW);
+        c
+    }
+    #[cfg(not(windows))]
+    {
+        let sh = match shell {
+            Shell::Bash if Path::new("/bin/bash").exists() => "/bin/bash",
+            _ => "/bin/sh",
+        };
+        let mut c = Command::new(sh);
+        c.args(["-c", command]);
+        c
+    }
+}
+
+static ANSI: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\r(?:[^\n])").unwrap());
+
+/// Drops colour codes and progress-bar carriage returns.
+fn strip_ansi(text: &str) -> String {
+    ANSI.replace_all(text, |c: &regex::Captures| {
+        let m = c.get(0).map(|m| m.as_str()).unwrap_or("");
+        // "\rX" (progress redraw) → keep X on a fresh line.
+        if let Some(rest) = m.strip_prefix('\r') {
+            format!("\n{rest}")
+        } else {
+            String::new()
+        }
+    })
+    .into_owned()
+}
+
+/// Commands that exist in bash but not in cmd / PowerShell 5.1.
+const UNIX_ONLY: &[&str] = &[
+    "grep", "sed", "awk", "touch", "which", "head", "tail", "export", "chmod", "wc", "xargs", "find",
+    "rm", "cp", "mv", "ls", "cat", "source", "unzip", "tar", "less",
+];
+
+/// A one-line next step for the classic failures, so the model changes
+/// approach instead of retrying the same broken command.
+fn failure_hint(shell: Shell, command: &str, code: i32, text: &str) -> Option<String> {
+    let low = text.to_lowercase();
+    let first = command
+        .split(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '|')
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .trim_matches(['"', '\''])
+        .to_string();
+    let not_found = (shell == Shell::Bash && code == 127)
+        || low.contains("command not found")
+        || low.contains("is not recognized as")
+        || low.contains("не является внутренней или внешней")
+        || low.contains("не распознано как имя");
+    if not_found {
+        if shell != Shell::Bash && UNIX_ONLY.contains(&first.as_str()) {
+            let bash = if default_shell() == Shell::Bash {
+                "pass shell:\"bash\" to run it in Git Bash, or "
+            } else {
+                ""
+            };
+            return Some(format!(
+                "hint: `{first}` is a Unix command and this ran in {}. Either {bash}use the built-in tools \
+                 (list_dir, read_file, find_files, grep, file_op) instead.",
+                shell.name()
+            ));
+        }
+        let check = if shell == Shell::Bash { "command -v NAME" } else { "where.exe NAME" };
+        return Some(format!(
+            "hint: a program in this command is not installed or not on PATH. Check with `{check}` \
+             (or look for a local one, e.g. `npx NAME`, `python -m NAME`); do not retry the same command."
+        ));
+    }
+    if shell == Shell::PowerShell && command.contains("&&") {
+        return Some("hint: Windows PowerShell 5.1 has no `&&` — use `;` or `cmd1; if ($?) { cmd2 }`.".into());
+    }
+    if low.contains("no such file or directory")
+        || low.contains("cannot find the path")
+        || low.contains("cannot find path")
+        || low.contains("не удается найти")
+        || low.contains("системе не удается")
+    {
+        return Some(
+            "hint: a path in the command does not exist. Relative paths start at the working directory \
+             shown above; locate files with find_files or list_dir instead of guessing."
+                .into(),
+        );
+    }
+    if low.contains("permission denied") || low.contains("access is denied") || low.contains("отказано в доступе") {
+        return Some(
+            "hint: access denied — the file may be open in another program (a running dev server, the IDE) \
+             or need admin rights. Do not retry unchanged."
+                .into(),
+        );
+    }
+    None
+}
+
+/// Truncates from the middle so both the start and the end stay visible.
+/// Slices on CHAR boundaries — byte slicing panicked on Cyrillic output.
+fn clip_middle(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
+    }
+    fn cut(s: &str, at: usize) -> usize {
+        let mut i = at.min(s.len());
+        while i > 0 && !s.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    }
+    let head_end = cut(&text, max / 2);
+    let tail_start = cut(&text, text.len().saturating_sub(max / 2));
+    format!("{}\n\n… output truncated …\n\n{}", &text[..head_end], &text[tail_start..])
+}
+
+/// How long a background command is watched before the tool returns.
+const BACKGROUND_WATCH: Duration = Duration::from_secs(5);
+
+/// Runs a command in `cwd` (the workspace when unset) and returns its output.
+///
+/// `background` is for dev servers and watchers that never exit: the process
+/// keeps running, its output goes to a log file, and the tool returns after
+/// a few seconds with the pid and what it printed so far.
+pub fn run_command(
+    root: &Path,
+    command: &str,
+    cwd: Option<&str>,
+    timeout_secs: Option<u64>,
+    shell: Option<&str>,
+    background: bool,
+) -> ToolResult {
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(COMMAND_TIMEOUT_SECS).clamp(1, 600));
+    let shell = shell.and_then(Shell::parse).unwrap_or_else(default_shell);
+
+    // Relative cwd joins the workspace; unset means the workspace itself.
+    let workdir = match cwd.map(str::trim) {
+        Some(c) if !c.is_empty() => match resolve(root, c) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::err(e),
+        },
+        _ => root.to_path_buf(),
+    };
+    if !workdir.is_dir() {
+        return ToolResult::err(format!("working directory does not exist.\n{}", not_found(root, cwd.unwrap_or(""))));
+    }
+    let where_ = format!("[{} in {}]", shell.name(), workdir.display());
+
+    let mut proc = shell_process(shell, command);
+    proc.current_dir(&workdir);
+    quiet_env(&mut proc);
+
+    let log_path = std::env::temp_dir().join(format!(
+        "singularity-bg-{}.log",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    if background {
+        let log = match std::fs::File::create(&log_path) {
+            Ok(f) => f,
+            Err(e) => return ToolResult::err(format!("cannot create the log file: {e}")),
+        };
+        let Ok(log2) = log.try_clone() else {
+            return ToolResult::err("cannot create the log file");
+        };
+        proc.stdout(log).stderr(log2);
+    } else {
+        proc.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    }
+
+    let mut child = match proc.spawn() {
+        Ok(c) => c,
+        Err(e) => return ToolResult::err(format!("cannot start {}: {e}", shell.name())),
     };
 
-    let mut text = decode_console(&output.stdout);
-    let stderr = decode_console(&output.stderr);
+    if background {
+        let started = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break Some(st),
+                Ok(None) if started.elapsed() < BACKGROUND_WATCH => std::thread::sleep(Duration::from_millis(100)),
+                _ => break None,
+            }
+        };
+        let log = std::fs::read(&log_path).map(|b| strip_ansi(&decode_console(&b))).unwrap_or_default();
+        let log = clip_middle(log, 6_000);
+        return match status {
+            Some(st) => {
+                let code = st.code().unwrap_or(-1);
+                let body = format!("exit code {code} {where_} — exited within {}s\n{log}", BACKGROUND_WATCH.as_secs());
+                if st.success() { ToolResult::ok(body) } else { ToolResult::err(body) }
+            }
+            None => {
+                let pid = child.id();
+                let stop = if cfg!(windows) { format!("taskkill /T /F /PID {pid}") } else { format!("kill {pid}") };
+                ToolResult::ok(format!(
+                    "running in the background, pid {pid} {where_}\nfull log: {} (read_file it for later output)\nstop it with: {stop}\n--- output so far ---\n{}",
+                    log_path.display(),
+                    if log.trim().is_empty() { "(nothing yet)".into() } else { log }
+                ))
+            }
+        };
+    }
+
+    // Read both pipes on their own threads: a chatty command blocks once a
+    // pipe buffer fills, and polling try_wait alone then never saw it exit.
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_thread = std::thread::spawn(move || drain(out_pipe.take()));
+    let err_thread = std::thread::spawn(move || drain(err_pipe.take()));
+
+    // Poll instead of blocking so a hanging command cannot stall the agent.
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if started.elapsed() > timeout {
+                    kill_tree(&mut child);
+                    let partial = String::from_utf8_lossy(&out_thread.join().unwrap_or_default()).into_owned();
+                    return ToolResult::err(format!(
+                        "command timed out after {}s and was killed {where_}: {command}\n\
+                         hint: if it is a dev server or watcher that never exits, run it with background:true; \
+                         if it waits for input, pass the answer as a flag (--yes, -y).\n--- output before the kill ---\n{}",
+                        timeout.as_secs(),
+                        clip_middle(strip_ansi(&partial), 6_000)
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return ToolResult::err(format!("cannot wait for command: {e}")),
+        }
+    };
+
+    let mut text = strip_ansi(&decode_console(&out_thread.join().unwrap_or_default()));
+    let stderr = strip_ansi(&decode_console(&err_thread.join().unwrap_or_default()));
     if !stderr.trim().is_empty() {
         if !text.is_empty() {
             text.push('\n');
@@ -548,36 +1117,257 @@ pub fn run_command(root: &Path, command: &str, cwd: Option<&str>, timeout_secs: 
         text.push_str("stderr:\n");
         text.push_str(&stderr);
     }
-
-    // Truncate from the middle so both the start and the end stay visible.
-    // Slice on CHAR boundaries — byte slicing here panicked on any Cyrillic
-    // output ("byte index is not a char boundary").
-    if text.len() > MAX_OUTPUT_BYTES {
-        fn cut(s: &str, at: usize) -> usize {
-            let mut i = at.min(s.len());
-            while i > 0 && !s.is_char_boundary(i) {
-                i -= 1;
-            }
-            i
-        }
-        let head_end = cut(&text, MAX_OUTPUT_BYTES / 2);
-        let tail_start = cut(&text, text.len().saturating_sub(MAX_OUTPUT_BYTES / 2));
-        let head = &text[..head_end];
-        let tail = &text[tail_start..];
-        text = format!("{head}\n\n… output truncated …\n\n{tail}");
-    }
+    let mut text = clip_middle(text, MAX_OUTPUT_BYTES);
     if text.trim().is_empty() {
         text = "(no output)".into();
     }
 
-    let code = output.status.code().unwrap_or(-1);
-    let body = format!("exit code {code}\n{text}");
-
-    if output.status.success() {
+    let code = status.code().unwrap_or(-1);
+    let mut body = format!("exit code {code} {where_}\n{text}");
+    if status.success() {
         ToolResult::ok(body)
     } else {
+        if let Some(hint) = failure_hint(shell, command, code, &text) {
+            body.push_str("\n\n");
+            body.push_str(&hint);
+        }
         ToolResult::err(body)
     }
+}
+
+/// Reads a child pipe to the end (on its own thread).
+fn drain(pipe: Option<impl std::io::Read>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if let Some(mut p) = pipe {
+        let _ = p.read_to_end(&mut buf);
+    }
+    buf
+}
+
+/// Kills a command and everything it started (a shell's children survive a
+/// plain kill on Windows).
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .creation_flags(0x0800_0000)
+            .output();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/* ---------- Ready-made operations ----------
+   Structured tools for what the model otherwise improvised as shell one-
+   liners — the source of most "command not found" / quoting failures,
+   especially on Windows. */
+
+/// `*.tsx`, `src/**/test_*.py`, `config*` → a case-insensitive regex. A
+/// pattern without `/` matches the file name anywhere in the tree.
+fn glob_regex(pattern: &str) -> Option<Regex> {
+    let pat = pattern.trim().replace('\\', "/");
+    let pat = pat.trim_start_matches("./");
+    let name_only = !pat.contains('/');
+    let mut re = String::from("(?i)^");
+    let chars: Vec<char> = pat.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' if chars.get(i + 1) == Some(&'*') => {
+                // "**/" = any number of folders (including none)
+                if chars.get(i + 2) == Some(&'/') {
+                    re.push_str("(?:.*/)?");
+                    i += 3;
+                } else {
+                    re.push_str(".*");
+                    i += 2;
+                }
+                continue;
+            }
+            '*' => re.push_str("[^/]*"),
+            '?' => re.push_str("[^/]"),
+            '{' => re.push_str("(?:"),
+            '}' => re.push(')'),
+            ',' => re.push('|'),
+            c => re.push_str(&regex::escape(&c.to_string())),
+        }
+        i += 1;
+    }
+    re.push('$');
+    let re = if name_only { re.replacen("(?i)^", "(?i)(?:^|/)", 1) } else { re };
+    Regex::new(&re).ok()
+}
+
+/// Files (and folders) under `path` whose relative path matches `pattern`.
+pub fn find_files(root: &Path, pattern: &str, path: Option<&str>) -> ToolResult {
+    let base = match resolve(root, path.unwrap_or("")) {
+        Ok(p) => p,
+        Err(e) => return ToolResult::err(e),
+    };
+    if !base.is_dir() {
+        return ToolResult::err(not_found(root, path.unwrap_or("")));
+    }
+    let Some(re) = glob_regex(pattern) else {
+        return ToolResult::err(format!("bad pattern: {pattern}"));
+    };
+    let hits: Vec<String> = workspace_files(&base)
+        .into_iter()
+        .filter(|f| re.is_match(f.trim_end_matches('/')))
+        .take(300)
+        .collect();
+    if hits.is_empty() {
+        return ToolResult::ok(format!("no files match {pattern:?} under {}", base.display()));
+    }
+    let more = if hits.len() == 300 { "\n… (first 300 shown — narrow the pattern)" } else { "" };
+    ToolResult::ok(format!("{} (paths relative to it):\n{}{more}", base.display(), hits.join("\n")))
+}
+
+fn copy_recursive(from: &Path, to: &Path) -> std::io::Result<u64> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        let mut n = 0;
+        for e in std::fs::read_dir(from)? {
+            let e = e?;
+            n += copy_recursive(&e.path(), &to.join(e.file_name()))?;
+        }
+        Ok(n)
+    } else {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(from, to).map(|_| 1)
+    }
+}
+
+/// mkdir / move / copy / delete / info on files and folders — without a shell.
+pub fn file_op(root: &Path, op: &str, path: &str, to: &str) -> ToolResult {
+    let src = match resolve(root, path) {
+        Ok(p) => p,
+        Err(e) => return ToolResult::err(e),
+    };
+    let dest = || resolve(root, to);
+    let shown = src.display().to_string();
+    match op {
+        "mkdir" => match std::fs::create_dir_all(&src) {
+            Ok(()) => ToolResult::ok(format!("created folder {shown}")),
+            Err(e) => ToolResult::err(format!("cannot create {shown}: {e}")),
+        },
+        "info" | "exists" => match std::fs::metadata(&src) {
+            Ok(m) => ToolResult::ok(format!(
+                "{shown}: {}, {} bytes",
+                if m.is_dir() { "folder" } else { "file" },
+                m.len()
+            )),
+            Err(_) => ToolResult::ok(format!("{shown} does not exist")),
+        },
+        "move" | "rename" | "copy" => {
+            if to.trim().is_empty() {
+                return ToolResult::err(format!("{op} needs `to`"));
+            }
+            if !src.exists() {
+                return ToolResult::err(not_found(root, path));
+            }
+            let mut target = match dest() {
+                Ok(p) => p,
+                Err(e) => return ToolResult::err(e),
+            };
+            // Into an existing folder → keep the name, like mv/cp.
+            if target.is_dir() {
+                if let Some(name) = src.file_name() {
+                    target = target.join(name);
+                }
+            }
+            if target.exists() {
+                return ToolResult::err(format!("{} already exists — delete it first or pick another name", target.display()));
+            }
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let res = if op == "copy" {
+                copy_recursive(&src, &target).map(|n| format!("copied {shown} → {} ({n} files)", target.display()))
+            } else {
+                std::fs::rename(&src, &target)
+                    .or_else(|_| copy_recursive(&src, &target).and_then(|_| remove_any(&src)))
+                    .map(|_| format!("moved {shown} → {}", target.display()))
+            };
+            match res {
+                Ok(msg) => ToolResult::ok(msg),
+                Err(e) => ToolResult::err(format!("{op} failed: {e}")),
+            }
+        }
+        "delete" => {
+            if !src.exists() {
+                return ToolResult::ok(format!("{shown} does not exist (nothing to delete)"));
+            }
+            match remove_any(&src) {
+                Ok(()) => ToolResult::ok(format!("deleted {shown}")),
+                Err(e) => ToolResult::err(format!("cannot delete {shown}: {e}")),
+            }
+        }
+        other => ToolResult::err(format!("unknown op {other:?} — use mkdir, move, copy, delete or info")),
+    }
+}
+
+fn remove_any(p: &Path) -> std::io::Result<()> {
+    if p.is_dir() {
+        std::fs::remove_dir_all(p)
+    } else {
+        std::fs::remove_file(p)
+    }
+}
+
+/// Git subcommands that never change anything.
+pub const GIT_READ_ONLY: &[&str] = &["status", "diff", "log", "show", "blame", "branch", "remote", "rev-parse", "ls-files", "shortlog", "describe", "tag"];
+
+/// Runs git directly (no shell, so no quoting problems) in `cwd`.
+pub fn git(root: &Path, subcommand: &str, args: &[String], cwd: Option<&str>) -> ToolResult {
+    let sub = subcommand.trim().trim_start_matches("git ").trim();
+    if sub.is_empty() || sub.contains(char::is_whitespace) {
+        return ToolResult::err("`subcommand` is ONE git subcommand (status, diff, commit…); put the rest in `args`");
+    }
+    let workdir = match cwd.map(str::trim) {
+        Some(c) if !c.is_empty() => match resolve(root, c) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::err(e),
+        },
+        _ => root.to_path_buf(),
+    };
+    let mut c = Command::new("git");
+    c.arg("-c").arg("core.quotepath=off").arg("-c").arg("color.ui=never").arg(sub);
+    // Default summaries that fit the context.
+    if sub == "log" && !args.iter().any(|a| a.starts_with("-n") || a.starts_with("--max-count") || a.starts_with('-') && a[1..].parse::<u32>().is_ok()) {
+        c.arg("-n").arg("20");
+    }
+    c.args(args).current_dir(&workdir);
+    quiet_env(&mut c);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000);
+    }
+    let out = match c.output() {
+        Ok(o) => o,
+        Err(e) => return ToolResult::err(format!("cannot run git (is it installed?): {e}")),
+    };
+    let mut text = decode_console(&out.stdout);
+    let err = decode_console(&out.stderr);
+    if !err.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&err);
+    }
+    let text = clip_middle(text, MAX_OUTPUT_BYTES);
+    let body = format!(
+        "git {sub} {} [in {}] → exit {}\n{}",
+        args.join(" "),
+        workdir.display(),
+        out.status.code().unwrap_or(-1),
+        if text.trim().is_empty() { "(no output)" } else { &text }
+    );
+    if out.status.success() { ToolResult::ok(body) } else { ToolResult::err(body) }
 }
 
 /// Decodes command output the way the user's console actually wrote it.
@@ -615,7 +1405,12 @@ pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult
         ),
         "write_file" => write_file(root, s("path"), s("content")),
         "edit_file" => edit_file(root, s("path"), s("old_text"), s("new_text")),
-        "apply_patch" => apply_patch(root, s("path"), s("diff")),
+        "apply_patch" => apply_patch(
+            root,
+            s("path"),
+            s("diff"),
+            args.get("create").and_then(|v| v.as_bool()).unwrap_or(false),
+        ),
         "list_dir" => list_dir(root, s("path")),
         "grep" => grep(root, s("pattern"), args.get("path").and_then(|v| v.as_str())),
         "run_command" => run_command(
@@ -623,7 +1418,20 @@ pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult
             s("command"),
             args.get("cwd").and_then(|v| v.as_str()),
             args.get("timeout_secs").and_then(|v| v.as_u64()),
+            args.get("shell").and_then(|v| v.as_str()),
+            args.get("background").and_then(|v| v.as_bool()).unwrap_or(false),
         ),
+        "find_files" => find_files(root, s("pattern"), args.get("path").and_then(|v| v.as_str())),
+        "file_op" => file_op(root, s("op"), s("path"), s("to")),
+        "git" => {
+            let list: Vec<String> = match args.get("args") {
+                Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+                // A model that sends one string gets it split on spaces.
+                Some(serde_json::Value::String(t)) => t.split_whitespace().map(String::from).collect(),
+                _ => Vec::new(),
+            };
+            git(root, s("subcommand"), &list, args.get("cwd").and_then(|v| v.as_str()))
+        }
         other => ToolResult::err(format!("unknown tool: {other}")),
     }
 }
@@ -674,6 +1482,74 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_model_paths() {
+        assert_eq!(normalize_path("  \"src/a.rs\" "), "src/a.rs");
+        assert_eq!(normalize_path("`src/a.rs`"), "src/a.rs");
+        if cfg!(windows) {
+            assert_eq!(normalize_path("/c/Users/x"), "C:/Users/x");
+            assert_eq!(normalize_path("/mnt/d/p"), "D:/p");
+            assert_eq!(normalize_path("file:///C:/a/b"), "C:/a/b");
+        }
+    }
+
+    #[test]
+    fn locate_ignores_indentation_and_crlf() {
+        let file = "fn a() {\r\n    let x = 1;\r\n    let y = 2;\r\n}\r\n";
+        let search = match_endings(file, "let x = 1;\nlet y = 2;");
+        let replace = match_endings(file, "let x = 10;\nlet y = 20;");
+        let (s, e, r) = locate(file, &search, &replace).unwrap();
+        let out = format!("{}{}{}", &file[..s], r, &file[e..]);
+        assert_eq!(out, "fn a() {\r\n    let x = 10;\r\n    let y = 20;\r\n}\r\n");
+        assert_eq!(locate("a\na\n", "a", "b"), Err(2));
+    }
+
+    #[test]
+    fn glob_matches() {
+        let re = glob_regex("*.tsx").unwrap();
+        assert!(re.is_match("src/app/App.tsx"));
+        assert!(!re.is_match("src/app/App.ts"));
+        let re = glob_regex("src/**/*.rs").unwrap();
+        assert!(re.is_match("src/a.rs") && re.is_match("src/x/y/a.rs"));
+        assert!(glob_regex("*.{ts,tsx}").unwrap().is_match("a/b.ts"));
+    }
+
+    #[test]
+    fn ps_chain_rewrites_and() {
+        assert_eq!(ps_and_chain("cd a && npm i"), "cd a; if ($?) { npm i }");
+        assert_eq!(ps_and_chain("echo \"a && b\""), "echo \"a && b\"");
+    }
+
+    #[test]
+    fn runs_commands_in_default_shell() {
+        let dir = std::env::temp_dir();
+        let res = run_command(&dir, "echo hello", None, Some(30), None, false);
+        assert!(res.ok, "{}", res.output);
+        assert!(res.output.contains("hello"));
+        let bad = run_command(&dir, "definitely-not-a-command-xyz", None, Some(30), None, false);
+        assert!(!bad.ok);
+        assert!(bad.output.contains("hint:"), "{}", bad.output);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runs_in_every_windows_shell() {
+        let dir = std::env::temp_dir();
+        for sh in ["powershell", "cmd", "bash"] {
+            let res = run_command(&dir, "echo привет && echo two", None, Some(60), Some(sh), false);
+            assert!(res.ok, "{sh}: {}", res.output);
+            assert!(res.output.contains("привет") && res.output.contains("two"), "{sh}: {}", res.output);
+        }
+        let ps_fail = run_command(&dir, "Get-Item C:/definitely/missing", None, Some(60), Some("powershell"), false);
+        assert!(!ps_fail.ok, "{}", ps_fail.output);
+        for (sh, cmd) in [("bash", "echo started && sleep 30"), ("cmd", "ping -n 30 127.0.0.1")] {
+            let bg = run_command(&dir, cmd, None, None, Some(sh), true);
+            assert!(bg.ok && bg.output.contains("background"), "{sh}: {}", bg.output);
+            let pid = bg.output.split("pid ").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
+            let _ = run_command(&dir, &format!("taskkill /T /F /PID {pid}"), None, None, Some("cmd"), false);
+        }
+    }
+
+    #[test]
     fn apply_patch_edits_and_creates() {
         let dir = std::env::temp_dir().join(format!("sing-patch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -682,21 +1558,28 @@ mod tests {
 
         // Edit existing
         let diff = "<<<<<<< SEARCH\ntwo\n=======\nTWO\n>>>>>>> REPLACE";
-        let res = apply_patch(&dir, "a.txt", diff);
+        let res = apply_patch(&dir, "a.txt", diff, false);
         assert!(res.ok, "{}", res.output);
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\nTWO\nthree");
 
         // Create new via empty SEARCH
         let create = "<<<<<<< SEARCH\n=======\nfresh\n>>>>>>> REPLACE";
-        let res2 = apply_patch(&dir, "b.txt", create);
+        let refused = apply_patch(&dir, "b.txt", create, false);
+        assert!(!refused.ok && !dir.join("b.txt").exists(), "{}", refused.output);
+        let res2 = apply_patch(&dir, "b.txt", create, true);
         assert!(res2.ok, "{}", res2.output);
         assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "fresh\n");
 
         // Missing SEARCH side → error, file untouched
         let bad = "<<<<<<< SEARCH\nnope\n=======\nx\n>>>>>>> REPLACE";
-        let res3 = apply_patch(&dir, "a.txt", bad);
+        let res3 = apply_patch(&dir, "a.txt", bad, false);
         assert!(!res3.ok);
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\nTWO\nthree");
+
+        // A guessed path in a missing folder, same name as an existing file.
+        let guess = apply_patch(&dir, "nope/a.txt", create, true);
+        assert!(!guess.ok && guess.output.contains("refusing"), "{}", guess.output);
+        assert!(!dir.join("nope").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

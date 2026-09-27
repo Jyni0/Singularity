@@ -486,7 +486,7 @@ function AddProvider({
         <button
           className={PRIMARY_BUTTON}
           onClick={submit}
-          disabled={busy || !name.trim() || (template.needsKey && !keyOptional && !apiKey.trim())}
+          disabled={busy || !name.trim() || (template.needsKey && !keyOptional && !db.isLocalUrl(baseUrl) && !apiKey.trim())}
         >
           {busy ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
           Add provider

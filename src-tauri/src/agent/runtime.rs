@@ -39,7 +39,7 @@ use rig_agent::tool::{DynamicTool, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
 
@@ -68,9 +68,19 @@ struct RunCtx {
     started: std::time::Instant,
     /// MCP tool name → (server name, read-only hint) for the approval gate.
     mcp_tools: Arc<HashMap<String, (String, bool)>>,
+    /// Working directory of file tools and commands; `change_dir` moves it.
+    /// Starts at the workspace.
+    cwd: Arc<Mutex<PathBuf>>,
+    /// Set once the provider rejected the temperature parameter (reasoning
+    /// models, out-of-range values): later requests go without it.
+    no_temperature: Arc<AtomicBool>,
 }
 
 impl RunCtx {
+    fn cwd(&self) -> PathBuf {
+        self.cwd.lock().unwrap().clone()
+    }
+
     fn step_for(&self, internal_id: &str) -> usize {
         let mut map = self.steps.lock().unwrap();
         *map.entry(internal_id.to_string())
@@ -243,7 +253,13 @@ impl AgentHook for UiHook {
                 place: format!("MCP server {server}"),
                 reason: String::new(),
             }),
-            None => permission_gate(event.tool_name, &args, &self.ctx.req.workspace, self.ctx.req.auto_run),
+            None => permission_gate(
+                event.tool_name,
+                &args,
+                &self.ctx.req.workspace,
+                &self.ctx.cwd().to_string_lossy(),
+                self.ctx.req.auto_run,
+            ),
         };
         if let Some(gate) = gate {
             let approved = {
@@ -285,8 +301,25 @@ struct Gate {
 /// Decides whether a tool call must wait for the user. `reason` is empty
 /// for the plain "commands need approval" case and names the danger
 /// otherwise.
-fn permission_gate(tool: &str, args: &Value, workspace: &str, auto_run: bool) -> Option<Gate> {
+fn permission_gate(tool: &str, args: &Value, workspace: &str, cwd: &str, auto_run: bool) -> Option<Gate> {
     let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    // A file the call writes / reads: sensitive paths always ask, writes
+    // outside the project ask unless the project auto-runs.
+    let path_gate = |path: &str, write: bool, verb: &str| -> Option<Gate> {
+        let full = full_path(cwd, path);
+        let reason = if let Some(why) = crate::safety::sensitive_path(&full.to_string_lossy(), write) {
+            format!("{} {}", if write { "Writes a file that" } else { "Reads a file that" }, why)
+        } else if write && !auto_run && !is_inside(&full, Path::new(workspace)) {
+            "Writes outside the project folder".to_string()
+        } else {
+            return None;
+        };
+        Some(Gate {
+            what: format!("{verb} {}", full.display()),
+            place: workspace.to_string(),
+            reason,
+        })
+    };
     match tool {
         "run_command" | "ssh_exec" => {
             let cmd = get("command");
@@ -297,9 +330,9 @@ fn permission_gate(tool: &str, args: &Value, workspace: &str, auto_run: bool) ->
             let place = if tool == "ssh_exec" {
                 format!("server {}", get("server"))
             } else if get("cwd").is_empty() {
-                workspace.to_string()
+                cwd.to_string()
             } else {
-                get("cwd").to_string()
+                full_path(cwd, get("cwd")).display().to_string()
             };
             Some(Gate {
                 what: cmd.to_string(),
@@ -307,22 +340,49 @@ fn permission_gate(tool: &str, args: &Value, workspace: &str, auto_run: bool) ->
                 reason: risky.map(|r| format!("Risky command: {r}")).unwrap_or_default(),
             })
         }
-        "read_file" | "list_dir" | "grep" | "apply_patch" | "write_file" | "edit_file" => {
-            let path = get("path");
-            let write = matches!(tool, "apply_patch" | "write_file" | "edit_file");
-            let full = full_path(workspace, path);
-            let reason = if let Some(why) = crate::safety::sensitive_path(&full.to_string_lossy(), write) {
-                format!("{} {}", if write { "Writes a file that" } else { "Reads a file that" }, why)
-            } else if write && !auto_run && !is_inside(&full, Path::new(workspace)) {
-                "Writes outside the project folder".to_string()
-            } else {
-                return None;
+        "git" => {
+            let sub = get("subcommand").trim().to_string();
+            let rest = match args.get("args") {
+                Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "),
+                Some(Value::String(t)) => t.clone(),
+                _ => String::new(),
             };
+            let line = format!("git {sub} {rest}").trim().to_string();
+            let risky = crate::safety::risky_command(&line);
+            // Read-only subcommands never ask (a `branch`/`tag`/`remote`
+            // with arguments may change things, so those do).
+            let read_only = tools::GIT_READ_ONLY.contains(&sub.as_str())
+                && (rest.is_empty() || !matches!(sub.as_str(), "branch" | "tag" | "remote"));
+            if risky.is_none() && (read_only || auto_run) {
+                return None;
+            }
             Some(Gate {
-                what: format!("{} {}", if write { "edit" } else { "read" }, full.display()),
-                place: workspace.to_string(),
-                reason,
+                what: line,
+                place: if get("cwd").is_empty() { cwd.to_string() } else { full_path(cwd, get("cwd")).display().to_string() },
+                reason: risky.map(|r| format!("Risky command: {r}")).unwrap_or_default(),
             })
+        }
+        "file_op" => match get("op") {
+            "info" | "exists" => None,
+            "delete" => {
+                let full = full_path(cwd, get("path"));
+                let inside = is_inside(&full, Path::new(workspace));
+                if auto_run && inside && crate::safety::sensitive_path(&full.to_string_lossy(), true).is_none() {
+                    return None;
+                }
+                Some(Gate {
+                    what: format!("delete {}", full.display()),
+                    place: workspace.to_string(),
+                    reason: if inside { String::new() } else { "Deletes outside the project folder".into() },
+                })
+            }
+            "move" | "rename" => path_gate(get("path"), true, "move").or_else(|| path_gate(get("to"), true, "move to")),
+            "copy" => path_gate(get("to"), true, "copy to"),
+            _ => path_gate(get("path"), true, "create"),
+        },
+        "read_file" | "list_dir" | "grep" | "find_files" | "apply_patch" | "write_file" | "edit_file" => {
+            let write = matches!(tool, "apply_patch" | "write_file" | "edit_file");
+            path_gate(get("path"), write, if write { "edit" } else { "read" })
         }
         _ => None,
     }
@@ -363,7 +423,10 @@ fn live_summary(name: &str, args: &str) -> String {
     }
     let key = match name {
         "run_command" | "ssh_exec" => "command",
-        "grep" => "pattern",
+        "grep" | "find_files" => "pattern",
+        "web_search" => "query",
+        "web_fetch" => "url",
+        "git" => "subcommand",
         "delegate" => "agent",
         "skill" => "name",
         _ => "path",
@@ -441,15 +504,26 @@ fn fs_tools(ctx: &RunCtx) -> Vec<DynamicTool> {
                     let c = c.clone();
                     let tool_name = tool_name.clone();
                     Box::pin(async move {
-                        let res = if tool_name == "ssh_exec" {
-                            run_ssh_tool(&c.app, &c.req, &args).await
-                        } else {
-                            // Tools block (file IO, processes): keep the async
-                            // workers free so events keep flowing.
-                            let root = c.root.clone();
-                            tokio::task::spawn_blocking(move || tools::dispatch(&root, &tool_name, &args))
-                                .await
-                                .unwrap_or_else(|e| tools::ToolResult::err(format!("tool task failed: {e}")))
+                        let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let res = match tool_name.as_str() {
+                            "ssh_exec" => run_ssh_tool(&c.app, &c.req, &args).await,
+                            "web_search" => {
+                                let max = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+                                crate::web::search(&get("query"), max).await
+                            }
+                            "web_fetch" => {
+                                let start = args.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                crate::web::fetch(&get("url"), start).await
+                            }
+                            "change_dir" => change_dir(&c, &get("path")),
+                            _ => {
+                                // Tools block (file IO, processes): keep the async
+                                // workers free so events keep flowing.
+                                let root = c.cwd();
+                                tokio::task::spawn_blocking(move || tools::dispatch(&root, &tool_name, &args))
+                                    .await
+                                    .unwrap_or_else(|e| tools::ToolResult::err(format!("tool task failed: {e}")))
+                            }
                         };
                         let text = model_text(&res);
                         tctx.insert_result(res);
@@ -459,6 +533,27 @@ fn fs_tools(ctx: &RunCtx) -> Vec<DynamicTool> {
             )
         })
         .collect()
+}
+
+/// `change_dir`: moves the run's working directory (relative paths of every
+/// later file tool and command start there) and lists the new place.
+fn change_dir(ctx: &RunCtx, path: &str) -> tools::ToolResult {
+    let current = ctx.cwd();
+    let target = if path.trim().is_empty() {
+        ctx.root.clone()
+    } else {
+        match tools::resolve(&current, path) {
+            Ok(p) => p,
+            Err(e) => return tools::ToolResult::err(e),
+        }
+    };
+    if !target.is_dir() {
+        return tools::ToolResult::err(tools::not_found(&current, path));
+    }
+    let target = full_path(&target.to_string_lossy(), "");
+    *ctx.cwd.lock().unwrap() = target.clone();
+    let listing = tools::list_dir(&target, "");
+    tools::ToolResult::ok(format!("now in {}\n{}", target.display(), listing.output))
 }
 
 /// The single `delegate` tool that hands a task to a user-defined helper.
@@ -635,7 +730,7 @@ fn build_agent(ctx: &RunCtx, preamble: &str, tools: Vec<DynamicTool>) -> Result<
     let mut b = AgentBuilder::from_model_handle(setup.handle)
         .preamble(preamble)
         .default_max_turns(MAX_TURNS);
-    if let Some(t) = setup.temperature {
+    if let Some(t) = setup.temperature.filter(|_| !ctx.no_temperature.load(Ordering::Relaxed)) {
         b = b.temperature(t);
     }
     if let Some(m) = setup.max_tokens {
@@ -801,7 +896,29 @@ async fn run_with_retry(
         if err.starts_with(crate::cancel::STOPPED) || is_cancelled(&ctx.run_id) {
             return cancelled_result(text);
         }
-        if err.contains(GUARD_STOP) || attempt >= ctx.req.max_retries {
+        if err.contains(GUARD_STOP) {
+            return Err(err);
+        }
+        // The provider refused the temperature (reasoning models take none,
+        // Anthropic caps it at 1): drop it and go again at once — this used
+        // to burn every retry, 5 s apart, on the same 400.
+        if ctx.req.temperature.is_some()
+            && !ctx.no_temperature.load(Ordering::Relaxed)
+            && err.to_lowercase().contains("temperature")
+        {
+            ctx.no_temperature.store(true, Ordering::Relaxed);
+            emit_text(
+                &ctx.app,
+                &ctx.run_id,
+                "\n\n⚠️ This model does not accept the chosen temperature — continuing with its default.\n\n".to_string(),
+            );
+            if let Some((p, h)) = snapshot.lock().unwrap().take() {
+                prompt = p;
+                history = h;
+            }
+            continue;
+        }
+        if attempt >= ctx.req.max_retries {
             return Err(err);
         }
         attempt += 1;
@@ -898,10 +1015,26 @@ pub(super) async fn run(
                 .map(|b| (b.name.clone(), (b.server.name.clone(), b.tool.read_only)))
                 .collect(),
         ),
+        cwd: Arc::new(Mutex::new(root.to_path_buf())),
+        no_temperature: Arc::default(),
     };
 
     let has_helpers = req.subagents.iter().any(|s| !s.name.trim().is_empty());
     let mut preamble = system.to_string();
+    // Facts the model otherwise guesses wrong: which OS and shell, where it
+    // is, and today's date (for web searches and "latest version" questions).
+    preamble.push_str(&format!(
+        "\n\nEnvironment:\n- {}\n- Workspace: {} (the starting working directory; change_dir moves it)\n- Today: {}\n\
+         Prefer the dedicated tools over shell one-liners: find_files / list_dir / grep to look around, \
+         read_file to read, apply_patch to edit, file_op to create folders or move / copy / delete, git for git, \
+         web_search + web_fetch for anything on the internet (never curl/wget for reading pages). \
+         Use run_command for builds, tests, package managers and project scripts; \
+         start dev servers and watchers with background:true. \
+         When a command fails, read its error and hint and change the approach — never rerun it unchanged.",
+        tools::shell_summary(),
+        root.display(),
+        today()
+    ));
     if has_helpers {
         preamble.push_str(&format!(
             "\n\nHelper agents are available through the `delegate` tool (up to {parallel} at once). They are optional: do simple or tightly coupled work yourself, and delegate only self-contained parts that match a helper's specialty."
@@ -962,9 +1095,48 @@ pub(super) async fn run(
     Ok(text)
 }
 
+/// Today's date (UTC) as YYYY-MM-DD.
+fn today() -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0) as i64;
+    // Civil-from-days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn today_is_a_date() {
+        let t = today();
+        assert_eq!(t.len(), 10);
+        assert!(t.starts_with("20"));
+    }
+
+    #[test]
+    fn gates_follow_the_tool() {
+        let ws = if cfg!(windows) { "C:/proj" } else { "/proj" };
+        assert!(permission_gate("git", &json!({"subcommand": "status"}), ws, ws, false).is_none());
+        assert!(permission_gate("git", &json!({"subcommand": "commit", "args": ["-m", "x"]}), ws, ws, false).is_some());
+        assert!(permission_gate("git", &json!({"subcommand": "commit", "args": ["-m", "x"]}), ws, ws, true).is_none());
+        assert!(permission_gate("git", &json!({"subcommand": "reset", "args": ["--hard"]}), ws, ws, true).is_some());
+        assert!(permission_gate("file_op", &json!({"op": "delete", "path": "a"}), ws, ws, false).is_some());
+        assert!(permission_gate("file_op", &json!({"op": "delete", "path": "a"}), ws, ws, true).is_none());
+        assert!(permission_gate("file_op", &json!({"op": "mkdir", "path": "a/b"}), ws, ws, false).is_none());
+        assert!(permission_gate("web_fetch", &json!({"url": "https://x"}), ws, ws, false).is_none());
+    }
 
     #[test]
     fn partial_field_reads_truncated_json() {

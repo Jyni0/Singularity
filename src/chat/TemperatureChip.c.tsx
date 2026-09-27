@@ -75,6 +75,11 @@ export function TemperatureChip({
                 <span>1</span>
                 <span>2</span>
               </div>
+              {value !== null && value > 1 && (
+                <div className="mt-1.5 text-[10.5px] leading-snug text-[var(--text-dim)]">
+                  Above 1 the agent gets gentler steps (2 → 1.3, Claude max 1) so tool calls stay valid.
+                </div>
+              )}
             </div>
             <div className="mx-1 mb-1 h-px bg-[var(--border-soft)]" />
             {PRESETS.map((p) => (

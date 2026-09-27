@@ -19,6 +19,7 @@ mod tools;
 mod tray;
 mod updater;
 mod utf8stream;
+mod web;
 
 use tauri::Manager;
 

@@ -83,6 +83,12 @@ export function toolLabel(step: db.AgentStepEvent): string {
     ssh_exec: "SSH",
     skill: "Skill",
     mcp: "MCP",
+    find_files: "Find",
+    change_dir: "cd",
+    file_op: "Files",
+    git: "Git",
+    web_search: "Web",
+    web_fetch: "Fetch",
   };
   return verb[step.name] ?? step.name.replace(/^mcp__(.+?)__/, "$1 · ");
 }

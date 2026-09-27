@@ -26,6 +26,29 @@ fn anthropic_thinking(effort: &str) -> Option<u64> {
     }
 }
 
+/// The temperature actually sent for the user's pick (0–2), or None to use
+/// the provider default.
+///
+/// An agent must emit exact JSON tool calls, file paths and code; sampling
+/// above ~1.2 turns them into noise — the model then never produced a valid
+/// call ("nothing generates") or rambled until the context ran out ("takes
+/// forever"). The upper half of the slider is therefore compressed into
+/// 1.0–1.3: still noticeably more varied, never broken. Anthropic accepts
+/// at most 1.0, and OpenAI's reasoning models (o-series, gpt-5) accept no
+/// temperature at all — sending one was a 400 on every retry.
+pub(super) fn agent_temperature(kind: &str, model: &str, t: f64) -> Option<f64> {
+    let m = model.to_lowercase();
+    let m = m.rsplit('/').next().unwrap_or(&m);
+    let reasoning = m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") || m.starts_with("gpt-5");
+    if reasoning && kind != "anthropic-messages" && kind != "ollama" {
+        return None;
+    }
+    let t = t.clamp(0.0, 2.0);
+    let soft = if t <= 1.0 { t } else { 1.0 + (t - 1.0) * 0.3 };
+    let cap = if kind == "anthropic-messages" { 1.0 } else { 1.3 };
+    Some((soft.min(cap) * 100.0).round() / 100.0)
+}
+
 /// Builds the Rig model for this request's provider.
 pub(super) fn build(req: &AgentRequest) -> Result<ModelSetup, String> {
     let key = req.api_key.trim().to_string();
@@ -34,7 +57,7 @@ pub(super) fn build(req: &AgentRequest) -> Result<ModelSetup, String> {
     let effort = req.effort.as_str();
     // "medium" is every provider's default — only low/high are sent.
     let pick = matches!(effort, "low" | "high").then_some(effort);
-    let temperature = req.temperature.map(|t| t.clamp(0.0, 2.0));
+    let temperature = req.temperature.and_then(|t| agent_temperature(&req.kind, &req.model, t));
 
     match req.kind.as_str() {
         "anthropic-messages" => {
@@ -92,5 +115,19 @@ pub(super) fn build(req: &AgentRequest) -> Result<ModelSetup, String> {
                 max_tokens: None,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agent_temperature;
+
+    #[test]
+    fn temperature_stays_usable() {
+        assert_eq!(agent_temperature("openai", "gpt-4o", 0.7), Some(0.7));
+        assert_eq!(agent_temperature("openai", "gpt-4o", 2.0), Some(1.3));
+        assert_eq!(agent_temperature("anthropic-messages", "claude-sonnet-5", 2.0), Some(1.0));
+        assert_eq!(agent_temperature("openai", "o3-mini", 0.5), None);
+        assert_eq!(agent_temperature("openai", "openai/gpt-5", 1.0), None);
     }
 }

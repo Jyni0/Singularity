@@ -72,7 +72,12 @@ function readActivity(segments: Segment[] | undefined): { activity: Activity; de
       case "list_dir":
         return { activity: "reading", detail: baseName(subject(input)) };
       case "grep":
+      case "find_files":
+      case "web_search":
         return { activity: "searching", detail: subject(input) };
+      case "web_fetch":
+      case "change_dir":
+        return { activity: "reading", detail: "" };
       case "write_file":
       case "edit_file":
       case "apply_patch":

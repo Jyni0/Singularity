@@ -1001,6 +1001,27 @@ export async function streamChat(
   }
 }
 
+/** localhost, 127.x, ::1, *.local, host.docker.internal and private LAN ranges. */
+export function isLocalUrl(url: string): boolean {
+  let host: string;
+  try {
+    host = new URL(url.trim()).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  } catch {
+    return false;
+  }
+  return (
+    host === "localhost" ||
+    host === "::1" ||
+    host === "0.0.0.0" ||
+    host === "host.docker.internal" ||
+    host.endsWith(".local") ||
+    /^127\./.test(host) ||
+    /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+  );
+}
+
 /** Resolves the credential a provider should authenticate with at call time. */
 export async function credentialFor(
   provider: Provider,
@@ -1012,6 +1033,9 @@ export async function credentialFor(
     return { apiKey: res.token ?? "", auth: "bearer" };
   }
   if (!provider.api_key.trim()) {
+    // Local servers (Ollama, LM Studio, llama.cpp, vLLM on this machine or
+    // the LAN) take no key — refusing them here blocked every Ollama call.
+    if (provider.kind === "ollama" || isLocalUrl(provider.base_url)) return { apiKey: "", auth: "key" };
     return { apiKey: "", auth: "key", error: `${provider.name} has no credentials` };
   }
   return { apiKey: provider.api_key, auth: "key" };

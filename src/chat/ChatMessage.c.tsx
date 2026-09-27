@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, memo } from "react";
 import { ArrowUp, Bug, Check, ChevronDown, ChevronRight, Copy, Loader2, Pencil, Wrench } from "lucide-react";
 import * as db from "../core/db.r";
 import { formatDuration } from "../utils/format.u";
@@ -13,7 +13,7 @@ import type { Segment } from "./message.i";
  * under the row the pointer is on, together with that row's actions.
  */
 
-export function MessageBody({ text }: { text: string }) {
+function MessageBody({ text }: { text: string }) {
   const long = text.length > 600 || text.split("\n").length > 12;
   const [open, setOpen] = useState(!long);
   return (
@@ -244,7 +244,7 @@ function groupSegments(segments: Segment[]): (Segment | { group: Segment[] })[] 
 
 /* ---------- Unified chat message row ---------- */
 
-export function ChatMessage({
+function ChatMessageView({
   role,
   text,
   segments,
@@ -428,7 +428,7 @@ function HudCell({ label, value, title }: { label: string; value: string; title?
 }
 
 /** Real-time inference statistics of the turn (Debug mode only). */
-export function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?: boolean }) {
+function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?: boolean }) {
   const secs = (usage.elapsed_ms ?? 0) / 1000;
   const tps = secs > 0.5 ? usage.completion_tokens / secs : 0;
   const cacheRate =
@@ -461,7 +461,7 @@ export function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?:
 }
 
 /** Generation time at the end of a finished agent turn. */
-export function DurationFooter({ streaming, durationMs }: { streaming?: boolean; durationMs?: number }) {
+function DurationFooter({ streaming, durationMs }: { streaming?: boolean; durationMs?: number }) {
   if (streaming || !durationMs || durationMs <= 0) return null;
   return (
     <span
@@ -472,3 +472,23 @@ export function DurationFooter({ streaming, durationMs }: { streaming?: boolean;
     </span>
   );
 }
+
+type ChatMessageProps = Parameters<typeof ChatMessageView>[0];
+
+/**
+ * Memoized: while an agent streams, only its live turn changes — finished
+ * messages (and their Markdown) must not re-render on every token. Callback
+ * props are recreated by the parent each render but never change meaning
+ * for a mounted message (the list remounts per conversation), so only
+ * whether they exist is compared.
+ */
+export const ChatMessage = memo(ChatMessageView, (a: ChatMessageProps, b: ChatMessageProps) =>
+  a.role === b.role &&
+  a.text === b.text &&
+  a.segments === b.segments &&
+  a.streaming === b.streaming &&
+  a.durationMs === b.durationMs &&
+  a.images === b.images &&
+  a.debugMode === b.debugMode &&
+  !!a.onEdit === !!b.onEdit
+);

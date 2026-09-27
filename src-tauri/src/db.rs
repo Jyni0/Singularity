@@ -117,7 +117,102 @@ pub fn migrations() -> Vec<Migration> {
         provider_limits_migration(),
         server_order_migration(),
         key_script_order_migration(),
+        proxy_migration(),
+        scheduled_tasks_migration(),
+        mcp_migration(),
     ]
+}
+
+/// Version 19 — MCP servers the agent can use as extra tools.
+///
+/// `transport` is "stdio" (command + args, env) or "http" (Streamable HTTP
+/// url + headers). `env` and `headers` are JSON objects, vault-encrypted
+/// because they usually carry API tokens.
+///
+/// FROZEN once applied: never edit this SQL after release; add version 20.
+fn mcp_migration() -> Migration {
+    Migration {
+        version: 19,
+        description: "mcp servers",
+        sql: "
+            CREATE TABLE IF NOT EXISTS mcp_servers (
+              id          TEXT PRIMARY KEY,
+              name        TEXT NOT NULL,
+              transport   TEXT NOT NULL DEFAULT 'stdio',
+              command     TEXT NOT NULL DEFAULT '',
+              args        TEXT NOT NULL DEFAULT '[]',
+              env         TEXT NOT NULL DEFAULT '',
+              url         TEXT NOT NULL DEFAULT '',
+              headers     TEXT NOT NULL DEFAULT '',
+              enabled     INTEGER NOT NULL DEFAULT 1,
+              sort_order  INTEGER NOT NULL DEFAULT 0,
+              created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+        ",
+        kind: MigrationKind::Up,
+    }
+}
+
+/// Version 18 — scheduled agent tasks (Scheduled Tasks page).
+///
+/// `schedule` is a 5-field cron expression (hourly/daily/weekly presets are
+/// stored as cron too); `kind` only remembers which editor built it. The
+/// frontend scheduler runs a task once a cron minute passed since
+/// `armed_at` — reset on every run, save and resume, so editing a task never
+/// fires it for times that passed before. `last_run_at` is display-only.
+///
+/// FROZEN once applied: never edit this SQL after release; add version 19.
+fn scheduled_tasks_migration() -> Migration {
+    Migration {
+        version: 18,
+        description: "scheduled tasks",
+        sql: "
+            CREATE TABLE IF NOT EXISTS scheduled_tasks (
+              id          TEXT PRIMARY KEY,
+              name        TEXT NOT NULL,
+              project     TEXT NOT NULL,
+              provider_id TEXT NOT NULL DEFAULT '',
+              model_id    TEXT NOT NULL DEFAULT '',
+              kind        TEXT NOT NULL DEFAULT 'daily',
+              schedule    TEXT NOT NULL,
+              prompt      TEXT NOT NULL,
+              enabled     INTEGER NOT NULL DEFAULT 1,
+              last_run_at INTEGER,
+              armed_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+              last_conv   TEXT NOT NULL DEFAULT '',
+              created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+        ",
+        kind: MigrationKind::Up,
+    }
+}
+
+/// Version 17 — proxies (HTTP / SOCKS5) that servers can tunnel through.
+///
+/// The password is vault-encrypted like every other secret; a server links
+/// one via proxy_id ("" = direct connection).
+///
+/// FROZEN once applied: never edit this SQL after release; add version 18.
+fn proxy_migration() -> Migration {
+    Migration {
+        version: 17,
+        description: "ssh proxies",
+        sql: "
+            CREATE TABLE IF NOT EXISTS ssh_proxies (
+              id          TEXT PRIMARY KEY,
+              name        TEXT NOT NULL,
+              kind        TEXT NOT NULL DEFAULT 'http',
+              host        TEXT NOT NULL,
+              port        INTEGER NOT NULL,
+              username    TEXT NOT NULL DEFAULT '',
+              password    TEXT NOT NULL DEFAULT '',
+              sort_order  INTEGER NOT NULL DEFAULT 0,
+              created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            ALTER TABLE ssh_servers ADD COLUMN proxy_id TEXT NOT NULL DEFAULT '';
+        ",
+        kind: MigrationKind::Up,
+    }
 }
 
 /// Version 16 — user-defined order of credentials and scripts, the same

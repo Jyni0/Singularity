@@ -12,18 +12,6 @@ export type DiffLine =
   | { kind: "ctx"; text: string; oldNo: number; newNo: number }
   | { kind: "hunk"; text: string };
 
-/** Computes added/removed line counts for badges. */
-export function diffStats(oldText: string, newText: string): { added: number; removed: number } {
-  const lines = computeDiff(oldText, newText);
-  let added = 0;
-  let removed = 0;
-  for (const l of lines) {
-    if (l.kind === "add") added++;
-    else if (l.kind === "del") removed++;
-  }
-  return { added, removed };
-}
-
 export function computeDiff(oldText: string, newText: string): DiffLine[] {
   const a = oldText.split("\n");
   const b = newText.split("\n");

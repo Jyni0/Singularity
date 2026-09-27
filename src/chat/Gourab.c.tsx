@@ -21,7 +21,7 @@ import { formatDuration } from "../utils/format.u";
 import { baseName } from "./FileIcon.c";
 import type { Segment } from "./message.i";
 
-export const MASCOT_NAME = "gourab";
+const MASCOT_NAME = "gourab";
 
 type Activity =
   | "thinking"
@@ -77,6 +77,8 @@ function readActivity(segments: Segment[] | undefined): { activity: Activity; de
       case "edit_file":
       case "apply_patch":
         return { activity: "coding", detail: baseName(subject(input)) };
+      case "skill":
+        return { activity: "reading", detail: subject(input) };
       case "run_command":
       case "ssh_exec":
         return { activity: "running", detail: "" };

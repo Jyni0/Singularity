@@ -11,9 +11,12 @@ import { AgentsSettings } from "./AgentsSettings.c";
 import type * as db from "../core/db.r";
 import { TerminalSettings } from "./TerminalSettings.c";
 import { ProjectSelect, ProjectSettingsPanel } from "./ProjectSettings.c";
-import { SettingRow, SettingsCard, Sep } from "./SettingsParts.c";
+import { SettingRow, SettingsCard, Sep, Segmented } from "./SettingsParts.c";
 import { Switch } from "../ui/Switch.c";
 import { LogsSettings } from "./LogsSettings.c";
+import { SkillsSettings } from "./SkillsSettings.c";
+import { GEN_ANIMATIONS, type GenAnimation } from "../ui/GenerationGlow.c";
+import { McpSettings } from "./McpSettings.c";
 
 export type SettingsSection =
   | "general"
@@ -22,6 +25,8 @@ export type SettingsSection =
   | "project-settings"
   | "models"
   | "agents"
+  | "skills"
+  | "mcp"
   | "terminal"
   | "logs"
   | "about";
@@ -44,6 +49,8 @@ export function SettingsModal({
   onGlobalAutoRun,
   debugMode,
   onDebugMode,
+  genAnimation = "pixels",
+  onGenAnimation,
   subagents,
   onSubagents,
   maxAgents,
@@ -53,8 +60,11 @@ export function SettingsModal({
   initialProject,
   initialSection,
   mode = "agent",
+  workspace = "",
   onClose,
 }: {
+  /** Folder of the open chat's project — its project skills are listed too. */
+  workspace?: string;
   /** Helper agents (Settings → Agent). */
   subagents: db.Subagent[];
   onSubagents: (next: db.Subagent[]) => void;
@@ -79,6 +89,9 @@ export function SettingsModal({
   onModelsChanged: (next: Model[]) => void;
   globalAutoRun: boolean;
   onGlobalAutoRun: (next: boolean) => void;
+  /** Animation behind the chat while the model generates. */
+  genAnimation?: GenAnimation;
+  onGenAnimation?: (next: GenAnimation) => void;
   /** Debug mode: live token/speed/cache/time HUD inside the chat. */
   debugMode: boolean;
   onDebugMode: (next: boolean) => void;
@@ -129,6 +142,8 @@ export function SettingsModal({
           { id: "general", label: "General" },
           { id: "models", label: "Models" },
           { id: "agents", label: "Agent" },
+          { id: "skills", label: "Skills" },
+          { id: "mcp", label: "MCP Servers" },
         ]
       : [
           { id: "general", label: "General" },
@@ -156,6 +171,8 @@ export function SettingsModal({
     general: ["General", "Appearance, theme and workspace defaults"],
     models: ["Models", "Connect providers and manage the models they expose"],
     agents: ["Agent", "Helper subagents and how many can work at once"],
+    skills: ["Skills", "Instruction packs the agent loads when a task matches — or you call with /name"],
+    mcp: ["MCP Servers", "External tool servers (Model Context Protocol) the agent can use"],
     permissions: ["Global Permissions", "Tool and filesystem access rules"],
     projects: ["Manage Projects", "Create and organize project folders"],
     "project-settings": ["Project Settings", "Rename, permissions and delete for one project"],
@@ -248,6 +265,17 @@ export function SettingsModal({
               {mode === "agent" && (
                 <>
                   <Sep />
+                  <SettingRow title="Generation Animation" hint="What plays behind the chat while the model works">
+                    <Segmented
+                      options={GEN_ANIMATIONS.map((a) => a.label)}
+                      value={GEN_ANIMATIONS.find((a) => a.id === genAnimation)?.label ?? "Pixels"}
+                      onChange={(label) => {
+                        const next = GEN_ANIMATIONS.find((a) => a.label === label);
+                        if (next) onGenAnimation?.(next.id);
+                      }}
+                    />
+                  </SettingRow>
+                  <Sep />
                   <SettingRow
                     title="Debug Mode"
                     hint="Live stats in chat: tokens/sec, token spend, cache rate, time"
@@ -283,6 +311,10 @@ export function SettingsModal({
               onMaxRetries={onMaxRetries}
             />
           )}
+
+          {effectiveSection === "skills" && <SkillsSettings workspace={workspace} />}
+
+          {effectiveSection === "mcp" && <McpSettings />}
 
           {effectiveSection === "terminal" && <TerminalSettings />}
 

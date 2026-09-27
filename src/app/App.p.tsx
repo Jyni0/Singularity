@@ -1,20 +1,21 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { Shield, ChevronDown } from "lucide-react";
+import { Shield, ShieldAlert, ChevronDown } from "lucide-react";
 import * as db from "../core/db.r";
-import type { AppMode, Model, Project, Provider, SshConn, SshKey, SshScript, SshServer, Theme, UnitsTab, ViewKind, Attachment } from "../core/types.i";
+import type { AppMode, Effort, Model, ScheduledTask, Project, Provider, SshConn, SshKey, SshProxy, SshScript, SshServer, Theme, UnitsTab, ViewKind, Attachment } from "../core/types.i";
 import { NO_PROJECT, THEMES } from "../core/types.i";
 import { toGateways } from "../utils/gateways.u";
 import { useBlockContextMenu } from "../hooks/useBlockContextMenu.h";
 import { ScrollArea } from "../ui/ScrollArea.c";
-import { AuroraGlow } from "../ui/AuroraGlow.c";
+import { GenerationGlow, type GenAnimation } from "../ui/GenerationGlow.c";
 
 import type { PanelState, PanelTabSpec } from "../chat/message.i";
 import { storedToMsg, fileLabel, toolLabel } from "../chat/message.u";
 import { ChatMessage } from "../chat/ChatMessage.c";
 import { useChat, DRAFT_ID } from "../hooks/useChat.h";
+import { useScheduledTasks } from "../hooks/useScheduledTasks.h";
 import type { ChatSelection } from "../hooks/useChat.h";
-import { PromptBox } from "../chat/PromptBox.c";
+import { PromptBox, type PromptCommand } from "../chat/PromptBox.c";
 import { InspectionPanel } from "../chat/InspectionPanel.c";
 import { TitleBar } from "../layout/TitleBar.c";
 import { Sidebar } from "../layout/Sidebar.c";
@@ -32,21 +33,20 @@ import { ScheduleModal } from "../settings/ScheduleModal.c";
 import { SettingsModal } from "../settings/SettingsModal.c";
 import type { SettingsSection } from "../settings/SettingsModal.c";
 
-export /** Loose chats (no folder). Kept as a real entry so every row action just works. */
+/** Loose chats (no folder). Kept as a real entry so every row action just works. */
 const NO_PROJECT_ENTRY: Project = {
   name: NO_PROJECT,
   path: "",
   conversations: [],
 };
 
-export const INITIAL_SCHEDULED = ["Nightly /review @main", "Weekly /test all"];
 
 /* ---------- Custom title bar ---------- */
 
-export /** Inspection panel width bounds, px. */
+/** Inspection panel width bounds, px. */
 const PANEL_MIN_W = 260;
 
-export const PANEL_MAX_W = 720;
+const PANEL_MAX_W = 720;
 
 export default function App() {
   // No default browser context menu anywhere in the window.
@@ -56,6 +56,24 @@ export default function App() {
   /** Panel width, drag-resizable and persisted like the sidebar's. */
   const [panelWidth, setPanelWidth] = useState(340);
   const [sidebarWidth, setSidebarWidth] = useState(240);
+  /** View → Hide Sidebar (Ctrl+B); remembered across launches. */
+  const [sidebarHidden, setSidebarHidden] = useState(() => {
+    try {
+      return localStorage.getItem("dsh:sidebar-hidden") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleSidebar = useCallback(() => {
+    setSidebarHidden((h) => {
+      try {
+        localStorage.setItem("dsh:sidebar-hidden", h ? "0" : "1");
+      } catch {
+        /* per-viewer convenience only */
+      }
+      return !h;
+    });
+  }, []);
   const [theme, setThemeState] = useState<Theme>("dark");
   /** Every settings edit is persisted, so edits survive a relaunch. */
   const setTheme = useCallback((t: Theme) => {
@@ -66,7 +84,8 @@ export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [models, setModels] = useState<Model[]>([]);
-  const [scheduled, setScheduled] = useState<string[]>(INITIAL_SCHEDULED);
+  /** Task open in the Schedule dialog (undefined = creating a new one). */
+  const [editingTask, setEditingTask] = useState<ScheduledTask | undefined>(undefined);
   const [modal, setModal] = useState<
     "none" | "settings" | "schedule" | "new-project"
   >("none");
@@ -83,6 +102,11 @@ export default function App() {
   const [workspace, setWorkspace] = useState(
     () => localStorage.getItem("agent_workspace") ?? ""
   );
+  /** The app's own agent folder (projects without a directory run there). */
+  const [appWorkspace, setAppWorkspace] = useState("");
+  useEffect(() => {
+    void db.appWorkspace().then(setAppWorkspace);
+  }, []);
   /** When off, prompts are answered by plain chat with no tool access. */
   const [agentMode] = useState(() => localStorage.getItem("agent_mode") !== "off");
   /** Global command permission — the default for projects set to "As default". */
@@ -90,6 +114,10 @@ export default function App() {
   /** Debug mode: live token/speed/cache HUD inside the chat transcript.
    *  Persisted as the "debug_mode" setting. */
   const [debugMode, setDebugMode] = useState(false);
+  /** Animation behind the chat while the model works ("gen_animation"). */
+  const [genAnimation, setGenAnimation] = useState<GenAnimation>(
+    () => (localStorage.getItem("gen_animation") as GenAnimation | null) ?? "pixels"
+  );
   /** Last picked model, restored on launch so the chat remembers its choice. */
   const [pickedModel, setPickedModel] = useState<{ gatewayId: string; modelId: string } | null>(
     null
@@ -105,6 +133,8 @@ export default function App() {
   const agentViewRef = useRef<ViewKind>("chat");
   const [sshServers, setSshServers] = useState<SshServer[]>([]);
   const [sshKeys, setSshKeys] = useState<SshKey[]>([]);
+  /** Saved proxies — Units page only (not in the sidebar). */
+  const [sshProxies, setSshProxies] = useState<SshProxy[]>([]);
   const [sshScripts, setSshScripts] = useState<SshScript[]>([]);
   const [sshConnectedIds, setSshConnectedIds] = useState<string[]>([]);
   const [sshBusyIds, setSshBusyIds] = useState<string[]>([]);
@@ -150,6 +180,7 @@ export default function App() {
     models,
     projects,
     workspace,
+    appWorkspace,
     agentMode,
     globalAutoRun,
     sshServers,
@@ -158,10 +189,11 @@ export default function App() {
     maxRetries,
     pickedModel,
     newChatProject,
-    onConversationCreated: (project, conv) => {
+    onConversationCreated: (project, conv, open) => {
       setProjects((prev) =>
         prev.map((p) => (p.name !== project ? p : { ...p, conversations: [conv, ...p.conversations] }))
       );
+      if (!open) return;
       setActiveConv({ project, id: conv.id });
       setView("chat");
     },
@@ -176,6 +208,24 @@ export default function App() {
       ),
   });
   const { convMsgs, setConvMsgs, activeRuns, runPhase, erroredConv, confirmReqs } = chat;
+
+  /** Scheduled Tasks: each due run is a new background chat in the task's project. */
+  const schedule = useScheduledTasks(async (t) => {
+    if (!projects.some((p) => p.name === t.project)) return null; // project was deleted
+    const t0 = localStorage.getItem("temperature");
+    return chat.send(
+      t.prompt,
+      null,
+      {
+        gatewayId: t.provider_id,
+        modelId: t.model_id,
+        effort: (localStorage.getItem("effort") as Effort) || "medium",
+        temperature: t0 === null || t0 === "" ? null : Number(t0),
+      },
+      [],
+      { project: t.project, background: true }
+    );
+  });
 
   /** Messages of the conversation currently on screen. */
   const draftMsgs = activeConv
@@ -271,21 +321,14 @@ export default function App() {
     [mode, view]
   );
 
-  // Restore the last-used mode on boot.
+  /** Set once boot has restored mode + page, so the initial state isn't saved over them. */
+  const bootedRef = useRef(false);
+
+  // Remember the last page per mode — the next launch reopens it.
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const saved = await db.getSetting("app_mode");
-      if (cancelled) return;
-      if (saved === "ssh") {
-        setMode("ssh");
-        setView("units");
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    if (!bootedRef.current) return;
+    localStorage.setItem(`dsh:last-view:${mode}`, view);
+  }, [mode, view]);
 
   /* ---------- SSH Client data ---------- */
 
@@ -293,7 +336,7 @@ export default function App() {
    * A list was dragged into a new order: show it at once, then persist.
    * Open connections are session-only, so their order is not stored.
    */
-  const reorderSsh = useCallback((kind: "server" | "key" | "script" | "conn", ids: string[]) => {
+  const reorderSsh = useCallback((kind: "server" | "key" | "script" | "proxy" | "conn", ids: string[]) => {
     const sortBy = <T extends { id: string }>(cur: T[]): T[] => {
       const byId = new Map(cur.map((x) => [x.id, x]));
       const moved = ids.map((id) => byId.get(id)).filter((x): x is T => !!x);
@@ -305,10 +348,12 @@ export default function App() {
     }
     if (kind === "server") setSshServers(sortBy);
     else if (kind === "key") setSshKeys(sortBy);
+    else if (kind === "proxy") setSshProxies(sortBy);
     else setSshScripts(sortBy);
     void db.reorderSshUnits(kind, ids).catch(() => {
       void db.loadSshServers().then(setSshServers).catch(() => {});
       void db.loadSshKeys().then(setSshKeys).catch(() => {});
+      void db.loadSshProxies().then(setSshProxies).catch(() => {});
       void db.loadSshScripts().then(setSshScripts).catch(() => {});
     });
   }, []);
@@ -316,6 +361,7 @@ export default function App() {
   const reloadSshServers = useCallback(() => {
     void db.loadSshServers().then(setSshServers).catch(() => {});
     void db.loadSshKeys().then(setSshKeys).catch(() => {});
+    void db.loadSshProxies().then(setSshProxies).catch(() => {});
     void db.loadSshScripts().then(setSshScripts).catch(() => {});
     void db.sshConnected().then(setSshConnectedIds).catch(() => {});
     void db.sshVaultBacked().then(setSshVaultBacked).catch(() => {});
@@ -450,7 +496,7 @@ export default function App() {
 
       // Restore user settings persisted in SQLite (falls back to localStorage
       // values from older versions, then to defaults).
-      const [globalAuto, picked, savedTheme, savedPanelW, savedSshPanelW, savedDebug] =
+      const [globalAuto, picked, savedTheme, savedPanelW, savedSshPanelW, savedDebug, savedMode] =
         await Promise.all([
           db.getSetting("global_auto_run"),
           db.getSetting("picked_model"),
@@ -458,7 +504,12 @@ export default function App() {
           db.getSetting("panel_width"),
           db.getSetting("ssh_panel_width"),
           db.getSetting("debug_mode"),
+          db.getSetting("app_mode"),
         ]);
+      const savedAnim = await db.getSetting("gen_animation");
+      if (!cancelled && (savedAnim === "pixels" || savedAnim === "aurora" || savedAnim === "off")) {
+        setGenAnimation(savedAnim);
+      }
       if (!cancelled && savedDebug !== null) setDebugMode(savedDebug === "1");
       if (!cancelled && savedPanelW) {
         const w = Number(savedPanelW);
@@ -500,10 +551,22 @@ export default function App() {
       setProviders(nextProviders);
       setModels(nextModels);
 
-      // Open the chat the user LAST OPENED (persisted per open); if it is
-      // gone (deleted) or there never was one — land on New Conversation
-      // instead of some arbitrary stored chat.
-      const lastId = localStorage.getItem("dsh:last-conv");
+      // Reopen the page the app was closed on, per mode. Agent: the last
+      // chat (if it still exists), History or Tasks — otherwise New
+      // Conversation. SSH: Units or Logs — terminal/files tabs don't survive
+      // a restart, so those land on Units.
+      const sshMode = savedMode === "ssh";
+      const agentView = localStorage.getItem("dsh:last-view:agent") ?? "chat";
+      const sshView = localStorage.getItem("dsh:last-view:ssh");
+      const restoredSshView: ViewKind = sshView === "ssh-logs" ? "ssh-logs" : "units";
+      if (sshMode) setMode("ssh");
+      /** Shows an agent page — or parks it for the switch back when SSH is on screen. */
+      const showAgent = (v: ViewKind) => {
+        agentViewRef.current = v;
+        setView(sshMode ? restoredSshView : v);
+      };
+
+      const lastId = agentView === "chat" ? localStorage.getItem("dsh:last-conv") : null;
       const reattachId = (() => {
         try {
           return (JSON.parse(localStorage.getItem("dsh:live-run") ?? "null") as { convId?: string } | null)?.convId ?? null;
@@ -514,18 +577,11 @@ export default function App() {
       // A run that was live across the reload always wins — its re-attach
       // effect owns that conversation's buffer.
       const targetId = reattachId ?? lastId;
-      let owner = targetId ? nextProjects.find((p) => p.conversations.some((c) => c.id === targetId)) : undefined;
-      let conv = owner?.conversations.find((c) => c.id === targetId);
-      if (!conv) {
-        // Last-conv gone: fall back to the newest real conversation; if none
-        // exists at all, stay on the New Conversation screen.
-        const first = nextProjects.find((p) => p.conversations.length > 0);
-        conv = first?.conversations[0];
-        owner = first;
-      }
+      const owner = targetId ? nextProjects.find((p) => p.conversations.some((c) => c.id === targetId)) : undefined;
+      const conv = owner?.conversations.find((c) => c.id === targetId);
       if (owner && conv) {
         setActiveConv({ project: owner.name, id: conv.id });
-        setView("chat");
+        showAgent("chat");
         // The re-attach effect loads the stored rows AND appends the streaming
         // draft for its conversation; overwriting here would wipe it mid-stream.
         if (conv.id !== reattachId) {
@@ -537,12 +593,15 @@ export default function App() {
             }));
           }
         }
+      } else if (agentView === "history" || agentView === "tasks") {
+        showAgent(agentView);
       } else {
-        // Nothing to open — start at New Conversation.
+        // Closed on New Conversation, or the last chat is gone.
         setNewChatProject(NO_PROJECT);
         setConvMsgs((prev) => ({ ...prev, [DRAFT_ID]: prev[DRAFT_ID] ?? [] }));
-        setView("new");
+        showAgent("new");
       }
+      if (!cancelled) bootedRef.current = true;
     })();
     return () => {
       cancelled = true;
@@ -700,6 +759,46 @@ export default function App() {
     setPickedModel(next);
     void db.setSetting("picked_model", JSON.stringify(next));
   }, []);
+
+  /** Opens the New Conversation screen in Agent mode, optionally inside a project. */
+  const startNewChat = (project: string = NO_PROJECT) => {
+    if (mode !== "agent") applyMode("agent");
+    setNewChatProject(project);
+    setActiveConv(null);
+    chat.reset(DRAFT_ID);
+    setView("new");
+  };
+
+  /** Folder a prompt in `project` runs in (the @ menu lists its files). */
+  const workspaceOf = (project: string) =>
+    projects.find((p) => p.name === project)?.path?.trim() || appWorkspace || workspace;
+
+  /** `/new`, `/skills`, `/mcp` typed in the prompt box. */
+  const onPromptCommand = (cmd: PromptCommand) => {
+    if (cmd === "new") return startNewChat(activeConv?.project ?? newChatProject);
+    setSettingsSection(cmd);
+    setModal("settings");
+  };
+
+  /** File → Open Folder: the folder's project (created on first open) + a new chat in it. */
+  const openFolder = async () => {
+    let picked: string | string[] | null = null;
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      picked = await open({ directory: true, multiple: false, title: "Open folder as a project" });
+    } catch {
+      return; // no native dialog outside Tauri
+    }
+    if (typeof picked !== "string") return;
+    const norm = (x: string) => x.replace(/[\\/]+$/, "").toLowerCase();
+    const existing = projects.find((p) => p.path && norm(p.path) === norm(picked as string));
+    if (existing) return startNewChat(existing.name);
+    const base = picked.split(/[\\/]/).filter(Boolean).pop() || "Project";
+    let name = base;
+    for (let i = 2; projects.some((p) => p.name === name); i++) name = `${base} ${i}`;
+    await addProject(name, picked);
+    startNewChat(name);
+  };
 
   /** Creates a project. `path` is optional — a project can be just a folder
    * for chats with no directory on disk behind it. */
@@ -866,11 +965,27 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col">
-      <TitleBar mode={mode} onSetMode={applyMode} />
+      <TitleBar
+        mode={mode}
+        onSetMode={applyMode}
+        onNewConversation={() => startNewChat()}
+        onNewProject={() => {
+          if (mode !== "agent") applyMode("agent");
+          setModal("new-project");
+        }}
+        onOpenFolder={() => void openFolder()}
+        onOpenSettings={() => {
+          setSettingsSection("general");
+          setSettingsProject(null);
+          setModal("settings");
+        }}
+        onToggleSidebar={toggleSidebar}
+        sidebarHidden={sidebarHidden}
+      />
       {/* overflow-hidden: the row must never scroll — a focus jump into the
           right-hand panel used to shift the whole page sideways. */}
       <div className="flex min-h-0 flex-1 overflow-hidden">
-        {mode === "ssh" ? (
+        {sidebarHidden ? null : mode === "ssh" ? (
           /* SSH Client mode: Units / Logs nav + the server list, laid out
              exactly like the Agent sidebar's conversations. */
           <SshSidebar
@@ -901,7 +1016,7 @@ export default function App() {
               setUnitsTab(tab);
               setView("units");
               setSshPanel({
-                kind: tab === "servers" ? "server" : tab === "keys" ? "key" : "script",
+                kind: tab === "servers" ? "server" : tab === "keys" ? "key" : tab === "proxies" ? "proxy" : "script",
               });
             }}
             onOpenSettings={() => {
@@ -965,7 +1080,28 @@ export default function App() {
           {view === "tasks" && (
             <ScrollArea className="flex-1" innerClassName="py-4">
               <div className="px-6">
-                <TasksView scheduled={scheduled} onScheduleTask={() => setModal("schedule")} />
+                <TasksView
+                  tasks={schedule.tasks}
+                  models={models}
+                  runningIds={schedule.runningIds}
+                  onNew={() => {
+                    setEditingTask(undefined);
+                    setModal("schedule");
+                  }}
+                  onEdit={(t) => {
+                    setEditingTask(t);
+                    setModal("schedule");
+                  }}
+                  onDelete={(t) => {
+                    if (confirm(`Delete the scheduled task "${t.name}"? Chats it already created stay.`)) void schedule.remove(t.id);
+                  }}
+                  onToggle={(t, on) => void schedule.setEnabled(t, on)}
+                  onRunNow={(t) => void schedule.runNow(t)}
+                  onOpenChat={(t) => {
+                    const owner = projects.find((p) => p.conversations.some((c) => c.id === t.last_conv));
+                    if (owner) void openConversation(owner.name, t.last_conv);
+                  }}
+                />
               </div>
             </ScrollArea>
           )}
@@ -977,6 +1113,7 @@ export default function App() {
                   servers={sshServers}
                   keys={sshKeys}
                   scripts={sshScripts}
+                  proxies={sshProxies}
                   connected={sshConnectedIds}
                   busyIds={sshBusyIds}
                   notice={sshNotice}
@@ -1058,6 +1195,8 @@ export default function App() {
                   gateways={gateways}
                   pickedModel={pickedModel}
                   onPickModel={pickModel}
+                  workspace={workspaceOf(newChatProject)}
+                  onCommand={onPromptCommand}
                   onSend={(text, selection, attachments) => sendMessage(text, null, selection, attachments)}
                 />
               </motion.div>
@@ -1079,7 +1218,7 @@ export default function App() {
                   and become unclickable. Negative-z aurora keeps the natural
                   paint order those popups rely on. */}
               <div className="absolute inset-0 -z-10 overflow-hidden">
-                <AuroraGlow mood={promptMood} />
+                <GenerationGlow mood={promptMood} style={genAnimation} />
               </div>
               {/* Wrapper hosts the floating "jump to latest" button over the list. */}
               <div className="relative flex min-h-0 flex-1 flex-col">
@@ -1185,15 +1324,35 @@ export default function App() {
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: 6 }}
                   >
-                    <div className="mx-auto flex w-full max-w-[760px] items-center gap-3 rounded-xl border border-[var(--accent)]/50 bg-[var(--bg-surface)] px-3.5 py-2.5 shadow-[var(--shadow-popup)]">
-                      <Shield size={15} className="shrink-0 text-[var(--accent)]" />
+                    <div
+                      className={
+                        "mx-auto flex w-full max-w-[760px] items-center gap-3 rounded-xl border bg-[var(--bg-surface)] px-3.5 py-2.5 shadow-[var(--shadow-popup)] " +
+                        (confirmReq.reason ? "border-[var(--diff-del)]/60" : "border-[var(--accent)]/50")
+                      }
+                    >
+                      {confirmReq.reason ? (
+                        <ShieldAlert size={15} className="shrink-0 text-[var(--diff-del)]" />
+                      ) : (
+                        <Shield size={15} className="shrink-0 text-[var(--accent)]" />
+                      )}
                       <div className="min-w-0 flex-1">
-                        <div className="text-[12px] font-medium text-[var(--text-main)]">
-                          The agent wants to run a command
+                        <div
+                          className={
+                            "text-[12px] font-medium " +
+                            (confirmReq.reason ? "text-[var(--diff-del)]" : "text-[var(--text-main)]")
+                          }
+                        >
+                          {confirmReq.reason || "The agent wants to run a command"}
                         </div>
-                        <code className="mt-0.5 block truncate font-mono text-[11px] text-[var(--text-muted)]">
+                        <code
+                          className="mt-0.5 block truncate font-mono text-[11px] text-[var(--text-muted)]"
+                          title={confirmReq.command}
+                        >
                           {confirmReq.command}
                         </code>
+                        {confirmReq.cwd && (
+                          <span className="block truncate text-[10.5px] text-[var(--text-dim)]">{confirmReq.cwd}</span>
+                        )}
                       </div>
                       <button
                         className="shrink-0 rounded-lg bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-white transition-opacity hover:opacity-90"
@@ -1224,6 +1383,11 @@ export default function App() {
                 onPickModel={pickModel}
                 busy={streaming}
                 onStop={() => activeConv && chat.stop(activeConv.id)}
+                workspace={workspaceOf(activeConv?.project ?? NO_PROJECT)}
+                onCommand={onPromptCommand}
+                queued={activeConv ? chat.queues[activeConv.id] ?? [] : []}
+                onTakeQueued={(id) => (activeConv ? chat.takeQueued(activeConv.id, id) : undefined)}
+                onRunQueued={(id) => activeConv && void chat.runQueued(activeConv.id, activeConv.project, id)}
               />
             </div>
           )}
@@ -1254,6 +1418,7 @@ export default function App() {
               servers={sshServers}
               keys={sshKeys}
               scripts={sshScripts}
+              proxies={sshProxies}
               width={sshPanelWidth}
               resizing={sshPanelResizing}
               onResizeStart={startSshPanelResize}
@@ -1289,6 +1454,12 @@ export default function App() {
                 setGlobalAutoRun(next);
                 void db.setSetting("global_auto_run", next ? "1" : "0");
               }}
+              genAnimation={genAnimation}
+              onGenAnimation={(next) => {
+                setGenAnimation(next);
+                localStorage.setItem("gen_animation", next);
+                void db.setSetting("gen_animation", next);
+              }}
               debugMode={debugMode}
               onDebugMode={(next) => {
                 setDebugMode(next);
@@ -1312,6 +1483,7 @@ export default function App() {
               initialProject={settingsProject}
               initialSection={settingsSection}
               mode={mode}
+              workspace={workspaceOf(activeConv?.project ?? newChatProject)}
               onClose={() => {
                 setModal("none");
                 // The next plain "Settings" click must land on General again.
@@ -1322,7 +1494,12 @@ export default function App() {
           )}
           {modal === "schedule" && (
             <ScheduleModal
-              onAdd={(t) => setScheduled((s) => [...s, t])}
+              task={editingTask}
+              projects={projects}
+              providers={providers}
+              models={models}
+              defaultModel={pickedModel}
+              onSave={schedule.save}
               onClose={() => setModal("none")}
             />
           )}

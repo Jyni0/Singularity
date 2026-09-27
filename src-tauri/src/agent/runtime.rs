@@ -12,6 +12,10 @@
 //!   the model decides which task goes to which helper. A semaphore bounds
 //!   how many work at once, and the main run executes tool calls with the
 //!   same concurrency so several delegations really run in parallel.
+//! * Skills: a `skill` tool loads a skill's instructions on demand; the
+//!   preamble lists only names + descriptions.
+//! * MCP: every tool of every enabled MCP server becomes a `mcp__server__tool`
+//!   dynamic tool over the pooled connection (mcp.rs).
 
 use super::context::one_line;
 use super::prompt::{summarize, tool_specs};
@@ -62,6 +66,8 @@ struct RunCtx {
     delegate_cards: Arc<Mutex<HashMap<String, usize>>>,
     usage: Arc<Mutex<RunUsage>>,
     started: std::time::Instant,
+    /// MCP tool name → (server name, read-only hint) for the approval gate.
+    mcp_tools: Arc<HashMap<String, (String, bool)>>,
 }
 
 impl RunCtx {
@@ -226,21 +232,29 @@ impl AgentHook for UiHook {
 
         self.step(idx, event.tool_name, summary.clone(), false, &tools::ToolResult::ok(""));
 
-        // Permission gate: unless the project runs commands automatically,
-        // run_command waits for the user's Allow/Deny in the UI.
-        if event.tool_name == "run_command" && !self.ctx.req.auto_run {
-            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            let cwd = args
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .unwrap_or(self.ctx.req.workspace.as_str());
+        // Permission gate (safety.rs): commands need a yes unless the project
+        // runs them automatically, and risky commands, secrets and writes to
+        // system / outside-project paths ALWAYS need one.
+        // MCP tools act outside the app — they ask like commands do, unless
+        // the server marks the tool read-only or the project auto-runs.
+        let gate = match self.ctx.mcp_tools.get(event.tool_name) {
+            Some((server, read_only)) => (!self.ctx.req.auto_run && !read_only).then(|| Gate {
+                what: format!("{} {}", event.tool_name, one_line(&canonical(&args), 200)),
+                place: format!("MCP server {server}"),
+                reason: String::new(),
+            }),
+            None => permission_gate(event.tool_name, &args, &self.ctx.req.workspace, self.ctx.req.auto_run),
+        };
+        if let Some(gate) = gate {
             let approved = {
                 let _one_banner = self.ctx.confirm_lock.lock().await;
-                ask_confirm(&self.ctx.app, &self.ctx.run_id, cmd, cwd).await
+                ask_confirm(&self.ctx.app, &self.ctx.run_id, &gate.what, &gate.place, &gate.reason).await
             };
             if !approved {
                 self.step(idx, event.tool_name, summary, true, &tools::ToolResult::err("denied by the user"));
-                return ToolCallAction::Skip("The user denied this command. Do not retry it — continue without it.".into());
+                return ToolCallAction::Skip(
+                    "The user denied this action. Do not retry it or work around it — continue without it, or explain what you would need.".into(),
+                );
             }
         }
         ToolCallAction::Run
@@ -261,6 +275,87 @@ impl AgentHook for UiHook {
     }
 }
 
+/// What the Allow/Deny banner shows for a call that needs a yes.
+struct Gate {
+    what: String,
+    place: String,
+    reason: String,
+}
+
+/// Decides whether a tool call must wait for the user. `reason` is empty
+/// for the plain "commands need approval" case and names the danger
+/// otherwise.
+fn permission_gate(tool: &str, args: &Value, workspace: &str, auto_run: bool) -> Option<Gate> {
+    let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    match tool {
+        "run_command" | "ssh_exec" => {
+            let cmd = get("command");
+            let risky = crate::safety::risky_command(cmd);
+            if auto_run && risky.is_none() {
+                return None;
+            }
+            let place = if tool == "ssh_exec" {
+                format!("server {}", get("server"))
+            } else if get("cwd").is_empty() {
+                workspace.to_string()
+            } else {
+                get("cwd").to_string()
+            };
+            Some(Gate {
+                what: cmd.to_string(),
+                place,
+                reason: risky.map(|r| format!("Risky command: {r}")).unwrap_or_default(),
+            })
+        }
+        "read_file" | "list_dir" | "grep" | "apply_patch" | "write_file" | "edit_file" => {
+            let path = get("path");
+            let write = matches!(tool, "apply_patch" | "write_file" | "edit_file");
+            let full = full_path(workspace, path);
+            let reason = if let Some(why) = crate::safety::sensitive_path(&full.to_string_lossy(), write) {
+                format!("{} {}", if write { "Writes a file that" } else { "Reads a file that" }, why)
+            } else if write && !auto_run && !is_inside(&full, Path::new(workspace)) {
+                "Writes outside the project folder".to_string()
+            } else {
+                return None;
+            };
+            Some(Gate {
+                what: format!("{} {}", if write { "edit" } else { "read" }, full.display()),
+                place: workspace.to_string(),
+                reason,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The path a tool will touch, relative paths joined onto the workspace and
+/// `.`/`..` folded lexically (the file may not exist yet).
+fn full_path(workspace: &str, path: &str) -> PathBuf {
+    let p = Path::new(path.trim());
+    let joined = if p.is_absolute() { p.to_path_buf() } else { Path::new(workspace).join(p) };
+    let mut out = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn is_inside(path: &Path, root: &Path) -> bool {
+    if root.as_os_str().is_empty() {
+        return true;
+    }
+    // Windows paths compare case-insensitively.
+    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let (p, r) = (norm(path), norm(root));
+    p == r || p.starts_with(&(r + "/"))
+}
+
 /// Card input for a call whose JSON arguments may still be incomplete.
 fn live_summary(name: &str, args: &str) -> String {
     if let Ok(v) = serde_json::from_str::<Value>(args) {
@@ -270,6 +365,7 @@ fn live_summary(name: &str, args: &str) -> String {
         "run_command" | "ssh_exec" => "command",
         "grep" => "pattern",
         "delegate" => "agent",
+        "skill" => "name",
         _ => "path",
     };
     let head = partial_field(args, key).unwrap_or_default();
@@ -405,6 +501,123 @@ fn delegate_tool(ctx: &RunCtx) -> DynamicTool {
                             Err(e) => tools::ToolResult::err(e),
                         }
                     }
+                };
+                let text = model_text(&res);
+                tctx.insert_result(res);
+                Ok(ToolOutput::text(text))
+            })
+        }),
+    )
+}
+
+/// The `skill` tool: loads a skill's instructions (or one of its files).
+fn skill_tool(skills: Arc<Vec<crate::skills::Skill>>) -> DynamicTool {
+    let names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
+    DynamicTool::new(
+        "skill",
+        "Load the instructions of a skill listed in the system prompt. Call it before starting a task that matches the skill's description, then follow the instructions. Pass `file` to read one of the skill's supporting files.",
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "enum": names, "description": "Skill to load." },
+                "file": { "type": "string", "description": "Optional: a file inside the skill folder, as listed by the skill." }
+            },
+            "required": ["name"]
+        }),
+        tool_fn(move |tctx, args| {
+            let skills = skills.clone();
+            Box::pin(async move {
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let file = args.get("file").and_then(|v| v.as_str());
+                let res = match skills.iter().find(|s| s.name == name) {
+                    None => tools::ToolResult::err(format!("unknown skill {name:?}")),
+                    Some(s) => match crate::skills::load_for_model(s, file) {
+                        Ok(text) => tools::ToolResult::ok(text),
+                        Err(e) => tools::ToolResult::err(e),
+                    },
+                };
+                let text = model_text(&res);
+                tctx.insert_result(res);
+                Ok(ToolOutput::text(text))
+            })
+        }),
+    )
+}
+
+/// One MCP tool offered to the model.
+#[derive(Clone)]
+struct McpBinding {
+    server: Arc<crate::mcp::McpServer>,
+    tool: crate::mcp::McpTool,
+    /// Name the model sees (`mcp__server__tool`, unique within the run).
+    name: String,
+}
+
+/// Connects every enabled MCP server (pooled — usually instant) and lists
+/// their tools. A server that fails gets a red card and is left out; the run
+/// goes on with the rest.
+async fn load_mcp(app: &AppHandle, run_id: &str, counter: &AtomicUsize) -> Vec<McpBinding> {
+    let servers: Vec<_> = crate::mcp::list(app)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.enabled)
+        .collect();
+    if servers.is_empty() {
+        return Vec::new();
+    }
+    let results = futures_util::future::join_all(servers.into_iter().map(|s| async move {
+        let r = tokio::select! {
+            r = crate::mcp::connect(&s) => r,
+            _ = crate::cancel::cancel_signal(run_id) => Err(crate::cancel::STOPPED.to_string()),
+        };
+        (s, r)
+    }))
+    .await;
+    let mut out: Vec<McpBinding> = Vec::new();
+    for (server, res) in results {
+        match res {
+            Ok(conn) => {
+                let server = Arc::new(server);
+                for tool in &conn.tools {
+                    let mut name = crate::mcp::tool_name(&server.name, &tool.name);
+                    let mut n = 2;
+                    while out.iter().any(|b| b.name == name) {
+                        let suffix = format!("_{n}");
+                        name = format!("{}{suffix}", name.chars().take(64 - suffix.len()).collect::<String>());
+                        n += 1;
+                    }
+                    out.push(McpBinding { server: server.clone(), tool: tool.clone(), name });
+                }
+            }
+            Err(e) if e == crate::cancel::STOPPED => {}
+            Err(e) => {
+                let idx = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                emit_step(app, run_id, idx, "mcp", format!("connect {}", server.name), true, &tools::ToolResult::err(e));
+            }
+        }
+    }
+    out
+}
+
+fn mcp_tool(b: &McpBinding) -> DynamicTool {
+    let desc = if b.tool.description.trim().is_empty() {
+        format!("{} (MCP server {})", b.tool.name, b.server.name)
+    } else {
+        format!("{} (MCP server {})", b.tool.description.trim(), b.server.name)
+    };
+    let (server, tool_name) = (b.server.clone(), b.tool.name.clone());
+    DynamicTool::new(
+        b.name.clone(),
+        desc,
+        b.tool.input_schema.clone(),
+        tool_fn(move |tctx, args| {
+            let (server, tool_name) = (server.clone(), tool_name.clone());
+            Box::pin(async move {
+                let res = match crate::mcp::call(&server, &tool_name, args).await {
+                    Ok((text, false)) => tools::ToolResult::ok(text),
+                    Ok((text, true)) => tools::ToolResult::err(text),
+                    Err(e) => tools::ToolResult::err(e),
                 };
                 let text = model_text(&res);
                 tctx.insert_result(res);
@@ -656,13 +869,19 @@ pub(super) async fn run(
     turns: Vec<crate::chat::ChatTurn>,
 ) -> Result<String, String> {
     let parallel = req.max_agents.max(1);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let skills = Arc::new(crate::skills::for_run(app, &req.workspace));
+    let mcp = load_mcp(app, run_id, &counter).await;
+    if is_cancelled(run_id) {
+        return cancelled_result(String::new());
+    }
     let ctx = RunCtx {
         app: app.clone(),
         run_id: run_id.to_string(),
         req: Arc::new(req.clone()),
         root: root.to_path_buf(),
         steps: Arc::default(),
-        counter: Arc::new(AtomicUsize::new(0)),
+        counter,
         confirm_lock: Arc::default(),
         agent_slots: Arc::new(tokio::sync::Semaphore::new(parallel)),
         delegate_cards: Arc::default(),
@@ -674,6 +893,11 @@ pub(super) async fn run(
             elapsed_ms: 0,
         })),
         started: std::time::Instant::now(),
+        mcp_tools: Arc::new(
+            mcp.iter()
+                .map(|b| (b.name.clone(), (b.server.name.clone(), b.tool.read_only)))
+                .collect(),
+        ),
     };
 
     let has_helpers = req.subagents.iter().any(|s| !s.name.trim().is_empty());
@@ -683,12 +907,50 @@ pub(super) async fn run(
             "\n\nHelper agents are available through the `delegate` tool (up to {parallel} at once). They are optional: do simple or tightly coupled work yourself, and delegate only self-contained parts that match a helper's specialty."
         ));
     }
+    if !skills.is_empty() {
+        preamble.push_str(
+            "\n\nSkills — instruction packs for particular kinds of tasks. When the request matches a skill's description, call the `skill` tool with its name BEFORE you start, then follow it:",
+        );
+        for s in skills.iter() {
+            preamble.push_str(&format!("\n- {}: {}", s.name, one_line(&s.description, 300)));
+        }
+    }
+    if !mcp.is_empty() {
+        preamble.push_str(
+            "\n\nTools named mcp__<server>__<tool> come from MCP servers the user connected; use them when they fit the task better than the built-in tools.",
+        );
+    }
     let tools = || {
         let mut t = fs_tools(&ctx);
         if has_helpers {
             t.push(delegate_tool(&ctx));
         }
+        if !skills.is_empty() {
+            t.push(skill_tool(skills.clone()));
+        }
+        t.extend(mcp.iter().map(mcp_tool));
         t
+    };
+    // /commands, invoked skills and @mentions → what the model reads. File
+    // IO and git run off the async workers.
+    let turns = {
+        let (skills, root) = (skills.clone(), root.to_path_buf());
+        tokio::task::spawn_blocking(move || {
+            let is_user = |r: &str| r != "agent" && r != "assistant";
+            let last_user = turns.iter().rposition(|t| is_user(&t.role));
+            turns
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut t)| {
+                    if is_user(&t.role) {
+                        t.text = super::expand::user_turn(&t.text, &skills, &root, Some(i) == last_user);
+                    }
+                    t
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| format!("prompt expansion failed: {e}"))?
     };
     let (history, prompt) = to_messages(req, &turns);
     let text = run_with_retry(&ctx, &preamble, tools, None, prompt, history, parallel, true, |_| {}).await?;

@@ -43,6 +43,10 @@ pub enum RunEvent {
     Confirm {
         command: String,
         cwd: String,
+        /// Why this call needs a yes (risky command, secrets, outside the
+        /// project); empty for an ordinary "run commands?" question.
+        #[serde(default)]
+        reason: String,
     },
     Done {
         answer: String,

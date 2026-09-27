@@ -7,27 +7,25 @@
  */
 import type { Attachment } from "../core/types.i";
 
-/**
+/*
  * No client-side size cap — the user decides what to attach. The provider is
  * the one that ultimately rejects an oversized payload (an HTTP error the
- * chat surfaces normally). Constants stay exported for old references.
+ * chat surfaces normally).
  */
-export const MAX_BYTES = Number.POSITIVE_INFINITY;
-export const MAX_TEXT_BYTES = Number.POSITIVE_INFINITY;
 
-export const TEXT_EXTENSIONS = new Set([
+const TEXT_EXTENSIONS = new Set([
   "txt", "md", "markdown", "json", "yaml", "yml", "toml", "ini", "cfg", "env",
   "js", "jsx", "ts", "tsx", "mjs", "cjs", "py", "rb", "go", "rs", "java", "kt",
   "c", "h", "cpp", "hpp", "cs", "php", "swift", "sh", "bash", "ps1", "bat",
   "sql", "html", "css", "scss", "xml", "csv", "log", "gitignore", "dockerfile",
 ]);
 
-export function extension(name: string): string {
+function extension(name: string): string {
   const parts = name.toLowerCase().split(".");
   return parts.length > 1 ? parts[parts.length - 1] : "";
 }
 
-export function readAsText(file: File): Promise<string> {
+function readAsText(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result ?? ""));
@@ -36,7 +34,7 @@ export function readAsText(file: File): Promise<string> {
   });
 }
 
-export function readAsDataUrl(file: File): Promise<string> {
+function readAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result ?? ""));

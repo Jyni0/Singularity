@@ -6,7 +6,7 @@ import { Combobox } from "../ui/Combobox.c";
 import { SBUTTON } from "../ui/tokens.s";
 
 /** Per-project command permission choices. */
-export const PERM_MODES: Array<{ id: PermMode; label: string; hint: string }> = [
+const PERM_MODES: Array<{ id: PermMode; label: string; hint: string }> = [
   { id: "bypass", label: "Bypass all", hint: "Run commands right away, never ask" },
   { id: "default", label: "As default", hint: "Use the global setting" },
   { id: "ask", label: "Always ask", hint: "Ask before every command" },

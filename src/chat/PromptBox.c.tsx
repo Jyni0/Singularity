@@ -1,9 +1,13 @@
-import { useState, useEffect, useRef } from "react";
-import { motion } from "motion/react";
-import { Send, X, Square, Mic, Loader2, Paperclip, FileText } from "lucide-react";
+import { useState, useEffect, useRef, useMemo } from "react";
+import { motion, AnimatePresence } from "motion/react";
+import {
+  Send, X, Square, Mic, Loader2, Paperclip, FileText, Folder, GitBranch, SquarePen, Zap, Rabbit, Scale, Brain,
+  Sparkles, Plug, ListChecks, SearchCode, BookOpen, Wrench, FlaskConical, GitCommitHorizontal,
+  ListPlus, Pencil, Play, CornerDownRight,
+} from "lucide-react";
 import * as db from "../core/db.r";
 import type { Project, Gateway, Attachment, Effort } from "../core/types.i";
-import type { ChatSelection } from "../hooks/useChat.h";
+import type { ChatSelection, QueuedPrompt } from "../hooks/useChat.h";
 import { toAttachments, formatSize } from "../utils/attachments.u";
 import { useDictation } from "../hooks/useDictation.h";
 import { useOverlayThumb } from "../hooks/useOverlayThumb.h";
@@ -13,6 +17,44 @@ import { ModelSelector } from "./ModelSelector.c";
 import { ProjectPicker } from "./ProjectPicker.c";
 import { EffortChip } from "./EffortChip.c";
 import { TemperatureChip } from "./TemperatureChip.c";
+import { ComposerMenu, type ComposerItem } from "./ComposerMenu.c";
+import { detectTrigger, mentionText, rankFiles, replaceToken, splitPath } from "./composer.u";
+
+/** What a `/` action asks the app to do. */
+export type PromptCommand = "new" | "skills" | "mcp";
+
+/** A `/` entry: runs at once (action) or stays in the prompt (template —
+ *  expanded by the agent, see src-tauri/src/agent/expand.rs). */
+interface SlashDef {
+  name: string;
+  hint: string;
+  icon: React.ReactNode;
+  kind: "action" | "template" | "skill";
+}
+
+const ICON = { size: 13, strokeWidth: 1.6 } as const;
+
+const TEMPLATES: SlashDef[] = [
+  { name: "plan", hint: "Investigate and write a plan — no changes", icon: <ListChecks {...ICON} />, kind: "template" },
+  { name: "review", hint: "Review the uncommitted changes", icon: <SearchCode {...ICON} />, kind: "template" },
+  { name: "explain", hint: "Explain code or the whole project", icon: <BookOpen {...ICON} />, kind: "template" },
+  { name: "fix", hint: "Find and fix a problem, then verify", icon: <Wrench {...ICON} />, kind: "template" },
+  { name: "test", hint: "Write tests and run them", icon: <FlaskConical {...ICON} />, kind: "template" },
+  { name: "commit", hint: "Commit the current changes", icon: <GitCommitHorizontal {...ICON} />, kind: "template" },
+];
+
+const ACTIONS: SlashDef[] = [
+  { name: "new", hint: "Start a new conversation", icon: <SquarePen {...ICON} />, kind: "action" },
+  { name: "model", hint: "Choose the model", icon: <Zap {...ICON} />, kind: "action" },
+  { name: "fast", hint: "Effort: fast answers", icon: <Rabbit {...ICON} />, kind: "action" },
+  { name: "balanced", hint: "Effort: balanced", icon: <Scale {...ICON} />, kind: "action" },
+  { name: "think", hint: "Effort: think harder", icon: <Brain {...ICON} />, kind: "action" },
+  { name: "skills", hint: "Manage skills", icon: <Sparkles {...ICON} />, kind: "action" },
+  { name: "mcp", hint: "Manage MCP servers", icon: <Plug {...ICON} />, kind: "action" },
+];
+
+/** Workspace listings are cached this long (ms) between @ menus. */
+const FILES_TTL = 30_000;
 
 export function PromptBox({
   onSend,
@@ -25,6 +67,11 @@ export function PromptBox({
   onStop,
   pickedModel,
   onPickModel,
+  workspace = "",
+  onCommand,
+  queued = [],
+  onTakeQueued,
+  onRunQueued,
 }: {
   onSend: (text: string, selection: ChatSelection, attachments: Attachment[]) => void;
   projects: Project[];
@@ -39,6 +86,16 @@ export function PromptBox({
   pickedModel?: { gatewayId: string; modelId: string } | null;
   /** Reports the model the user picked, so it can be persisted. */
   onPickModel?: (next: { gatewayId: string; modelId: string }) => void;
+  /** Folder the prompt's run works in — the @ menu lists its files. */
+  workspace?: string;
+  /** `/new`, `/skills`, `/mcp` — handled by the app. */
+  onCommand?: (cmd: PromptCommand) => void;
+  /** Follow-ups written while the agent works; they run one by one after it. */
+  queued?: QueuedPrompt[];
+  /** Removes a queued prompt and returns it (Edit / Delete). */
+  onTakeQueued?: (id: string) => QueuedPrompt | undefined;
+  /** Sends a queued prompt now (the queue is paused after Stop). */
+  onRunQueued?: (id: string) => void;
 }) {
   const [text, setText] = useState("");
   const [gatewayId, setGatewayId] = useState("");
@@ -57,6 +114,173 @@ export function PromptBox({
   const fileInput = useRef<HTMLInputElement>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
   const promptThumb = useOverlayThumb(ref);
+
+  /* ---------- `/` and `@` menu ---------- */
+  const [caret, setCaret] = useState(0);
+  const [menuActive, setMenuActive] = useState(0);
+  /** Token start the user closed the menu on (Esc) — stays closed there. */
+  const [dismissedAt, setDismissedAt] = useState<number | null>(null);
+  const [modelSignal, setModelSignal] = useState(0);
+  const [files, setFiles] = useState<{ root: string; at: number; list: string[] } | null>(null);
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [skills, setSkills] = useState<db.Skill[]>([]);
+  const trigger = detectTrigger(text, caret);
+  const menuOpen = trigger !== null && dismissedAt !== trigger.start;
+
+  // Fresh data when a menu opens: skills for `/`, the file index for `@`.
+  const triggerKind = menuOpen ? trigger.kind : null;
+  useEffect(() => {
+    if (triggerKind === "slash") {
+      void db.listSkills(workspace).then((l) => setSkills(l.filter((s) => s.enabled))).catch(() => setSkills([]));
+    }
+    if (triggerKind === "mention" && workspace) {
+      if (files && files.root === workspace && Date.now() - files.at < FILES_TTL) return;
+      setFilesLoading(true);
+      void db
+        .workspaceFiles(workspace)
+        .then((list) => setFiles({ root: workspace, at: Date.now(), list }))
+        .catch(() => setFiles({ root: workspace, at: Date.now(), list: [] }))
+        .finally(() => setFilesLoading(false));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [triggerKind, workspace]);
+
+  const slashDefs = useMemo<SlashDef[]>(() => {
+    const q = trigger?.kind === "slash" ? trigger.query.toLowerCase() : "";
+    const skillDefs: SlashDef[] = skills.map((s) => ({
+      name: s.name,
+      hint: s.description,
+      icon: <Sparkles {...ICON} />,
+      kind: "skill",
+    }));
+    const all = [...TEMPLATES, ...skillDefs, ...ACTIONS];
+    const starts = all.filter((d) => d.name.toLowerCase().startsWith(q));
+    const contains = all.filter((d) => !d.name.toLowerCase().startsWith(q) && d.name.toLowerCase().includes(q));
+    // Keep the group order stable: prompts, skills, actions.
+    const order = (d: SlashDef) => (d.kind === "template" ? 0 : d.kind === "skill" ? 1 : 2);
+    return [...starts, ...contains].sort((a, b) => order(a) - order(b));
+  }, [trigger?.kind, trigger?.query, skills]);
+
+  const mentionPaths = useMemo<string[]>(() => {
+    if (trigger?.kind !== "mention") return [];
+    const q = trigger.query;
+    const git = q && !q.includes("/") && "git".startsWith(q.toLowerCase()) ? ["@git"] : !q ? ["@git"] : [];
+    return [...git, ...rankFiles(files?.root === workspace ? files.list : [], q)];
+  }, [trigger?.kind, trigger?.query, files, workspace]);
+
+  const menuItems: ComposerItem[] =
+    trigger?.kind === "slash"
+      ? slashDefs.map((d) => ({
+          id: `${d.kind}:${d.name}`,
+          group: d.kind === "template" ? "Prompts" : d.kind === "skill" ? "Skills" : "Actions",
+          icon: d.icon,
+          label: `/${d.name}`,
+          detail: d.hint,
+          mono: true,
+          badge: d.kind === "skill" ? "skill" : undefined,
+        }))
+      : mentionPaths.map((p) => {
+          if (p === "@git") {
+            return { id: p, group: "Context", icon: <GitBranch {...ICON} />, label: "git", detail: "status, recent commits and diff", mono: true };
+          }
+          const { name, dir } = splitPath(p);
+          return {
+            id: p,
+            group: "Files & folders",
+            icon: p.endsWith("/") ? <Folder {...ICON} /> : <FileText {...ICON} />,
+            label: name,
+            detail: dir,
+          };
+        });
+
+  // A new query starts the highlight at the top.
+  useEffect(() => setMenuActive(0), [trigger?.kind, trigger?.query]);
+  // Leaving the token re-arms Esc for the next one.
+  useEffect(() => {
+    if (!trigger) setDismissedAt(null);
+  }, [trigger]);
+
+  /** Puts text + caret into the textarea after a menu pick. */
+  const applyText = (next: { text: string; caret: number }) => {
+    setText(next.text);
+    setCaret(next.caret);
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(next.caret, next.caret);
+      autoGrow();
+    });
+  };
+
+  /** Runs a `/` action; true when `name` was one. */
+  const runAction = (name: string): boolean => {
+    switch (name) {
+      case "new":
+        onCommand?.("new");
+        return true;
+      case "model":
+        setModelSignal((n) => n + 1);
+        return true;
+      case "fast":
+        pickEffort("low");
+        return true;
+      case "balanced":
+        pickEffort("medium");
+        return true;
+      case "think":
+        pickEffort("high");
+        return true;
+      case "skills":
+      case "mcp":
+        onCommand?.(name);
+        return true;
+    }
+    return false;
+  };
+
+  const pickMenu = (index: number) => {
+    if (!trigger) return;
+    if (trigger.kind === "slash") {
+      const d = slashDefs[index];
+      if (!d) return;
+      if (d.kind === "action") {
+        applyText(replaceToken(text, trigger, ""));
+        runAction(d.name);
+        return;
+      }
+      applyText(replaceToken(text, trigger, `/${d.name} `));
+      return;
+    }
+    const p = mentionPaths[index];
+    if (!p) return;
+    if (p === "@git") return applyText(replaceToken(text, trigger, "@git "));
+    // A folder opens: the menu lists its children next. Space attaches it.
+    applyText(replaceToken(text, trigger, mentionText(p, p.endsWith("/"))));
+  };
+
+  const onMenuKey = (e: React.KeyboardEvent): boolean => {
+    if (!menuOpen || !trigger) return false;
+    const n = menuItems.length;
+    if (e.key === "Escape") {
+      setDismissedAt(trigger.start);
+      return true;
+    }
+    if (n === 0) return false;
+    if (e.key === "ArrowDown") {
+      setMenuActive((i) => (i + 1) % n);
+      return true;
+    }
+    if (e.key === "ArrowUp") {
+      setMenuActive((i) => (i - 1 + n) % n);
+      return true;
+    }
+    if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
+      pickMenu(Math.min(menuActive, n - 1));
+      return true;
+    }
+    return false;
+  };
 
   // Keep the selection pointed at a model that actually exists: the provider
   // list is loaded from the database and changes as providers are connected.
@@ -182,6 +406,13 @@ export function PromptBox({
   const send = () => {
     // A prompt can be just attachments — that is a legitimate request.
     if (!text.trim() && attachments.length === 0) return;
+    // A bare action command ("/new") runs instead of being sent.
+    const bare = /^\/([\w-]+)$/.exec(text.trim());
+    if (bare && attachments.length === 0 && runAction(bare[1].toLowerCase())) {
+      setText("");
+      requestAnimationFrame(autoGrow);
+      return;
+    }
     // Sending cancels an in-flight recording instead of transcribing it.
     speech.cancel();
     onSend(text.trim(), { gatewayId, modelId, effort, temperature }, attachments);
@@ -216,6 +447,78 @@ export function PromptBox({
             void acceptFiles(Array.from(e.dataTransfer.files));
           }}
         >
+          <AnimatePresence>
+            {menuOpen && trigger && (
+              <ComposerMenu
+                key={trigger.kind}
+                title={trigger.kind === "slash" ? "Commands" : workspace ? `Files in ${workspace.split(/[\\/]/).filter(Boolean).pop()}` : "Files"}
+                items={menuItems}
+                active={Math.min(menuActive, Math.max(0, menuItems.length - 1))}
+                loading={trigger.kind === "mention" && filesLoading}
+                empty={trigger.kind === "slash" ? "No command matches" : "No file or folder matches"}
+                onPick={pickMenu}
+                onHover={setMenuActive}
+              />
+            )}
+          </AnimatePresence>
+          {/* Queued follow-ups: sent in order once the running task ends. */}
+          {queued.length > 0 && (
+            <div className="flex flex-col gap-1 px-3 pt-3">
+              <div className="flex items-center gap-1.5 px-1 text-[10.5px] font-medium uppercase tracking-wide text-[var(--text-dim)]">
+                <ListPlus size={11} />
+                {busy ? `Queued · runs after the current task` : `Queued · paused after Stop`}
+              </div>
+              {queued.map((q, i) => (
+                <div
+                  key={q.id}
+                  className="group flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] py-1 pl-2 pr-1"
+                >
+                  <span className="shrink-0 font-mono text-[10.5px] text-[var(--text-dim)]">{i + 1}</span>
+                  <CornerDownRight size={12} className="shrink-0 text-[var(--text-dim)]" />
+                  <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text-main)]" title={q.text}>
+                    {q.text || "(attachments)"}
+                  </span>
+                  {q.attachments.length > 0 && (
+                    <span className="flex shrink-0 items-center gap-0.5 text-[10.5px] text-[var(--text-dim)]">
+                      <Paperclip size={10} /> {q.attachments.length}
+                    </span>
+                  )}
+                  {!busy && (
+                    <button
+                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--accent)] transition-colors hover:bg-[var(--hover-bg)]"
+                      title="Send now"
+                      onClick={() => onRunQueued?.(q.id)}
+                    >
+                      <Play size={12} />
+                    </button>
+                  )}
+                  <button
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                    title="Edit — moves it back into the prompt box"
+                    onClick={() => {
+                      const item = onTakeQueued?.(q.id);
+                      if (!item) return;
+                      setText((prev) => (prev.trim() ? `${prev}\n${item.text}` : item.text));
+                      setAttachments((prev) => [...prev, ...item.attachments]);
+                      requestAnimationFrame(() => {
+                        autoGrow();
+                        ref.current?.focus();
+                      });
+                    }}
+                  >
+                    <Pencil size={11} />
+                  </button>
+                  <button
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)]"
+                    title="Remove from the queue"
+                    onClick={() => onTakeQueued?.(q.id)}
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           {/* Attachment previews, above the input */}
           {attachments.length > 0 && (
             <div className="flex flex-wrap gap-1.5 px-3 pt-3">
@@ -268,13 +571,25 @@ export function PromptBox({
               ref={ref}
               rows={1}
               className="no-native-scrollbar max-h-[200px] min-h-[44px] w-full resize-none border-none bg-transparent px-4 pb-2 pt-3.5 text-[14px] leading-normal text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
-              placeholder="Ask anything…  /commands   @files @folders @terminal @git"
+              placeholder={
+                busy
+                  ? "Agent is working — write a follow-up, it runs when the current task ends…"
+                  : "Ask anything…   / for commands and skills   @ for files, folders and git"
+              }
               value={text}
               onChange={(e) => {
                 setText(e.target.value);
+                setCaret(e.target.selectionStart ?? e.target.value.length);
                 autoGrow();
               }}
+              onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
+              onBlur={() => setDismissedAt(trigger?.start ?? null)}
+              onFocus={() => setDismissedAt(null)}
               onKeyDown={(e) => {
+                if (onMenuKey(e)) {
+                  e.preventDefault();
+                  return;
+                }
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
                   send();
@@ -286,11 +601,12 @@ export function PromptBox({
           </div>
           {/* Toolbar: 6px 12px 10px, space-between */}
           <div className="flex items-center justify-between gap-1.5 px-3 pb-2.5 pt-1.5">
-            <div className="flex min-w-0 items-center gap-1.5">
+            <div className="flex min-w-0 items-center gap-1">
               <ModelSelector
                 gateways={gateways}
                 gatewayId={gatewayId}
                 modelId={modelId}
+                openSignal={modelSignal}
                 onSelect={(g, m) => {
                   setGatewayId(g);
                   setModelId(m);
@@ -360,6 +676,16 @@ export function PromptBox({
                   />
                 )}
               </button>
+              {/* While the agent works, Send queues a follow-up next to Stop. */}
+              {busy && (text.trim() || attachments.length > 0) && (
+                <button
+                  className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--accent)] text-white transition-colors hover:bg-[var(--accent-hover)]"
+                  onClick={send}
+                  title="Queue — sends when the current task ends (Enter)"
+                >
+                  <ListPlus size={15} />
+                </button>
+              )}
               {busy ? (
                 <motion.button
                   className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--diff-del)] text-white transition-opacity hover:opacity-90"

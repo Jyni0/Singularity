@@ -1,60 +1,243 @@
-import { useState } from "react";
-import { CalendarClock } from "lucide-react";
-import { SINPUT } from "../ui/tokens.s";
+import { useMemo, useState } from "react";
+import { CalendarClock, Save } from "lucide-react";
 import { Modal } from "../ui/Modal.c";
+import { Combobox } from "../ui/Combobox.c";
+import type { Model, Project, Provider, ScheduledTask } from "../core/types.i";
+import { NO_PROJECT } from "../core/types.i";
+import type { ScheduleKind } from "../utils/cron.u";
+import { WEEKDAYS, cronError, describeSchedule, nextRun, presetCron, presetFields } from "../utils/cron.u";
 
+const FIELD =
+  "h-9 w-full rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 text-[12.5px] text-[var(--text-main)] outline-none transition-colors focus:border-[var(--accent)]";
+const LABEL = "mb-1.5 block text-[11px] font-medium text-[var(--text-muted)]";
+
+const KINDS: Array<{ id: ScheduleKind; label: string }> = [
+  { id: "hourly", label: "Every hour" },
+  { id: "daily", label: "Every day" },
+  { id: "weekly", label: "Every week" },
+  { id: "cron", label: "Custom (cron)" },
+];
+
+/** Monday-first order for the weekday picker; values stay cron numbers (0 = Sunday). */
+const WEEK_ORDER = [1, 2, 3, 4, 5, 6, 0];
+
+/**
+ * Create / edit a scheduled task: name, model, project (required),
+ * schedule (hourly / daily at a time / weekly on a day at a time / cron)
+ * and the prompt the agent receives on every run.
+ */
 export function ScheduleModal({
-  onAdd,
+  task,
+  projects,
+  providers,
+  models,
+  defaultModel,
+  onSave,
   onClose,
 }: {
-  onAdd: (task: string) => void;
+  /** Undefined = create. */
+  task?: ScheduledTask;
+  projects: Project[];
+  providers: Provider[];
+  models: Model[];
+  /** Pre-selected model for a new task (the prompt box's current pick). */
+  defaultModel: { gatewayId: string; modelId: string } | null;
+  onSave: (task: ScheduledTask) => Promise<void>;
   onClose: () => void;
 }) {
-  const [cmd, setCmd] = useState("");
-  const [freq, setFreq] = useState("daily");
-  const submit = () => {
-    if (!cmd.trim()) return;
-    onAdd(`${freq === "daily" ? "Nightly" : freq === "weekly" ? "Weekly" : "Once"} ${cmd.trim()}`);
-    onClose();
+  const preset = task && task.kind !== "cron" ? presetFields(task.schedule) : { time: "09:00", weekday: 1 };
+  const [name, setName] = useState(task?.name ?? "");
+  const [modelKey, setModelKey] = useState(
+    task ? `${task.provider_id}::${task.model_id}` : defaultModel ? `${defaultModel.gatewayId}::${defaultModel.modelId}` : ""
+  );
+  const realProjects = projects.filter((p) => p.name !== NO_PROJECT);
+  const [project, setProject] = useState(task?.project ?? (realProjects.length === 1 ? realProjects[0].name : ""));
+  const [kind, setKind] = useState<ScheduleKind>(task?.kind ?? "daily");
+  const [time, setTime] = useState(preset.time);
+  const [weekday, setWeekday] = useState(preset.weekday);
+  const [cron, setCron] = useState(task?.kind === "cron" ? task.schedule : "0 9 * * 1-5");
+  const [prompt, setPrompt] = useState(task?.prompt ?? "");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const modelOptions = useMemo(
+    () =>
+      models
+        .filter((m) => m.enabled && providers.some((p) => p.id === m.provider_id && p.enabled))
+        .map((m) => ({
+          value: `${m.provider_id}::${m.model_id}`,
+          label: m.name || m.model_id,
+          hint: providers.find((p) => p.id === m.provider_id)?.name,
+        })),
+    [models, providers]
+  );
+
+  const schedule = kind === "cron" ? cron.trim() : presetCron(kind, time, weekday);
+  const scheduleError = kind === "cron" ? cronError(schedule) : null;
+  const upcoming = (() => {
+    if (scheduleError) return null;
+    try {
+      return nextRun(schedule, new Date());
+    } catch {
+      return null;
+    }
+  })();
+
+  const save = async () => {
+    setError(null);
+    if (!name.trim()) return setError("Give the task a name.");
+    if (!modelKey) return setError("Pick the model that runs the task.");
+    if (!project) return setError("Pick a project — scheduled chats are created inside it.");
+    if (scheduleError) return setError(scheduleError);
+    if (!upcoming) return setError("This schedule never fires.");
+    if (!prompt.trim()) return setError("Write the prompt the agent should run.");
+    const [provider_id, model_id] = modelKey.split("::");
+    setBusy(true);
+    try {
+      await onSave({
+        id: task?.id ?? `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+        name: name.trim(),
+        project,
+        provider_id,
+        model_id,
+        kind,
+        schedule,
+        prompt: prompt.trim(),
+        enabled: task?.enabled ?? true,
+        last_run_at: task?.last_run_at ?? null,
+        armed_at: task?.armed_at ?? 0,
+        last_conv: task?.last_conv ?? "",
+        created_at: task?.created_at ?? Math.floor(Date.now() / 1000),
+      });
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
   };
+
   return (
-    <Modal title="Schedule Task" onClose={onClose}>
-      <div className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">Command</div>
-      <input
-        className={`${SINPUT} w-full font-mono`}
-        placeholder="/review @main"
-        value={cmd}
-        onChange={(e) => setCmd(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && submit()}
-        autoFocus
-      />
-      <div className="mt-2 text-[11px] uppercase tracking-wide text-[var(--text-dim)]">Frequency</div>
-      <div className="flex items-center gap-2">
-        {["once", "daily", "weekly"].map((f) => (
-          <button
-            key={f}
-            className={`h-7 rounded-md border px-2.5 font-mono text-[12px] transition-colors ${
-              freq === f
-                ? "border-[var(--accent)] bg-[var(--hover-bg)] text-[var(--text-main)]"
-                : "border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
-            }`}
-            onClick={() => setFreq(f)}
-          >
-            {f}
-          </button>
-        ))}
+    <Modal title={task ? "Edit Scheduled Task" : "Schedule Task"} onClose={onClose} width={560} overflowVisible>
+      <div>
+        <label className={LABEL}>Name</label>
+        <input className={FIELD} value={name} onChange={(e) => setName(e.target.value)} placeholder="Nightly code review" autoFocus />
       </div>
-      <div className="mt-4 flex justify-end">
+
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className={LABEL}>Model</label>
+          {modelOptions.length === 0 ? (
+            <div className="flex h-9 items-center rounded-md border border-dashed border-[var(--border)] px-2.5 text-[11.5px] text-[var(--text-muted)]">
+              No models — add one in Settings → Models
+            </div>
+          ) : (
+            <Combobox value={modelKey} onChange={setModelKey} placeholder="Pick a model" emptyText="No model matches" options={modelOptions} />
+          )}
+        </div>
+        <div>
+          <label className={LABEL}>Project (required)</label>
+          {realProjects.length === 0 ? (
+            <div className="flex h-9 items-center rounded-md border border-dashed border-[var(--border)] px-2.5 text-[11.5px] text-[var(--text-muted)]">
+              No projects — create one first (File → New Project)
+            </div>
+          ) : (
+            <Combobox
+              value={project}
+              onChange={setProject}
+              placeholder="Pick a project"
+              emptyText="No project matches"
+              options={realProjects.map((p) => ({ value: p.name, label: p.name, hint: p.path || undefined }))}
+            />
+          )}
+        </div>
+      </div>
+
+      <div>
+        <label className={LABEL}>Runs</label>
+        <div className="flex gap-1 rounded-md border border-[var(--border)] bg-[var(--bg-input)] p-0.5">
+          {KINDS.map((k) => (
+            <button
+              key={k.id}
+              type="button"
+              className={
+                "h-7 flex-1 rounded text-[11.5px] transition-colors " +
+                (kind === k.id ? "bg-[var(--accent)] text-white" : "text-[var(--text-muted)] hover:text-[var(--text-main)]")
+              }
+              onClick={() => setKind(k.id)}
+            >
+              {k.label}
+            </button>
+          ))}
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          {kind === "weekly" && (
+            <select
+              className={FIELD + " w-[150px]"}
+              value={weekday}
+              onChange={(e) => setWeekday(Number(e.target.value))}
+            >
+              {WEEK_ORDER.map((d) => (
+                <option key={d} value={d}>
+                  {WEEKDAYS[d]}
+                </option>
+              ))}
+            </select>
+          )}
+          {(kind === "daily" || kind === "weekly") && (
+            <input type="time" className={FIELD + " w-[120px]"} value={time} onChange={(e) => setTime(e.target.value || "09:00")} />
+          )}
+          {kind === "cron" && (
+            <input
+              className={FIELD + " font-mono"}
+              value={cron}
+              onChange={(e) => setCron(e.target.value)}
+              placeholder="minute hour day month weekday — e.g. 0 9 * * 1-5"
+              spellCheck={false}
+            />
+          )}
+          {kind === "hourly" && <span className="text-[12px] text-[var(--text-muted)]">At the start of every hour</span>}
+        </div>
+        <div className="mt-1.5 text-[11px] text-[var(--text-dim)]">
+          {scheduleError
+            ? <span className="text-[var(--diff-del)]">{scheduleError}</span>
+            : upcoming
+              ? `${describeSchedule(kind, schedule)} · next run ${upcoming.toLocaleString()}`
+              : "This schedule never fires"}
+        </div>
+      </div>
+
+      <div>
+        <label className={LABEL}>Prompt</label>
+        <textarea
+          className="h-32 w-full resize-none rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 text-[12.5px] leading-[1.5] text-[var(--text-main)] outline-none transition-colors focus:border-[var(--accent)]"
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          placeholder="Review yesterday's commits on main and list anything risky."
+        />
+      </div>
+
+      {error && (
+        <div className="rounded-md border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-3 py-2 text-[12px] text-[var(--diff-del)]">
+          {error}
+        </div>
+      )}
+
+      <div className="mt-2 flex justify-end gap-2">
+        <button
+          className="h-8 rounded-lg border border-[var(--border)] px-3 text-[13px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+          onClick={onClose}
+        >
+          Cancel
+        </button>
         <button
           className="flex h-8 items-center rounded-lg bg-[var(--accent)] px-3 text-[13px] text-white transition-colors hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-50"
-          onClick={submit}
-          disabled={!cmd.trim()}
+          onClick={() => void save()}
+          disabled={busy}
         >
-          <CalendarClock size={14} className="mr-1.5" /> Schedule
+          {task ? <Save size={14} className="mr-1.5" /> : <CalendarClock size={14} className="mr-1.5" />}
+          {task ? "Save" : "Schedule"}
         </button>
       </div>
     </Modal>
   );
 }
-
-/* ---------- Inspection panel (Changes / Commands) ---------- */

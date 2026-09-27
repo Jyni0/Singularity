@@ -15,7 +15,7 @@ import type * as db from "../core/db.r";
 import { OverlayScroll } from "../ui/ScrollArea.c";
 
 /** Renders a file's diff, reused by the file tab. */
-export function FileDiffBody({ step }: { step: db.AgentStepEvent }) {
+function FileDiffBody({ step }: { step: db.AgentStepEvent }) {
   const lines = computeDiff(step.old_text ?? "", step.new_text ?? "");
   return (
     <OverlayScroll

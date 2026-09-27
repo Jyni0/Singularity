@@ -1,7 +1,8 @@
+/* ---------- Temperature chip ---------- */
 import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { ChevronDown, Thermometer } from "lucide-react";
-import { CHIP_CTX } from "../ui/tokens.s";
+import { ChevronDown, Check, Thermometer } from "lucide-react";
+import { CHIP, POPOVER, POPOVER_LABEL, popoverItem, popMotion } from "../ui/tokens.s";
 
 /** Quick presets; "Auto" leaves the provider's default in place. */
 const PRESETS: { label: string; value: number | null; hint: string }[] = [
@@ -26,58 +27,75 @@ export function TemperatureChip({
     const close = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
     };
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
     document.addEventListener("mousedown", close);
-    return () => document.removeEventListener("mousedown", close);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", onKey);
+    };
   }, [open]);
+
+  const slider = value ?? 0.7;
 
   return (
     <div className="relative shrink-0" ref={ref}>
-      <span className={CHIP_CTX} onClick={() => setOpen(!open)} title="Temperature">
+      <span
+        className={`${CHIP} ${open ? "bg-[var(--hover-bg)] text-[var(--text-main)]" : ""}`}
+        onClick={() => setOpen(!open)}
+        title="Temperature"
+      >
         <Thermometer size={12} strokeWidth={1.5} />
         {value === null ? "Auto" : value.toFixed(1)}
         <ChevronDown size={12} />
       </span>
       <AnimatePresence>
         {open && (
-          <motion.div
-            className="absolute bottom-full left-0 z-50 mb-1.5 w-[220px] rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] p-2 shadow-[0_12px_28px_-10px_rgba(0,0,0,0.55)]"
-            initial={{ opacity: 0, y: 6, scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 6, scale: 0.98 }}
-            transition={{ duration: 0.12, ease: "easeOut" }}
-          >
-            <div className="flex items-center justify-between px-1 pb-1.5 text-[10px] uppercase tracking-wide text-[var(--text-dim)]">
+          <motion.div className={`${POPOVER} absolute bottom-[calc(100%+8px)] left-0 w-[240px] gap-0.5`} {...popMotion(true)}>
+            <div className={POPOVER_LABEL}>
               <span>Temperature</span>
-              <span className="font-mono normal-case">{value === null ? "auto" : value.toFixed(2)}</span>
+              <span className="font-mono normal-case tracking-normal text-[var(--text-muted)]">
+                {value === null ? "auto" : value.toFixed(2)}
+              </span>
             </div>
-            <input
-              type="range"
-              min={0}
-              max={2}
-              step={0.05}
-              value={value ?? 0.7}
-              onChange={(e) => onPick(Number(e.target.value))}
-              className="w-full accent-[var(--accent)]"
-            />
-            <div className="mt-1.5 grid grid-cols-2 gap-1">
-              {PRESETS.map((p) => (
-                <button
-                  key={p.label}
-                  className={`rounded-lg px-2 py-1 text-left text-[11.5px] transition-colors ${
-                    value === p.value
-                      ? "bg-[var(--hover-bg)] text-[var(--text-main)]"
-                      : "text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-                  }`}
-                  onClick={() => {
-                    onPick(p.value);
-                    setOpen(false);
-                  }}
-                  title={p.hint}
-                >
-                  {p.label}
-                </button>
-              ))}
+            <div className="px-2 pb-2 pt-1.5">
+              <input
+                type="range"
+                min={0}
+                max={2}
+                step={0.05}
+                value={slider}
+                onChange={(e) => onPick(Number(e.target.value))}
+                className="range-theme"
+                style={{ "--fill": `${(slider / 2) * 100}%` } as React.CSSProperties}
+                aria-label="Temperature"
+              />
+              <div className="mt-1 flex justify-between font-mono text-[9.5px] text-[var(--text-dim)]">
+                <span>0</span>
+                <span>1</span>
+                <span>2</span>
+              </div>
             </div>
+            <div className="mx-1 mb-1 h-px bg-[var(--border-soft)]" />
+            {PRESETS.map((p) => (
+              <button
+                key={p.label}
+                className={popoverItem(value === p.value)}
+                onClick={() => {
+                  onPick(p.value);
+                  setOpen(false);
+                }}
+              >
+                <span className="w-9 shrink-0 font-mono text-[11px] text-[var(--text-dim)]">
+                  {p.value === null ? "—" : p.value.toFixed(1)}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block font-medium">{p.label}</span>
+                  <span className="block truncate text-[10.5px] text-[var(--text-dim)]">{p.hint}</span>
+                </span>
+                {value === p.value && <Check size={13} className="shrink-0 text-[var(--accent)]" />}
+              </button>
+            ))}
           </motion.div>
         )}
       </AnimatePresence>

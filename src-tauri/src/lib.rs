@@ -4,24 +4,23 @@ mod agent;
 mod cancel;
 mod chat;
 mod limiter;
+mod mcp;
 mod db;
 mod discovery;
 mod oauth;
+mod proxy;
 mod runs;
+mod safety;
+mod skills;
 mod ssh;
 mod stt;
 mod vault;
 mod tools;
 mod tray;
+mod updater;
 mod utf8stream;
 
 use tauri::Manager;
-
-/// Absolute path of the SQLite file, so the UI can show users where data lives.
-#[tauri::command]
-fn database_path(app: tauri::AppHandle) -> Result<String, String> {
-    db::db_path(&app)
-}
 
 /// Default folder for the agent's file and command tools.
 ///
@@ -52,6 +51,18 @@ fn set_agent_workspace(app: tauri::AppHandle, path: String) -> Result<String, St
         let _ = std::fs::write(cfg.join("workspace.txt"), dir.to_string_lossy().as_bytes());
     }
     Ok(dir.to_string_lossy().to_string())
+}
+
+/// Files and folders of a workspace for the prompt box's @-mention picker.
+#[tauri::command]
+async fn workspace_files(root: String) -> Result<Vec<String>, String> {
+    let dir = std::path::PathBuf::from(&root);
+    if !dir.is_dir() {
+        return Err(format!("not a folder: {root}"));
+    }
+    tokio::task::spawn_blocking(move || tools::workspace_files(&dir))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Reads the remembered folder, falling back to the app's own workspace.
@@ -95,104 +106,6 @@ async fn google_refresh(
         oauth::refresh(&client_id, &client_secret.unwrap_or_default(), &refresh_token).await?;
     tokens.email = oauth::fetch_email(&tokens.access_token).await;
     Ok(tokens)
-}
-
-/* ---------- Google model discovery ---------- */
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct GoogleModel {
-    pub model_id: String,
-    pub name: String,
-    pub meta: String,
-}
-
-/// Lists Gemini models for an OAuth access token or a plain API key.
-#[tauri::command]
-async fn list_google_models(
-    base_url: Option<String>,
-    access_token: Option<String>,
-    api_key: Option<String>,
-) -> Result<Vec<GoogleModel>, String> {
-    let base = base_url
-        .filter(|u| !u.trim().is_empty())
-        .unwrap_or_else(|| "https://generativelanguage.googleapis.com".into());
-    let base = base.trim_end_matches('/').to_string();
-
-    let token = access_token.filter(|t| !t.trim().is_empty());
-    let key = api_key.filter(|k| !k.trim().is_empty());
-
-    let url = match (&token, &key) {
-        (Some(_), _) => format!("{base}/v1beta/models?pageSize=200"),
-        (None, Some(k)) => format!(
-            "{base}/v1beta/models?pageSize=200&key={}",
-            urlencoding::encode(k.trim())
-        ),
-        (None, None) => return Err("Sign in with Google or provide an API key first".into()),
-    };
-
-    let mut req = reqwest::Client::new().get(&url);
-    if let Some(t) = &token {
-        req = req.bearer_auth(t.trim());
-    }
-
-    let res = req.send().await.map_err(|e| format!("request failed: {e}"))?;
-    let status = res.status();
-    let body = res.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(format!(
-            "Google returned {status}: {}",
-            body.split_whitespace().collect::<Vec<_>>().join(" ")
-        ));
-    }
-
-    #[derive(serde::Deserialize)]
-    struct RawModel {
-        name: String,
-        #[serde(rename = "displayName")]
-        display_name: Option<String>,
-        #[serde(rename = "inputTokenLimit")]
-        input_token_limit: Option<i64>,
-        #[serde(rename = "supportedGenerationMethods")]
-        methods: Option<Vec<String>>,
-    }
-
-    let raw: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("bad JSON: {e}"))?;
-    let list = raw["models"].as_array().cloned().unwrap_or_default();
-
-    let mut out: Vec<GoogleModel> = list
-        .into_iter()
-        .filter_map(|m| serde_json::from_value::<RawModel>(m).ok())
-        // Only Gemini models that can actually generate content belong here.
-        .filter(|m| {
-            m.name.contains("gemini")
-                && m.methods
-                    .as_ref()
-                    .map(|x| x.iter().any(|s| s == "generateContent"))
-                    .unwrap_or(true)
-        })
-        .map(|m| {
-            let id = m.name.rsplit('/').next().unwrap_or(&m.name).to_string();
-            let limit = m.input_token_limit.unwrap_or(0);
-            let meta = if limit >= 1_000_000 {
-                format!("{}M ctx", limit / 1_000_000)
-            } else if limit >= 1_000 {
-                format!("{}k ctx", limit / 1_000)
-            } else {
-                "cloud".to_string()
-            };
-            GoogleModel {
-                name: m.display_name.unwrap_or_else(|| id.clone()),
-                model_id: id,
-                meta,
-            }
-        })
-        .collect();
-
-    out.sort_by(|a, b| a.model_id.cmp(&b.model_id));
-    if out.is_empty() {
-        return Err("No chat-capable Gemini models were returned".into());
-    }
-    Ok(out)
 }
 
 /* ---------- Inference ---------- */
@@ -307,18 +220,6 @@ async fn ssh_connect(app: tauri::AppHandle, server_id: String) -> Result<(), Str
     ssh::connect(&app, "user", &server_id).await
 }
 
-/// Disconnects a pooled session (idempotent — an unknown id is a no-op).
-#[tauri::command]
-async fn ssh_disconnect(app: tauri::AppHandle, server_id: String) -> Result<(), String> {
-    ssh::disconnect(&app, "user", &server_id).await
-}
-
-/// Runs one command on a server, auto-connecting when needed.
-#[tauri::command]
-async fn ssh_exec(app: tauri::AppHandle, server_id: String, command: String) -> Result<String, String> {
-    ssh::exec(&app, "user", &server_id, &command).await
-}
-
 /// Server ids with a live connection — the Units grid paints status from it.
 #[tauri::command]
 fn ssh_connected(app: tauri::AppHandle) -> Vec<String> {
@@ -330,7 +231,13 @@ pub fn run() {
     let migrations = db::migrations();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
+        // ONE app: a second launch (shortcut, installer "run", autostart)
+        // only brings the running window forward and exits — every extra
+        // process used to add its own taskbar button and tray icon.
+        // Registered first, as the plugin requires.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_main(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         // Folder picker for choosing the agent workspace.
         .plugin(tauri_plugin_dialog::init())
@@ -374,13 +281,11 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            database_path,
             agent_workspace,
             set_agent_workspace,
             current_agent_workspace,
             google_sign_in,
             google_refresh,
-            list_google_models,
             discovery::list_provider_models,
             agent_run,
             agent_confirm,
@@ -389,15 +294,31 @@ pub fn run() {
             stop_generation,
             transcribe_audio,
             tray::tray_state,
+            updater::update_check,
+            proxy::ssh_list_proxies,
+            proxy::ssh_save_proxy,
+            proxy::ssh_delete_proxy,
+            updater::update_install,
+            skills::skills_list,
+            skills::skills_get,
+            skills::skills_save,
+            skills::skills_delete,
+            skills::skills_set_enabled,
+            skills::skills_import,
+            skills::skills_folder,
+            mcp::mcp_list,
+            mcp::mcp_save,
+            mcp::mcp_delete,
+            mcp::mcp_test,
+            workspace_files,
             tray::tray_action,
             tray::tray_resize,
             ssh_connect,
-            ssh_disconnect,
-            ssh_exec,
             ssh_connected,
             ssh::ssh_list_servers,
             ssh::ssh_save_server,
             ssh::ssh_reorder_units,
+            ssh::ssh_reveal_password,
             ssh::ssh_delete_server,
             ssh::ssh_list_keys,
             ssh::ssh_save_key,
@@ -405,7 +326,6 @@ pub fn run() {
             ssh::ssh_get_key,
             ssh::ssh_derive_public,
             ssh::ssh_generate_key,
-            ssh::ssh_detect_os,
             ssh::ssh_list_scripts,
             ssh::ssh_save_script,
             ssh::ssh_delete_script,
@@ -428,8 +348,19 @@ pub fn run() {
             ssh::ssh_vault_status,
             chat_stream
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running singularity");
+        .build(tauri::generate_context!())
+        .expect("error while building singularity")
+        .run(|app_handle, event| {
+            // MCP servers are child processes — stop them with the app.
+            if let tauri::RunEvent::Exit = event {
+                mcp::shutdown();
+                // Remove the tray icon explicitly: an icon the process never
+                // removed stays as a "ghost" in the tray until hovered.
+                if let Some(tray) = app_handle.remove_tray_by_id(tray::TRAY_ID) {
+                    let _ = tray.set_visible(false);
+                }
+            }
+        });
 }
 
 /// WebView2 opens its own find bar on Ctrl+F before the page can say no —

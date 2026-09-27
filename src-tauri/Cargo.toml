@@ -1,6 +1,6 @@
 [package]
 name = "singularity"
-version = "0.3.0"
+version = "0.4.0"
 description = "Next-Gen Agentic Desktop — orchestration workspace for autonomous AI agents"
 authors = ["Singularity"]
 edition = "2021"
@@ -14,13 +14,12 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-shell = "2"
 tauri-plugin-sql = { version = "2", features = ["sqlite"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "net", "io-util", "process"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart", "rustls-tls"], default-features = false }
 futures-util = "0.3"
 rand = "0.8"
@@ -40,7 +39,7 @@ russh = { version = "0.63", default-features = false, features = ["ring", "flate
 # Same version the sql plugin uses, so one sqlx build serves both.
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite"] }
 russh-sftp = "3.0.0"
-percent-encoding = "2"
+regex = "1"
 keyring = "4.2.0"
 aes-gcm = "0.11.1"
 # Console-output decoding: Windows cmd.exe prints in the OEM codepage (cp866
@@ -49,6 +48,7 @@ aes-gcm = "0.11.1"
 encoding_rs = "0.8"
 rig-core = "0.42"
 rig-agent = "0.42"
+tauri-plugin-single-instance = "2"
 
 # WebView2 hooks (same versions wry uses): take Ctrl+F / Ctrl+G / F3 away
 # from the browser's own find bar so the app's search gets them.

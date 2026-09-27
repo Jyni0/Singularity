@@ -12,7 +12,7 @@ const AVATAR_COLORS = [
   "#be5046",
 ];
 
-export function avatarColor(seed: string): string {
+function avatarColor(seed: string): string {
   let h = 0;
   for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
   return AVATAR_COLORS[h % AVATAR_COLORS.length];
@@ -23,7 +23,7 @@ export function avatarColor(seed: string): string {
  * distribution is recognizable at a glance even at 14px. Keys match the
  * detected-os tokens Rust reports (lowercased).
  */
-export const OS_BRAND_COLORS: Record<string, string> = {
+const OS_BRAND_COLORS: Record<string, string> = {
   ubuntu: "#E95420",   // Canonical orange
   debian: "#A81D33",   // Debian red
   fedora: "#294172",   // Fedora blue

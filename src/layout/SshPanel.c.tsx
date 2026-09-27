@@ -12,9 +12,12 @@ import {
   Info,
   Copy,
   LoaderCircle,
+  Eye,
+  EyeOff,
+  Waypoints,
 } from "lucide-react";
 import * as db from "../core/db.r";
-import type { SshKey, SshScript, SshServer } from "../core/types.i";
+import type { SshKey, SshProxy, SshScript, SshServer } from "../core/types.i";
 import { ScrollArea } from "../ui/ScrollArea.c";
 import { Combobox } from "../ui/Combobox.c";
 import { useOverlayThumb } from "../hooks/useOverlayThumb.h";
@@ -32,7 +35,8 @@ import { Thumb } from "../ui/Thumb.c";
 export type SshPanelTarget =
   | { kind: "server"; id?: string } // id undefined = create
   | { kind: "key"; id?: string }
-  | { kind: "script"; id?: string };
+  | { kind: "script"; id?: string }
+  | { kind: "proxy"; id?: string };
 
 const FIELD =
   "h-9 w-full rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 text-[12.5px] text-[var(--text-main)] outline-none transition-colors focus:border-[var(--accent)]";
@@ -76,6 +80,7 @@ export function SshPanel({
   servers,
   keys,
   scripts,
+  proxies,
   width,
   resizing,
   onResizeStart,
@@ -86,6 +91,7 @@ export function SshPanel({
   servers: SshServer[];
   keys: SshKey[];
   scripts: SshScript[];
+  proxies: SshProxy[];
   /** Current panel width in px — dragged by the handle on its left edge. */
   width: number;
   /** True while dragging the edge: the width animation is switched off so the
@@ -106,30 +112,22 @@ export function SshPanel({
   const server = target.kind === "server" && target.id ? servers.find((s) => s.id === target.id) : undefined;
   const sshKey = target.kind === "key" && target.id ? keys.find((k) => k.id === target.id) : undefined;
   const script = target.kind === "script" && target.id ? scripts.find((s) => s.id === target.id) : undefined;
+  const proxy = target.kind === "proxy" && target.id ? proxies.find((p) => p.id === target.id) : undefined;
 
   // Editing a row that vanished (deleted elsewhere) falls back to closing.
   useEffect(() => {
     if (target.kind === "server" && target.id && !server) onClose();
     if (target.kind === "key" && target.id && !sshKey) onClose();
     if (target.kind === "script" && target.id && !script) onClose();
+    if (target.kind === "proxy" && target.id && !proxy) onClose();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [server, sshKey, script]);
+  }, [server, sshKey, script, proxy]);
 
-  const title =
-    target.kind === "server"
-      ? server
-        ? "Edit server"
-        : "New server"
-      : target.kind === "key"
-        ? sshKey
-          ? "Edit credential"
-          : "New credential"
-        : script
-          ? "Edit script"
-          : "New script";
+  const editing = !!(server || sshKey || script || proxy);
+  const noun = { server: "server", key: "credential", script: "script", proxy: "proxy" }[target.kind];
+  const title = (editing ? "Edit " : "New ") + noun;
 
-  const TitleIcon =
-    target.kind === "server" ? Server : target.kind === "key" ? KeyRound : FileCode2;
+  const TitleIcon = { server: Server, key: KeyRound, script: FileCode2, proxy: Waypoints }[target.kind];
 
   // key=… forces a fresh form state when the panel switches rows.
   const formKey = target.kind + ":" + (target.id ?? "new");
@@ -168,13 +166,16 @@ export function SshPanel({
 
       <ScrollArea className="min-h-0 flex-1" innerClassName="px-4 pt-4">
         {target.kind === "server" && (
-          <ServerForm key={formKey} server={server} keys={keys} onChanged={onChanged} onClose={onClose} />
+          <ServerForm key={formKey} server={server} keys={keys} proxies={proxies} onChanged={onChanged} onClose={onClose} />
         )}
         {target.kind === "key" && (
           <KeyForm key={formKey} value={sshKey} onChanged={onChanged} onClose={onClose} />
         )}
         {target.kind === "script" && (
           <ScriptForm key={formKey} value={script} onChanged={onChanged} onClose={onClose} />
+        )}
+        {target.kind === "proxy" && (
+          <ProxyForm key={formKey} value={proxy} onChanged={onChanged} onClose={onClose} />
         )}
       </ScrollArea>
     </motion.aside>
@@ -238,11 +239,13 @@ function FormButtons({
 function ServerForm({
   server,
   keys,
+  proxies,
   onChanged,
   onClose,
 }: {
   server?: SshServer;
   keys: SshKey[];
+  proxies: SshProxy[];
   onChanged: () => void;
   onClose: () => void;
 }) {
@@ -255,9 +258,51 @@ function ServerForm({
   // Inline key paste is gone: private bodies live only in Credentials.
   const [password, setPassword] = useState("");
   const [keyId, setKeyId] = useState(server?.key_id ?? "");
+  const [proxyId, setProxyId] = useState(server?.proxy_id ?? "");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const hasStoredPassword = !!server?.has_password;
+  /** Password shown as plain text (typed, or the stored one fetched on demand). */
+  const [showPassword, setShowPassword] = useState(false);
+  /** The stored password was pulled into the field — saving re-stores it as is. */
+  const [revealed, setRevealed] = useState(false);
+
+  // A revealed password hides itself again after 30 s.
+  useEffect(() => {
+    if (!showPassword) return;
+    const id = setTimeout(() => setShowPassword(false), 30_000);
+    return () => clearTimeout(id);
+  }, [showPassword]);
+
+  const toggleShow = async () => {
+    if (showPassword) return setShowPassword(false);
+    // Blank field on a server with a stored password: fetch it (audit-logged).
+    if (server && hasStoredPassword && !password && !revealed) {
+      try {
+        setPassword(await db.sshRevealPassword(server.id));
+        setRevealed(true);
+      } catch (e) {
+        return setError(e instanceof Error ? e.message : String(e));
+      }
+    }
+    setShowPassword(true);
+  };
+
+  const forgetHostKey = async () => {
+    if (!server) return;
+    if (!confirm("Forget the pinned host key? The next connect trusts whatever key the server presents — only do this after reinstalling the server.")) return;
+    setBusy(true);
+    try {
+      // "-" is the wire signal to clear the pinned fingerprint.
+      await db.saveSshServer({ ...server, password: "", host_key: "-" });
+      onChanged();
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const save = async () => {
     setError(null);
@@ -288,6 +333,7 @@ function ServerForm({
         host_key: server?.host_key ?? "",
         has_password: hasStoredPassword,
         os: server?.os ?? "",
+        proxy_id: proxyId,
       });
       onChanged();
       onClose();
@@ -358,13 +404,27 @@ function ServerForm({
             {server ? " — blank keeps the stored one" : ""}
           </label>
           <div className="flex gap-2">
-            <input
-              className={FIELD}
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder={hasStoredPassword ? "•••••••• (stored)" : "optional"}
-            />
+            <div className="relative min-w-0 flex-1">
+              <input
+                className={FIELD + " pr-9"}
+                type={showPassword ? "text" : "password"}
+                autoComplete="off"
+                spellCheck={false}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder={hasStoredPassword ? "•••••••• (stored)" : "optional"}
+              />
+              {(password || hasStoredPassword) && (
+                <button
+                  type="button"
+                  className="absolute right-1.5 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                  onClick={() => void toggleShow()}
+                  title={showPassword ? "Hide password" : "Show password (hides again after 30 s; logged)"}
+                >
+                  {showPassword ? <EyeOff size={13} /> : <Eye size={13} />}
+                </button>
+              )}
+            </div>
             {hasStoredPassword && (
               <button
                 type="button"
@@ -404,8 +464,64 @@ function ServerForm({
         </div>
       </Section>
 
-      {/* No Security section: host-key pinning still happens in Rust (TOFU),
-          and UnitsView shows the pinned badge — the form stays lean. */}
+      <Section title="Proxy">
+        <div>
+          <label className={LABEL}>Connect through — optional</label>
+          {proxies.length === 0 ? (
+            <div className="rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-[11.5px] text-[var(--text-muted)]">
+              No proxies yet — add one on the Units page (Proxies tab). Without one the server is reached directly.
+            </div>
+          ) : (
+            <Combobox
+              value={proxyId}
+              onChange={setProxyId}
+              placeholder="Direct connection"
+              emptyText="No proxy matches"
+              options={[
+                { value: "", label: "Direct connection" },
+                ...proxies.map((p) => ({
+                  value: p.id,
+                  label: p.name,
+                  hint: `${p.kind === "socks5" ? "SOCKS5" : "HTTP"} ${p.host}:${p.port}`,
+                })),
+              ]}
+            />
+          )}
+        </div>
+      </Section>
+
+      {server && (
+        <Section title="Security">
+          <div>
+            <label className={LABEL}>Host key (pinned on first connect)</label>
+            <div className="flex items-center gap-2">
+              <span
+                className="min-w-0 flex-1 truncate rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 font-mono text-[11px] text-[var(--text-muted)]"
+                title={server.host_key || undefined}
+              >
+                {server.host_key ? (
+                  <>
+                    <ShieldCheck size={11} className="mr-1 inline text-[var(--diff-add,#4ec9b0)]" />
+                    {server.host_key}
+                  </>
+                ) : (
+                  "Not pinned yet — the first connect pins it"
+                )}
+              </span>
+              {server.host_key && (
+                <button
+                  type="button"
+                  className="flex h-9 shrink-0 items-center gap-1 rounded-md border border-[var(--border)] px-2 text-[11px] text-[var(--text-muted)] transition-colors hover:border-[var(--diff-del)]/50 hover:text-[var(--diff-del)]"
+                  onClick={() => void forgetHostKey()}
+                  title="Only after the server was reinstalled — a changed key can mean an attack"
+                >
+                  <RotateCcw size={11} /> Forget
+                </button>
+              )}
+            </div>
+          </div>
+        </Section>
+      )}
 
       <ErrorLine error={error} />
       <FormButtons
@@ -838,6 +954,176 @@ function ScriptForm({
           />
         </div>
       </Section>
+      <ErrorLine error={error} />
+      <FormButtons
+        onSave={() => void save()}
+        saveLabel={value ? "Save" : "Create"}
+        busy={busy}
+        onDelete={value ? () => void del() : undefined}
+        onClose={onClose}
+      />
+    </div>
+  );
+}
+
+/* ---------- Proxy form ---------- */
+
+const DEFAULT_PROXY_PORT = { http: 8080, socks5: 1080 } as const;
+
+function ProxyForm({
+  value,
+  onChanged,
+  onClose,
+}: {
+  value?: SshProxy;
+  onChanged: () => void;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState(value?.name ?? "");
+  const [kind, setKind] = useState<SshProxy["kind"]>(value?.kind ?? "socks5");
+  const [host, setHost] = useState(value?.host ?? "");
+  const [port, setPort] = useState(String(value?.port ?? DEFAULT_PROXY_PORT.socks5));
+  const [username, setUsername] = useState(value?.username ?? "");
+  const [password, setPassword] = useState("");
+  const [clearPassword, setClearPassword] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const stored = !!value?.has_password && !clearPassword;
+
+  const pickKind = (k: SshProxy["kind"]) => {
+    // Swap the port along with the type while it is still the other default.
+    if (port === String(DEFAULT_PROXY_PORT[kind])) setPort(String(DEFAULT_PROXY_PORT[k]));
+    setKind(k);
+  };
+
+  const save = async () => {
+    setError(null);
+    if (!name.trim()) return setError("Give the proxy a name.");
+    if (!host.trim()) return setError("Host is required.");
+    const portNum = Number(port);
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+      return setError("Port must be a number from 1 to 65535.");
+    }
+    setBusy(true);
+    try {
+      await db.saveSshProxy({
+        id: value?.id ?? "",
+        name: name.trim(),
+        kind,
+        host: host.trim(),
+        port: portNum,
+        username: username.trim(),
+        // "" keeps the stored password, "-" removes it.
+        password: password || (clearPassword ? "-" : ""),
+        has_password: stored,
+      });
+      onChanged();
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const del = async () => {
+    if (!confirm("Delete this proxy? Servers using it will connect directly.")) return;
+    setBusy(true);
+    try {
+      if (value) await db.deleteSshProxy(value.id);
+      onChanged();
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="h-full flex flex-col">
+      <Section title="Proxy">
+        <div>
+          <label className={LABEL}>Label</label>
+          <input className={FIELD} value={name} onChange={(e) => setName(e.target.value)} placeholder="office socks" autoFocus />
+        </div>
+        <div>
+          <label className={LABEL}>Type</label>
+          <div className="flex gap-1 rounded-md border border-[var(--border)] bg-[var(--bg-input)] p-0.5">
+            {(["socks5", "http"] as const).map((k) => (
+              <button
+                key={k}
+                type="button"
+                className={
+                  "h-7 flex-1 rounded text-[11.5px] transition-colors " +
+                  (kind === k ? "bg-[var(--accent)] text-white" : "text-[var(--text-muted)] hover:text-[var(--text-main)]")
+                }
+                onClick={() => pickKind(k)}
+              >
+                {k === "socks5" ? "SOCKS5" : "HTTP"}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="grid grid-cols-[1fr_96px] gap-3">
+          <div>
+            <label className={LABEL}>Host</label>
+            <input className={FIELD} value={host} onChange={(e) => setHost(e.target.value)} placeholder="proxy.example.com" />
+          </div>
+          <div>
+            <label className={LABEL}>Port</label>
+            <input className={FIELD} value={port} onChange={(e) => setPort(e.target.value)} />
+          </div>
+        </div>
+      </Section>
+
+      <Section title="Authentication — optional">
+        <div>
+          <label className={LABEL}>Username</label>
+          <input className={FIELD} value={username} onChange={(e) => setUsername(e.target.value)} placeholder="none" autoComplete="off" />
+        </div>
+        <div>
+          <label className={LABEL}>Password{stored ? " — blank keeps the stored one" : ""}</label>
+          <div className="flex gap-2">
+            <div className="relative min-w-0 flex-1">
+              <input
+                className={FIELD + " pr-9"}
+                type={showPassword ? "text" : "password"}
+                autoComplete="off"
+                spellCheck={false}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder={stored ? "•••••••• (stored)" : "none"}
+              />
+              {password && (
+                <button
+                  type="button"
+                  className="absolute right-1.5 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                  onClick={() => setShowPassword((v) => !v)}
+                  title={showPassword ? "Hide password" : "Show password"}
+                >
+                  {showPassword ? <EyeOff size={13} /> : <Eye size={13} />}
+                </button>
+              )}
+            </div>
+            {stored && (
+              <button
+                type="button"
+                className="flex h-9 shrink-0 items-center gap-1 rounded-md border border-[var(--border)] px-2 text-[11px] text-[var(--text-muted)] transition-colors hover:border-[var(--diff-del)]/50 hover:text-[var(--diff-del)]"
+                onClick={() => {
+                  setClearPassword(true);
+                  setPassword("");
+                }}
+                title="Remove the stored password on save"
+              >
+                <RotateCcw size={11} /> Clear
+              </button>
+            )}
+          </div>
+        </div>
+      </Section>
+
       <ErrorLine error={error} />
       <FormButtons
         onSave={() => void save()}

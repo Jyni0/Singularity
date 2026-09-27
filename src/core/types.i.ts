@@ -83,7 +83,7 @@ export type ViewKind =
   | "ssh-files";
 
 /** Which Units sub-collection the Units page shows (segmented switcher). */
-export type UnitsTab = "servers" | "keys" | "scripts";
+export type UnitsTab = "servers" | "keys" | "scripts" | "proxies";
 
 /* ---------- SSH Client mode ---------- */
 
@@ -125,6 +125,21 @@ export interface SshServer {
   has_password?: boolean;
   /** Detected distribution ("ubuntu", "fedora", "windows", …); "" = unknown. */
   os?: string;
+  /** ssh_proxies row id to tunnel through ("" = direct connection). */
+  proxy_id?: string;
+}
+
+/** A saved proxy a server can connect through (password encrypted at rest). */
+export interface SshProxy {
+  id: string;
+  name: string;
+  kind: "http" | "socks5";
+  host: string;
+  port: number;
+  username: string;
+  /** Plaintext only when saving ("" keeps the stored one, "-" clears it); blank in listings. */
+  password: string;
+  has_password: boolean;
 }
 
 /** A reusable private-key credential (secrets encrypted at rest). */
@@ -144,9 +159,6 @@ export interface SshKey {
   /** Public half (authorized_keys form) — safe to show/copy. */
   public_key?: string;
 }
-
-/** Algorithms the key generator offers. */
-export type SshKeyAlgorithm = "ed25519" | "ecdsa-p256" | "ecdsa-p384" | "ecdsa-p521" | "rsa";
 
 /** Detected server OS tokens → logo files in /icons/os ("" = no logo). */
 export const OS_ICONS: Record<string, string> = {
@@ -309,12 +321,6 @@ export interface Gateway {
   models: Array<{ id: string; name: string; meta: string }>;
 }
 
-export interface ModelOption {
-  id: string;
-  name: string;
-  meta: string;
-}
-
 export interface StoredMessage {
   conversation_id: string;
   role: "user" | "agent";
@@ -441,3 +447,26 @@ export const THEME_LIST: ThemeMeta[] = [
 
 /** Every theme the app ships with — Settings → General lists these. */
 export const THEMES: Theme[] = THEME_LIST.map((t) => t.id);
+
+/** A recurring agent job (Scheduled Tasks page). */
+export interface ScheduledTask {
+  id: string;
+  name: string;
+  /** Project the new chat is created in (required). */
+  project: string;
+  provider_id: string;
+  model_id: string;
+  /** Which editor built `schedule` — presets are stored as cron too. */
+  kind: "hourly" | "daily" | "weekly" | "cron";
+  /** 5-field cron expression, local time. */
+  schedule: string;
+  prompt: string;
+  enabled: boolean;
+  /** Unix seconds of the last run; null = never ran. */
+  last_run_at: number | null;
+  /** The schedule counts from here (last run, save or resume), unix seconds. */
+  armed_at: number;
+  /** Conversation the last run created ("" = none yet). */
+  last_conv: string;
+  created_at: number;
+}

@@ -13,6 +13,7 @@
  *    the Rust buffer and followed to its end.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import type { Dispatch, SetStateAction } from "react";
 import * as db from "../core/db.r";
 import type { Attachment, Conversation, Effort, Model, Project, Provider, SshServer } from "../core/types.i";
@@ -34,11 +35,21 @@ export interface ChatSelection {
 
 export type RunPhase = "thinking" | "streaming";
 
+/** A prompt written while the chat's agent was still working. */
+export interface QueuedPrompt {
+  id: string;
+  text: string;
+  attachments: Attachment[];
+  selection: ChatSelection;
+}
+
 export interface UseChatOptions {
   providers: Provider[];
   models: Model[];
   projects: Project[];
   workspace: string;
+  /** The app's own agent folder — runs of projects without a directory use it. */
+  appWorkspace: string;
   agentMode: boolean;
   globalAutoRun: boolean;
   sshServers: SshServer[];
@@ -50,8 +61,8 @@ export interface UseChatOptions {
   pickedModel: { gatewayId: string; modelId: string } | null;
   /** Project a brand-new chat is created in. */
   newChatProject: string;
-  /** A send created a conversation — add it to the tree and open it. */
-  onConversationCreated: (project: string, conv: Conversation) => void;
+  /** A send created a conversation — add it to the tree; open it unless it runs in the background. */
+  onConversationCreated: (project: string, conv: Conversation, open: boolean) => void;
   /** A message landed — refresh the sidebar's activity stamp. */
   onActivity: (convId: string) => void;
   /** The AI named a new chat. */
@@ -80,6 +91,15 @@ export function useChat(options: UseChatOptions) {
   const lastSelection = useRef<ChatSelection | null>(null);
   /** Re-attach claims (StrictMode double-mounts effects in dev). */
   const claimedRuns = useRef(new Set<string>());
+  /** Conversations with a send in flight — set synchronously, so a second
+   *  prompt typed right away is queued instead of racing the first. */
+  const busy = useRef(new Set<string>());
+  /** Follow-up prompts per conversation, run one by one after the current run. */
+  const [queues, setQueues] = useState<Record<string, QueuedPrompt[]>>({});
+  const queuesRef = useRef(queues);
+  queuesRef.current = queues;
+  /** Conversations the user stopped — their queue waits instead of running on. */
+  const paused = useRef(new Set<string>());
 
   /** Writes to one conversation's buffer; safe for background runs. */
   const updateConvMsgs = useCallback((key: string, updater: (prev: Msg[]) => Msg[]) => {
@@ -97,7 +117,7 @@ export function useChat(options: UseChatOptions) {
   /* ---------- Live-turn mutators ---------- */
 
   /** Applies one run event to the conversation's live (last) agent turn. */
-  const applyEvent = useCallback(
+  const applyNow = useCallback(
     (convId: string, ev: { kind: "text"; delta: string } | { kind: "think"; delta: string } | { kind: "step"; step: db.AgentStepEvent } | { kind: "usage"; usage: db.RunUsage; accumulate: boolean }) => {
       updateConvMsgs(convId, (prev) => {
         const next = [...prev];
@@ -145,6 +165,56 @@ export function useChat(options: UseChatOptions) {
       });
     },
     [updateConvMsgs]
+  );
+
+  /* ---------- Delta batching ----------
+     Providers stream a delta per token; applying each one re-rendered the
+     whole app (and re-parsed the Markdown) up to hundreds of times a second
+     per running agent — several agents at once starved the UI. Text and
+     reasoning deltas are now merged and applied at most every FLUSH_MS; any
+     other event (a tool card, usage) flushes first, so the order stays. */
+  const FLUSH_MS = 50;
+  const pending = useRef<Record<string, Array<{ kind: "text" | "think"; delta: string }>>>({});
+  const flushTimer = useRef<number | null>(null);
+
+  const applyPending = useCallback(
+    (convId: string) => {
+      const list = pending.current[convId];
+      if (!list || list.length === 0) return;
+      delete pending.current[convId];
+      for (const ev of list) applyNow(convId, ev);
+    },
+    [applyNow]
+  );
+
+  const applyEvent = useCallback(
+    (convId: string, ev: Parameters<typeof applyNow>[1]) => {
+      if (ev.kind === "text" || ev.kind === "think") {
+        const list = (pending.current[convId] ??= []);
+        const last = list[list.length - 1];
+        if (last && last.kind === ev.kind) last.delta += ev.delta;
+        else list.push({ kind: ev.kind, delta: ev.delta });
+        if (flushTimer.current === null) {
+          flushTimer.current = window.setTimeout(() => {
+            flushTimer.current = null;
+            for (const id of Object.keys(pending.current)) applyPending(id);
+          }, FLUSH_MS);
+        }
+        return;
+      }
+      applyPending(convId);
+      applyNow(convId, ev);
+    },
+    [applyNow, applyPending]
+  );
+
+  /** Applies buffered deltas and renders NOW — before a finished turn is
+   *  read back from state to be saved. */
+  const flushNow = useCallback(
+    (convId: string) => {
+      if (pending.current[convId]?.length) flushSync(() => applyPending(convId));
+    },
+    [applyPending]
   );
 
   /* ---------- Running a turn ---------- */
@@ -207,7 +277,8 @@ export function useChat(options: UseChatOptions) {
     promptText: string,
     images: db.ImageAttachment[],
     selection: ChatSelection,
-    freshTitle: boolean
+    freshTitle: boolean,
+    background = false
   ) => {
     const o = opts.current;
     const provider = o.providers.find((p) => p.id === selection.gatewayId);
@@ -230,7 +301,11 @@ export function useChat(options: UseChatOptions) {
       updateConvMsgs(convId, (prev) => [...prev, { role: "agent", text: `${provider.name}: ${cred.error}` }]);
       return;
     }
-    if (o.agentMode && !o.workspace.trim()) {
+    // Each run works in ITS project's folder — not whichever folder the open
+    // chat happens to use (a new chat's first prompt, a scheduled task).
+    const runProject = o.projects.find((p) => p.name === projectName);
+    const runWorkspace = runProject?.path?.trim() || o.appWorkspace || o.workspace;
+    if (o.agentMode && !runWorkspace.trim()) {
       updateConvMsgs(convId, (prev) => [
         ...prev,
         {
@@ -243,7 +318,8 @@ export function useChat(options: UseChatOptions) {
 
     const runId = `req-${Date.now()}`;
     const startedAt = Date.now();
-    localStorage.setItem("dsh:last-conv", convId);
+    // A background (scheduled) run must not become the chat the next launch opens.
+    if (!background) localStorage.setItem("dsh:last-conv", convId);
     // Reload re-attach: remember which conversation this run streams into.
     localStorage.setItem("dsh:live-run", JSON.stringify({ runId, convId }));
     updateConvMsgs(convId, (prev) => [...prev, { role: "agent", text: "", segments: [] }]);
@@ -275,7 +351,7 @@ export function useChat(options: UseChatOptions) {
               auth: cred.auth,
               model: modelRow.model_id,
               system: "",
-              workspace: o.workspace,
+              workspace: runWorkspace,
               effort: selection.effort,
               temperature: selection.temperature,
               auto_run: autoRun,
@@ -319,6 +395,7 @@ export function useChat(options: UseChatOptions) {
             (u) => applyEvent(convId, { kind: "usage", usage: { ...u, elapsed_ms: Date.now() - startedAt }, accumulate: true })
           );
 
+      flushNow(convId);
       const elapsed = Date.now() - startedAt;
       // Persist prose AND the interleaved tool steps (reasoning stays live-only).
       const finalSegments = (convMsgsRef.current[convId] ?? []).at(-1)?.segments;
@@ -341,6 +418,7 @@ export function useChat(options: UseChatOptions) {
         return next;
       });
     } catch (e) {
+      flushNow(convId);
       const msg = e instanceof Error ? e.message : String(e);
       const elapsed = Date.now() - startedAt;
       setErroredConv(convId);
@@ -379,15 +457,19 @@ export function useChat(options: UseChatOptions) {
 
   /**
    * Sends a prompt into `target` (or a brand-new chat when null). One run
-   * per conversation — a send while it is busy is ignored.
+   * per conversation — a send while it is busy is ignored. `project`
+   * overrides the new chat's project; `background` leaves the screen alone
+   * (scheduled tasks). Resolves with the conversation id once the run ends.
    */
   const send = async (
     text: string,
     target: { project: string; id: string } | null,
     selection: ChatSelection,
-    attachments: Attachment[] = []
-  ) => {
-    lastSelection.current = selection;
+    attachments: Attachment[] = [],
+    extra: { project?: string; background?: boolean } = {}
+  ): Promise<string | null> => {
+    const background = !!extra.background;
+    if (!background) lastSelection.current = selection;
     const promptText = composePrompt(text, attachments);
     const images = attachments
       .filter((a) => a.kind === "image")
@@ -399,32 +481,72 @@ export function useChat(options: UseChatOptions) {
     let history: Msg[];
     let freshTitle = false;
     if (target) {
-      if (activeRunsRef.current[target.id]) return;
+      // The agent is still working here: queue the prompt for afterwards.
+      if (busy.current.has(target.id) || activeRunsRef.current[target.id]) {
+        const item: QueuedPrompt = {
+          id: `q-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+          text,
+          attachments,
+          selection,
+        };
+        setQueues((prev) => ({ ...prev, [target.id]: [...(prev[target.id] ?? []), item] }));
+        queuesRef.current = { ...queuesRef.current, [target.id]: [...(queuesRef.current[target.id] ?? []), item] };
+        return null;
+      }
+      busy.current.add(target.id);
+      paused.current.delete(target.id);
       convId = target.id;
       projectName = target.project;
       history = [...(convMsgsRef.current[convId] ?? []), userMsg];
       updateConvMsgs(convId, (prev) => [...prev, userMsg]);
     } else {
       convId = `c-${Date.now()}`;
-      projectName = opts.current.newChatProject;
+      projectName = extra.project ?? opts.current.newChatProject;
       const title = promptText.length > 42 ? `${promptText.slice(0, 42)}…` : promptText;
       freshTitle = true;
       const conv: Conversation = { id: convId, title, updatedAt: Math.floor(Date.now() / 1000) };
       // State first: the browser-preview store shares project objects with
       // React state, so inserting first would add the chat twice.
-      opts.current.onConversationCreated(projectName, conv);
+      opts.current.onConversationCreated(projectName, conv, !background);
       await db.insertConversation(projectName, conv);
+      busy.current.add(convId);
       history = [userMsg];
       setConvMsgs((prev) => {
         const next = { ...prev };
-        delete next[DRAFT_ID];
+        // The draft belongs to the user's new-chat screen — a background run keeps it.
+        if (!background) delete next[DRAFT_ID];
         next[convId] = history;
         return next;
       });
     }
-    await db.appendMessage(convId, "user", promptText, { images: images.length ? images : undefined });
-    opts.current.onActivity(convId);
-    await runTurn(convId, projectName, history, promptText, images, selection, freshTitle);
+    try {
+      await db.appendMessage(convId, "user", promptText, { images: images.length ? images : undefined });
+      opts.current.onActivity(convId);
+      await runTurn(convId, projectName, history, promptText, images, selection, freshTitle, background);
+    } finally {
+      busy.current.delete(convId);
+    }
+    // Next queued follow-up — unless the user pressed Stop.
+    if (!paused.current.has(convId)) void runQueued(convId, projectName);
+    return convId;
+  };
+
+  /** Removes a queued prompt; returns it (Edit puts it back in the prompt box). */
+  const takeQueued = (convId: string, id: string): QueuedPrompt | undefined => {
+    const item = (queuesRef.current[convId] ?? []).find((q) => q.id === id);
+    const rest = (queuesRef.current[convId] ?? []).filter((q) => q.id !== id);
+    queuesRef.current = { ...queuesRef.current, [convId]: rest };
+    setQueues((prev) => ({ ...prev, [convId]: (prev[convId] ?? []).filter((q) => q.id !== id) }));
+    return item;
+  };
+
+  /** Sends the first queued prompt (or the one with `id`) into the chat. */
+  const runQueued = async (convId: string, project: string, id?: string) => {
+    if (busy.current.has(convId)) return;
+    const first = id ?? queuesRef.current[convId]?.[0]?.id;
+    if (!first) return;
+    const item = takeQueued(convId, first);
+    if (item) await send(item.text, { project, id: convId }, item.selection, item.attachments);
   };
 
   /**
@@ -463,6 +585,8 @@ export function useChat(options: UseChatOptions) {
 
   /** Stops the run streaming into `convId`. */
   const stop = useCallback((convId: string) => {
+    // Stop means "hold on": queued follow-ups wait until sent by hand.
+    if ((queuesRef.current[convId] ?? []).length > 0) paused.current.add(convId);
     const run = activeRunsRef.current[convId];
     if (run) void db.stopGeneration(run);
   }, []);
@@ -546,7 +670,7 @@ export function useChat(options: UseChatOptions) {
             },
           });
         } else if (ev.kind === "Confirm") {
-          setConfirmReqs((prev) => ({ ...prev, [runId]: { run_id: runId, command: ev.command, cwd: ev.cwd } }));
+          setConfirmReqs((prev) => ({ ...prev, [runId]: { run_id: runId, command: ev.command, cwd: ev.cwd, reason: ev.reason } }));
         }
       };
       for (const ev of snapshot) {
@@ -629,6 +753,10 @@ export function useChat(options: UseChatOptions) {
     erroredConv,
     confirmReqs,
     send,
+    /** Follow-up prompts queued per conversation. */
+    queues,
+    takeQueued,
+    runQueued,
     editAndResend,
     stop,
     confirm,

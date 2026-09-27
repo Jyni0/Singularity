@@ -10,28 +10,12 @@
 import { useState, type ReactNode } from "react";
 import { ScrollBox } from "../ui/ScrollArea.c";
 import { FileIcon, baseName, dirName } from "./FileIcon.c";
-import {
-  Bot,
-  Brain,
-  Check,
-  Copy,
-  Eye,
-  FileDiff,
-  FilePlus2,
-  FolderOpen,
-  Loader2,
-  Pencil,
-  Search,
-  Server,
-  Terminal,
-  Wrench,
-  ChevronRight,
-} from "lucide-react";
+import { Bot, Brain, Check, Copy, Eye, FileDiff, FilePlus2, FolderOpen, Loader2, Pencil, Search, Server, Terminal, Wrench, ChevronRight, Sparkles, Plug } from "lucide-react";
 
 /* ---------- Inline formatting ---------- */
 
 /** Splits on `code`, **bold**, *italic* and [links](url). */
-export function renderInline(text: string, keyPrefix: string): ReactNode[] {
+function renderInline(text: string, keyPrefix: string): ReactNode[] {
   const out: ReactNode[] = [];
   // One pass, alternation ordered so `code` wins over emphasis.
   const pattern =
@@ -92,9 +76,9 @@ export function renderInline(text: string, keyPrefix: string): ReactNode[] {
 /* ---------- Code block ---------- */
 
 /** Languages that read as a shell command rather than source to copy verbatim. */
-export const SHELL_LANGS = new Set(["bash", "sh", "shell", "zsh", "powershell", "ps1", "cmd"]);
+const SHELL_LANGS = new Set(["bash", "sh", "shell", "zsh", "powershell", "ps1", "cmd"]);
 
-export function CodeBlock({ code, lang }: { code: string; lang: string }) {
+function CodeBlock({ code, lang }: { code: string; lang: string }) {
   const [copied, setCopied] = useState(false);
   const isShell = SHELL_LANGS.has(lang.toLowerCase());
 
@@ -152,7 +136,7 @@ export interface Block {
 }
 
 /** Groups raw lines into markdown blocks, keeping fenced code intact. */
-export function parseBlocks(text: string): Block[] {
+function parseBlocks(text: string): Block[] {
   const lines = text.split("\n");
   const blocks: Block[] = [];
   let i = 0;
@@ -261,7 +245,7 @@ export function parseBlocks(text: string): Block[] {
 
 /* ---------- Table ---------- */
 
-export function Table({ rows, keyPrefix }: { rows: string[]; keyPrefix: string }) {
+function Table({ rows, keyPrefix }: { rows: string[]; keyPrefix: string }) {
   const cells = (row: string) =>
     row
       .replace(/^\s*\|/, "")
@@ -404,7 +388,7 @@ export interface ToolCallView {
 }
 
 /** Each tool gets its own icon and verb, so the transcript reads at a glance. */
-export const TOOL_META: Record<string, { icon: typeof Terminal; label: string }> = {
+const TOOL_META: Record<string, { icon: typeof Terminal; label: string }> = {
   read_file: { icon: Eye, label: "Read" },
   write_file: { icon: FilePlus2, label: "Write" },
   edit_file: { icon: Pencil, label: "Edit" },
@@ -414,7 +398,15 @@ export const TOOL_META: Record<string, { icon: typeof Terminal; label: string }>
   run_command: { icon: Terminal, label: "Run" },
   ssh_exec: { icon: Server, label: "SSH" },
   delegate: { icon: Bot, label: "Agent" },
+  skill: { icon: Sparkles, label: "Skill" },
+  mcp: { icon: Plug, label: "MCP" },
 };
+
+/** `mcp__github__create_issue` → "github · create_issue". */
+export function mcpLabel(name: string): string | null {
+  const m = /^mcp__(.+?)__(.+)$/.exec(name);
+  return m ? `${m[1]} · ${m[2]}` : null;
+}
 
 /** Tools whose input starts with a file path. */
 const FILE_TOOLS = new Set(["read_file", "write_file", "edit_file", "apply_patch"]);
@@ -472,7 +464,8 @@ export function ThinkBlock({ text, live }: { text: string; live?: boolean }) {
 export function ToolCall({ call }: { call: ToolCallView }) {
   const running = call.running ?? false;
   const ok = call.ok ?? true;
-  const meta = TOOL_META[call.name] ?? { icon: Wrench, label: call.name };
+  const mcp = mcpLabel(call.name);
+  const meta = TOOL_META[call.name] ?? (mcp ? { icon: Plug, label: mcp } : { icon: Wrench, label: call.name });
   const Icon = meta.icon;
   const clickable = !!call.onInspect;
   const { owner, path, extra } = parseInput(call.name, call.input);

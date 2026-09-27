@@ -14,8 +14,10 @@ import type {
   Provider,
   ProviderKind,
   ProviderStatus,
+  ScheduledTask,
   SftpEntry,
   SshKey,
+  SshProxy,
   SshLog,
   SshScript,
   SshServer,
@@ -36,6 +38,7 @@ interface MemoryStore {
   sshServers: SshServer[];
   sshKeys: SshKey[];
   sshScripts: SshScript[];
+  sshProxies: SshProxy[];
   sshLogs: SshLog[];
 }
 
@@ -52,6 +55,7 @@ const memory: MemoryStore = {
   sshServers: [],
   sshKeys: [],
   sshScripts: [],
+  sshProxies: [],
   sshLogs: [],
 };
 
@@ -479,28 +483,6 @@ export async function appendMessage(
   }
 }
 
-/** Touches a conversation's activity stamp without storing a message. */
-export async function touchConversation(conversationId: string): Promise<number> {
-  const now = Math.floor(Date.now() / 1000);
-  const db = await getDb();
-  if (!db) {
-    for (const p of memory.projects) {
-      const c = p.conversations.find((x) => x.id === conversationId);
-      if (c) c.updatedAt = now;
-    }
-    return now;
-  }
-  try {
-    await db.execute("UPDATE conversations SET updated_at = $1 WHERE id = $2", [
-      now,
-      conversationId,
-    ]);
-  } catch {
-    /* older schema */
-  }
-  return now;
-}
-
 /* ---------- Providers & models ---------- */
 
 interface ProviderRow {
@@ -698,7 +680,7 @@ export async function loadTokens(providerId: string): Promise<OAuthTokens | null
   return rows[0] ?? null;
 }
 
-export async function saveTokens(tokens: OAuthTokens): Promise<void> {
+async function saveTokens(tokens: OAuthTokens): Promise<void> {
   const db = await getDb();
   if (!db) {
     memoryTokens.set(tokens.provider_id, tokens);
@@ -777,7 +759,7 @@ export async function googleSignIn(
  * Returns a valid access token, refreshing it first when it is about to expire.
  * This is what makes a signed-in provider keep working across restarts.
  */
-export async function validAccessToken(
+async function validAccessToken(
   providerId: string,
   clientId: string,
   clientSecret: string
@@ -850,7 +832,7 @@ export async function removeModel(modelId: string): Promise<void> {
 /* ---------- Model discovery (runs in Rust — no CORS, no allowlist) ---------- */
 
 /** Generates a stable id for a model row. */
-export function modelRowId(providerId: string, modelId: string): string {
+function modelRowId(providerId: string, modelId: string): string {
   return `${providerId}:${modelId}`;
 }
 
@@ -1144,8 +1126,8 @@ export interface AgentStepEvent {
 }
 
 /** Marks an error as "the user pressed Stop", so callers keep partial output. */
-export const STOPPED = "stopped by user";
-export function isStopError(message: string): boolean {
+const STOPPED = "stopped by user";
+function isStopError(message: string): boolean {
   return message.startsWith(STOPPED);
 }
 
@@ -1253,6 +1235,8 @@ export interface ConfirmRequest {
   run_id: string;
   command: string;
   cwd: string;
+  /** Why the call needs a yes (risky command, secrets, outside the project); empty for a plain command. */
+  reason?: string;
 }
 
 /**
@@ -1347,7 +1331,7 @@ export type RunEvent =
       new_text?: string;
     }
   /** A command waiting for Allow/Deny — re-shown after a reload. */
-  | { kind: "Confirm"; command: string; cwd: string }
+  | { kind: "Confirm"; command: string; cwd: string; reason?: string }
   /** Terminal markers, present only in a finished run's buffer. */
   | { kind: "Done"; answer: string }
   | { kind: "Error"; message: string };
@@ -1494,6 +1478,7 @@ interface RustServer {
   hostKey?: string;
   hasPassword?: boolean;
   os?: string;
+  proxyId?: string;
 }
 
 function toServer(r: RustServer): SshServer {
@@ -1510,6 +1495,7 @@ function toServer(r: RustServer): SshServer {
     host_key: r.hostKey ?? "",
     has_password: !!r.hasPassword,
     os: r.os ?? "",
+    proxy_id: r.proxyId ?? "",
   };
 }
 
@@ -1525,6 +1511,7 @@ function toRustServer(s: SshServer): RustServer {
     privateKey: s.private_key ?? "",
     keyId: s.key_id ?? "",
     hostKey: s.host_key ?? "",
+    proxyId: s.proxy_id ?? "",
   };
 }
 
@@ -1588,8 +1575,14 @@ export async function saveSshServer(server: SshServer): Promise<string> {
   return sshInvoke<string>("ssh_save_server", { server: toRustServer(server) });
 }
 
+/** Decrypts a server's stored password (the edit form's "show"); every reveal is audit-logged. */
+export async function sshRevealPassword(serverId: string): Promise<string> {
+  if (!inTauri) return memory.sshServers.find((s) => s.id === serverId)?.password ?? "";
+  return sshInvoke<string>("ssh_reveal_password", { serverId });
+}
+
 /** Persists the dragged order of a units list (ids top to bottom). */
-export async function reorderSshUnits(kind: "server" | "key" | "script", ids: string[]): Promise<void> {
+export async function reorderSshUnits(kind: "server" | "key" | "script" | "proxy", ids: string[]): Promise<void> {
   if (!inTauri) {
     const sortBy = <T extends { id: string }>(list: T[]): T[] => {
       const byId = new Map(list.map((x) => [x.id, x]));
@@ -1597,6 +1590,7 @@ export async function reorderSshUnits(kind: "server" | "key" | "script", ids: st
     };
     if (kind === "server") memory.sshServers = sortBy(memory.sshServers);
     else if (kind === "key") memory.sshKeys = sortBy(memory.sshKeys);
+    else if (kind === "proxy") memory.sshProxies = sortBy(memory.sshProxies);
     else memory.sshScripts = sortBy(memory.sshScripts);
     return;
   }
@@ -1704,6 +1698,66 @@ export async function generateSshKey(
   return toKey(r);
 }
 
+/* ---------- Proxies ---------- */
+
+interface RustProxy {
+  id: string;
+  name: string;
+  kind: string;
+  host: string;
+  port: number;
+  username: string;
+  password?: string;
+  hasPassword?: boolean;
+}
+
+/** Saved proxies, in the user's order (passwords never included). */
+export async function loadSshProxies(): Promise<SshProxy[]> {
+  if (!inTauri) return [...memory.sshProxies];
+  const rows = await sshInvoke<RustProxy[]>("ssh_list_proxies");
+  return rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    kind: r.kind === "socks5" ? "socks5" : "http",
+    host: r.host,
+    port: r.port,
+    username: r.username ?? "",
+    password: "",
+    has_password: !!r.hasPassword,
+  }));
+}
+
+/** Inserts or updates a proxy. Blank password keeps the stored one; "-" clears it. */
+export async function saveSshProxy(proxy: SshProxy): Promise<string> {
+  if (!inTauri) {
+    const id = proxy.id || memId() + "-prx";
+    const row = { ...proxy, id, has_password: proxy.password ? proxy.password !== "-" : proxy.has_password, password: "" };
+    memory.sshProxies = [row, ...memory.sshProxies.filter((p) => p.id !== id)];
+    return id;
+  }
+  return sshInvoke<string>("ssh_save_proxy", {
+    proxy: {
+      id: proxy.id,
+      name: proxy.name,
+      kind: proxy.kind,
+      host: proxy.host,
+      port: proxy.port,
+      username: proxy.username,
+      password: proxy.password,
+    },
+  });
+}
+
+/** Deletes a proxy; servers that used it connect directly again. */
+export async function deleteSshProxy(id: string): Promise<void> {
+  if (!inTauri) {
+    memory.sshProxies = memory.sshProxies.filter((p) => p.id !== id);
+    memory.sshServers = memory.sshServers.map((s) => (s.proxy_id === id ? { ...s, proxy_id: "" } : s));
+    return;
+  }
+  await sshInvoke("ssh_delete_proxy", { proxyId: id });
+}
+
 /* ---------- Scripts ---------- */
 
 export async function loadSshScripts(): Promise<SshScript[]> {
@@ -1781,30 +1835,10 @@ export async function sshConnect(serverId: string): Promise<void> {
   await sshInvoke("ssh_connect", { serverId });
 }
 
-/** Disconnects a unit (unknown ids are a no-op). */
-export async function sshDisconnect(serverId: string): Promise<void> {
-  await sshInvoke("ssh_disconnect", { serverId });
-}
-
-/** Runs one command on a unit, auto-connecting when needed. */
-export async function sshExec(serverId: string, command: string): Promise<string> {
-  return sshInvoke<string>("ssh_exec", { serverId, command });
-}
-
 /** Server ids with a live connection right now. */
 export async function sshConnected(): Promise<string[]> {
   if (!inTauri) return [];
   return sshInvoke<string[]>("ssh_connected");
-}
-
-/**
- * Returns the detected OS token for a server ("ubuntu", "windows", …; "" =
- * unknown). Uses the pooled connection's cached value or re-probes; safe to
- * call after connect to refresh a stale/empty logo.
- */
-export async function detectSshOs(serverId: string): Promise<string> {
-  if (!inTauri) return "";
-  return sshInvoke<string>("ssh_detect_os", { serverId });
 }
 
 /* ---------- Interactive terminal (PTY) ---------- */
@@ -2005,4 +2039,216 @@ export async function onSshEvent(handlers: {
     listen<[string, string]>("ssh://os", (e) => handlers.onOs?.(e.payload)),
   ]);
   return () => offs.forEach((off) => off());
+}
+
+/* ---------- Self-update (GitHub Releases) ---------- */
+
+export interface UpdateInfo {
+  current: string;
+  version: string;
+  title: string;
+  notes: string;
+  /** Release page on GitHub. */
+  page: string;
+  /** Installer file picked for this OS. */
+  asset: string;
+  size: number;
+}
+
+/** Newer release with an installer for this OS, or null (also outside Tauri). */
+export async function checkForUpdate(): Promise<UpdateInfo | null> {
+  if (!inTauri) return null;
+  return invoke<UpdateInfo | null>("update_check");
+}
+
+/**
+ * Downloads and launches the installer, then the app quits. `onProgress`
+ * receives byte counts while downloading.
+ */
+export async function installUpdate(onProgress: (downloaded: number, total: number) => void): Promise<void> {
+  const { listen } = await import("@tauri-apps/api/event");
+  const off = await listen<{ downloaded: number; total: number }>("update://progress", (e) =>
+    onProgress(e.payload.downloaded, e.payload.total),
+  );
+  try {
+    await invoke("update_install");
+  } finally {
+    off();
+  }
+}
+
+/* ---------- Scheduled tasks ---------- */
+
+const memTasks: ScheduledTask[] = [];
+
+interface TaskRow extends Omit<ScheduledTask, "enabled"> {
+  enabled: number;
+}
+
+export async function loadScheduledTasks(): Promise<ScheduledTask[]> {
+  const db = await getDb();
+  if (!db) return memTasks.map((t) => ({ ...t }));
+  const rows = await db.select<TaskRow[]>(
+    "SELECT id, name, project, provider_id, model_id, kind, schedule, prompt, enabled, last_run_at, armed_at, last_conv, created_at FROM scheduled_tasks ORDER BY created_at ASC"
+  );
+  return rows.map((r) => ({ ...r, enabled: !!r.enabled }));
+}
+
+/** Inserts or updates a task (run bookkeeping is kept on update). */
+export async function saveScheduledTask(t: ScheduledTask): Promise<void> {
+  const db = await getDb();
+  if (!db) {
+    const at = memTasks.findIndex((x) => x.id === t.id);
+    if (at >= 0) memTasks[at] = { ...t };
+    else memTasks.push({ ...t });
+    return;
+  }
+  await db.execute(
+    `INSERT INTO scheduled_tasks (id, name, project, provider_id, model_id, kind, schedule, prompt, enabled, armed_at, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+     ON CONFLICT(id) DO UPDATE SET name=$2, project=$3, provider_id=$4, model_id=$5, kind=$6, schedule=$7, prompt=$8, enabled=$9, armed_at=$10`,
+    [t.id, t.name, t.project, t.provider_id, t.model_id, t.kind, t.schedule, t.prompt, t.enabled ? 1 : 0, t.armed_at, t.created_at]
+  );
+}
+
+/** Records a run (called BEFORE the run starts, so a reload can't fire it twice). */
+export async function markScheduledTaskRun(id: string, at: number, convId = ""): Promise<void> {
+  const db = await getDb();
+  if (!db) {
+    const t = memTasks.find((x) => x.id === id);
+    if (t) {
+      t.last_run_at = at;
+      t.armed_at = at;
+      if (convId) t.last_conv = convId;
+    }
+    return;
+  }
+  if (convId) {
+    await db.execute("UPDATE scheduled_tasks SET last_run_at = $1, armed_at = $1, last_conv = $2 WHERE id = $3", [at, convId, id]);
+  } else {
+    await db.execute("UPDATE scheduled_tasks SET last_run_at = $1, armed_at = $1 WHERE id = $2", [at, id]);
+  }
+}
+
+export async function deleteScheduledTask(id: string): Promise<void> {
+  const db = await getDb();
+  if (!db) {
+    const at = memTasks.findIndex((x) => x.id === id);
+    if (at >= 0) memTasks.splice(at, 1);
+    return;
+  }
+  await db.execute("DELETE FROM scheduled_tasks WHERE id = $1", [id]);
+}
+
+/* ---------- Skills ----------
+   Folders with a SKILL.md (front matter name + description, then the
+   instructions). User skills live in the app data folder and are edited in
+   Settings → Skills; project skills (<project>/.singularity/skills,
+   <project>/.claude/skills) are picked up automatically. */
+
+export interface Skill {
+  name: string;
+  description: string;
+  dir: string;
+  source: "user" | "project";
+  enabled: boolean;
+}
+
+export interface SkillFull extends Skill {
+  body: string;
+  files: string[];
+}
+
+async function tauriInvoke<T>(cmd: string, args: Record<string, unknown> = {}): Promise<T> {
+  if (!inTauri) throw new Error("This needs the desktop shell (npm run tauri:dev)");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(cmd, args);
+}
+
+export async function listSkills(workspace = ""): Promise<Skill[]> {
+  if (!inTauri) return [];
+  return tauriInvoke<Skill[]>("skills_list", { workspace });
+}
+
+export async function getSkill(name: string, workspace = ""): Promise<SkillFull> {
+  return tauriInvoke<SkillFull>("skills_get", { name, workspace });
+}
+
+/** Creates or edits a user skill; `original` is the name before an edit. */
+export async function saveSkill(draft: { original: string; name: string; description: string; body: string }): Promise<Skill> {
+  return tauriInvoke<Skill>("skills_save", { draft });
+}
+
+export async function deleteSkill(name: string): Promise<void> {
+  await tauriInvoke("skills_delete", { name });
+}
+
+export async function setSkillEnabled(name: string, enabled: boolean): Promise<void> {
+  await tauriInvoke("skills_set_enabled", { name, enabled });
+}
+
+/** Copies a skill folder (or a single .md file) into the user skills. */
+export async function importSkill(path: string): Promise<Skill> {
+  return tauriInvoke<Skill>("skills_import", { path });
+}
+
+export async function skillsFolder(): Promise<string> {
+  if (!inTauri) return "";
+  return tauriInvoke<string>("skills_folder");
+}
+
+/* ---------- MCP servers ---------- */
+
+export interface McpServer {
+  id: string;
+  name: string;
+  transport: "stdio" | "http";
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  url: string;
+  headers: Record<string, string>;
+  enabled: boolean;
+}
+
+export interface McpTool {
+  name: string;
+  description: string;
+  readOnly: boolean;
+}
+
+export async function listMcpServers(): Promise<McpServer[]> {
+  if (!inTauri) return [];
+  return tauriInvoke<McpServer[]>("mcp_list");
+}
+
+export async function saveMcpServer(server: McpServer): Promise<string> {
+  return tauriInvoke<string>("mcp_save", { server });
+}
+
+export async function deleteMcpServer(id: string): Promise<void> {
+  await tauriInvoke("mcp_delete", { id });
+}
+
+/** Starts the server and lists its tools (Settings → MCP "Test"). */
+export async function testMcpServer(server: McpServer): Promise<McpTool[]> {
+  return tauriInvoke<McpTool[]>("mcp_test", { server });
+}
+
+/* ---------- Workspace ---------- */
+
+/** Files and folders of a workspace (folders end with "/") for @-mentions. */
+export async function workspaceFiles(root: string): Promise<string[]> {
+  if (!inTauri || !root) return [];
+  return tauriInvoke<string[]>("workspace_files", { root });
+}
+
+/** The app's own agent folder — where projects without a directory run. */
+export async function appWorkspace(): Promise<string> {
+  if (!inTauri) return "";
+  try {
+    return await tauriInvoke<string>("agent_workspace");
+  } catch {
+    return "";
+  }
 }

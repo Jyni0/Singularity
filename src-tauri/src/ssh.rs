@@ -80,6 +80,9 @@ pub struct SshServer {
     /// fills it from ssh_keys); never persisted on the server row itself.
     #[serde(default)]
     pub key_passphrase: String,
+    /// Id of a saved proxy (ssh_proxies) to tunnel through; "" = direct.
+    #[serde(default)]
+    pub proxy_id: String,
 }
 
 /// A standalone private-key credential, reusable by several servers.
@@ -177,8 +180,6 @@ type Conn = Arc<Handle<ClientHandler>>;
 /// Live connection: the russh handle, shared by exec / shells / SFTP.
 struct Pooled {
     handle: Conn,
-    /// Distribution detected right after connect ("ubuntu", "windows", …).
-    os: String,
 }
 
 static POOL: Mutex<Option<HashMap<String, Arc<Pooled>>>> = Mutex::new(None);
@@ -215,7 +216,7 @@ pub fn connected_ids() -> Vec<String> {
 /// failed connect is RETRIED on the next call rather than cached forever.
 static SQL: tokio::sync::Mutex<Option<sqlx::SqlitePool>> = tokio::sync::Mutex::const_new(None);
 
-async fn sql(app: &AppHandle) -> Option<sqlx::SqlitePool> {
+pub(crate) async fn sql(app: &AppHandle) -> Option<sqlx::SqlitePool> {
     let mut guard = SQL.lock().await;
     if let Some(pool) = guard.as_ref() {
         return Some(pool.clone());
@@ -254,7 +255,9 @@ pub async fn write_log(
     .bind(&server.host)
     .bind(action)
     .bind(ok as i64)
-    .bind(detail)
+    // Commands are logged verbatim otherwise — passwords typed inline
+    // (mysql -p…, API_KEY=…, tokens) must not sit in the audit trail.
+    .bind(crate::safety::redact(detail))
     .execute(&pool)
     .await;
     if let Err(e) = res {
@@ -280,7 +283,7 @@ pub fn unique_id(prefix: &str) -> String {
 async fn load_server(app: &AppHandle, id: &str) -> Result<SshServer, String> {
     let pool = sql(app).await.ok_or("database unavailable")?;
     let row = sqlx::query(
-        "SELECT id, name, host, port, username, auth, password, private_key, key_id, host_key, os FROM ssh_servers WHERE id = $1",
+        "SELECT id, name, host, port, username, auth, password, private_key, key_id, host_key, os, proxy_id FROM ssh_servers WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&pool)
@@ -309,6 +312,7 @@ async fn load_server(app: &AppHandle, id: &str) -> Result<SshServer, String> {
         has_password: !row.try_get::<String, _>("password").unwrap_or_default().is_empty(),
         os: row.try_get("os").unwrap_or_default(),
         key_passphrase: String::new(),
+        proxy_id: row.try_get("proxy_id").unwrap_or_default(),
     };
     // Lazy migration of legacy inline keys (auth == "key" stored the body on
     // the server row): move it into a Credentials row and link it, so old
@@ -413,11 +417,19 @@ async fn connect_inner(app: &AppHandle, server: &SshServer) -> Result<(), String
         expected: server.host_key.clone(),
         seen: seen.clone(),
     };
-    let addr = (server.host.as_str(), server.port);
-    let session = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        client::connect(config, addr, handler),
-    )
+    let session = tokio::time::timeout(CONNECT_TIMEOUT, async {
+        if server.proxy_id.is_empty() {
+            return client::connect(config, (server.host.as_str(), server.port), handler)
+                .await
+                .map_err(|e| format!("ssh handshake failed: {e}"));
+        }
+        // Tunnel through the linked proxy, then run SSH over that stream.
+        let proxy = crate::proxy::load(app, &server.proxy_id).await?;
+        let stream = crate::proxy::dial(&proxy, &server.host, server.port).await?;
+        client::connect_stream(config, stream, handler)
+            .await
+            .map_err(|e| format!("ssh handshake via proxy '{}' failed: {e}", proxy.name))
+    })
     .await;
     let mut session = match session {
         Ok(Ok(s)) => s,
@@ -432,7 +444,7 @@ async fn connect_inner(app: &AppHandle, server: &SshServer) -> Result<(), String
                     ));
                 }
             }
-            return Err(format!("ssh handshake failed: {e}"));
+            return Err(e);
         }
         Err(_) => return Err(format!("connection to {}:{} timed out", server.host, server.port)),
     };
@@ -516,11 +528,11 @@ async fn connect_inner(app: &AppHandle, server: &SshServer) -> Result<(), String
                 .execute(&pool)
                 .await;
         }
-        let _ = app.emit("ssh://os", (server.id.clone(), os.clone()));
+        let _ = app.emit("ssh://os", (server.id.clone(), os));
     }
     pool_put(
         server.id.clone(),
-        Arc::new(Pooled { handle, os }),
+        Arc::new(Pooled { handle }),
     );
     Ok(())
 }
@@ -1335,7 +1347,7 @@ pub async fn sftp_write_chunk(
 pub async fn list_servers(app: &AppHandle) -> Result<Vec<SshServer>, String> {
     let pool = sql(app).await.ok_or("database unavailable")?;
     let rows = sqlx::query(
-        "SELECT id, name, host, port, username, auth, key_id, host_key, os, password FROM ssh_servers ORDER BY sort_order ASC, created_at DESC",
+        "SELECT id, name, host, port, username, auth, key_id, host_key, os, password, proxy_id FROM ssh_servers ORDER BY sort_order ASC, created_at DESC",
     )
     .fetch_all(&pool)
     .await
@@ -1358,6 +1370,7 @@ pub async fn list_servers(app: &AppHandle) -> Result<Vec<SshServer>, String> {
             has_password: !r.try_get::<String, _>("password").unwrap_or_default().is_empty(),
             os: r.try_get("os").unwrap_or_default(),
             key_passphrase: String::new(),
+            proxy_id: r.try_get("proxy_id").unwrap_or_default(),
         })
         .collect())
 }
@@ -1366,6 +1379,14 @@ pub async fn list_servers(app: &AppHandle) -> Result<Vec<SshServer>, String> {
 /// app only) and go into the DB vault-encrypted. Empty password/key on an
 /// update keeps the stored secret — the edit form does not have to resend it.
 pub async fn save_server(app: &AppHandle, s: &SshServer) -> Result<String, String> {
+    crate::safety::validate_host(&s.host)?;
+    crate::safety::validate_username(&s.username)?;
+    if s.port == 0 {
+        return Err("Port must be a number from 1 to 65535.".into());
+    }
+    if s.name.trim().is_empty() || s.name.len() > 120 {
+        return Err("Give the server a name (up to 120 characters).".into());
+    }
     let pool = sql(app).await.ok_or("database unavailable")?;
     let id = if s.id.is_empty() {
         unique_id("srv")
@@ -1408,7 +1429,7 @@ pub async fn save_server(app: &AppHandle, s: &SshServer) -> Result<String, Strin
         s.host_key.clone()
     };
     sqlx::query(
-        "INSERT INTO ssh_servers (id, name, host, port, username, auth, password, private_key, key_id, host_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(id) DO UPDATE SET name=$2, host=$3, port=$4, username=$5, auth=$6, password=$7, private_key=$8, key_id=$9, host_key=$10",
+        "INSERT INTO ssh_servers (id, name, host, port, username, auth, password, private_key, key_id, host_key, proxy_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(id) DO UPDATE SET name=$2, host=$3, port=$4, username=$5, auth=$6, password=$7, private_key=$8, key_id=$9, host_key=$10, proxy_id=$11",
     )
     .bind(&id)
     .bind(&s.name)
@@ -1420,6 +1441,7 @@ pub async fn save_server(app: &AppHandle, s: &SshServer) -> Result<String, Strin
     .bind(&private_key)
     .bind(&s.key_id)
     .bind(&host_key)
+    .bind(&s.proxy_id)
     .execute(&pool)
     .await
     .map_err(|e| format!("cannot save server: {e}"))?;
@@ -1798,14 +1820,25 @@ pub async fn ssh_save_server(app: AppHandle, server: SshServer) -> Result<String
     save_server(&app, &server).await
 }
 
+/// Decrypts a server's stored password for the edit form's "show" button.
+/// Plaintext leaves Rust only on this explicit request, and every reveal is
+/// written to the audit log.
+#[tauri::command]
+pub async fn ssh_reveal_password(app: AppHandle, server_id: String) -> Result<String, String> {
+    let server = load_server(&app, &server_id).await?;
+    write_log(&app, "user", &server, "reveal-password", true, "stored password shown").await;
+    Ok(server.password)
+}
+
 /// Stores the order the user dragged a units list into (ids top to bottom).
-/// kind: "server" | "key" | "script".
+/// kind: "server" | "key" | "script" | "proxy".
 #[tauri::command]
 pub async fn ssh_reorder_units(app: AppHandle, kind: String, ids: Vec<String>) -> Result<(), String> {
     let table = match kind.as_str() {
         "server" => "ssh_servers",
         "key" => "ssh_keys",
         "script" => "ssh_scripts",
+        "proxy" => "ssh_proxies",
         other => return Err(format!("unknown unit kind {other}")),
     };
     let pool = sql(&app).await.ok_or("database unavailable")?;
@@ -1869,31 +1902,6 @@ pub async fn ssh_generate_key(
     passphrase: String,
 ) -> Result<SshKey, String> {
     generate_key(&app, &name, &algorithm, &passphrase).await
-}
-
-/// Re-detects (or returns the cached) OS of a connected server.
-#[tauri::command]
-pub async fn ssh_detect_os(app: AppHandle, server_id: String) -> Result<String, String> {
-    if let Some(conn) = pool_get(&server_id) {
-        if !conn.os.is_empty() {
-            return Ok(conn.os.clone());
-        }
-        let os = detect_os(&conn.handle).await;
-        if !os.is_empty() {
-            if let Some(pool) = sql(&app).await {
-                let _ = sqlx::query("UPDATE ssh_servers SET os = $1 WHERE id = $2")
-                    .bind(&os)
-                    .bind(&server_id)
-                    .execute(&pool)
-                    .await;
-            }
-            let _ = app.emit("ssh://os", (server_id, os.clone()));
-        }
-        return Ok(os);
-    }
-    // Not connected: fall back to the cached value (may be empty).
-    let server = load_server(&app, &server_id).await?;
-    Ok(server.os)
 }
 
 #[tauri::command]
@@ -2008,8 +2016,7 @@ pub async fn ssh_sftp_write_chunk(app: AppHandle, request: tauri::ipc::Request<'
             .ok_or_else(|| format!("missing header {k}"))
     };
     let server_id = header("x-server-id")?;
-    let remote = percent_encoding::percent_decode_str(&header("x-remote")?)
-        .decode_utf8()
+    let remote = urlencoding::decode(&header("x-remote")?)
         .map_err(|e| format!("bad path: {e}"))?
         .into_owned();
     let offset: u64 = header("x-offset")?.parse().map_err(|_| "bad offset")?;

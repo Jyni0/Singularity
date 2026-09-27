@@ -8,8 +8,10 @@
 //!   model     - provider → Rig model handle (effort, temperature, caching)
 //!   runtime   - Rig agent build, streaming consumer, hook, tools, subagents
 //!   context   - history bounding
+//!   expand    - /commands, skills invoked by name and @mentions
 
 mod context;
+mod expand;
 mod model;
 mod prompt;
 mod runtime;
@@ -69,7 +71,7 @@ pub fn resolve_confirm(run_id: &str, approve: bool) {
 /// Asks the UI to approve a command and waits for the answer. Returns as soon
 /// as the user decides — or as soon as the run is stopped, so a Stop pressed
 /// while the Allow/Deny banner is up does not hang the loop.
-async fn ask_confirm(app: &AppHandle, run_id: &str, command: &str, cwd: &str) -> bool {
+async fn ask_confirm(app: &AppHandle, run_id: &str, command: &str, cwd: &str, reason: &str) -> bool {
     let (tx, rx) = oneshot::channel();
     {
         let mut guard = pending().lock().unwrap();
@@ -83,11 +85,12 @@ async fn ask_confirm(app: &AppHandle, run_id: &str, command: &str, cwd: &str) ->
         crate::runs::RunEvent::Confirm {
             command: command.to_string(),
             cwd: cwd.to_string(),
+            reason: reason.to_string(),
         },
     );
     let _ = app.emit(
         "agent://confirm",
-        json!({ "run_id": run_id, "command": command, "cwd": cwd }),
+        json!({ "run_id": run_id, "command": command, "cwd": cwd, "reason": reason }),
     );
 
     // Wait on the answer, but keep an eye on cancellation so Stop unblocks us.

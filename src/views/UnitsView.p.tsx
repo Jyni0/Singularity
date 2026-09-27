@@ -9,9 +9,10 @@ import {
   LoaderCircle,
   X,
   ShieldAlert,
+  Waypoints,
 } from "lucide-react";
 import * as db from "../core/db.r";
-import type { SshKey, SshScript, SshServer, UnitsTab } from "../core/types.i";
+import type { SshKey, SshProxy, SshScript, SshServer, UnitsTab } from "../core/types.i";
 import { OsLogo } from "../ui/OsLogo.c";
 import { useDragOrder } from "../hooks/useDragOrder.h";
 
@@ -27,6 +28,7 @@ export function UnitsView({
   servers,
   keys,
   scripts,
+  proxies,
   connected,
   busyIds,
   notice,
@@ -43,6 +45,7 @@ export function UnitsView({
   servers: SshServer[];
   keys: SshKey[];
   scripts: SshScript[];
+  proxies: SshProxy[];
   connected: string[];
   busyIds: string[];
   notice?: string | null;
@@ -53,19 +56,21 @@ export function UnitsView({
   /** Reload the collections after a delete (saves happen inside SshPanel). */
   onChanged: () => void;
   /** Open the right-hand panel to edit a unit. */
-  onEditUnit: (target: { kind: "server" | "key" | "script"; id: string }) => void;
+  onEditUnit: (target: { kind: UnitKind; id: string }) => void;
   /** Open the right-hand panel to create a unit of the given kind. */
-  onAddUnit: (kind: "server" | "key" | "script") => void;
+  onAddUnit: (kind: UnitKind) => void;
   onConnect: (id: string) => void;
   onOpenTerminal: (serverId: string) => void;
   /** A list was dragged into a new order (ids top to bottom). */
-  onReorder: (kind: "server" | "key" | "script", ids: string[]) => void;
+  onReorder: (kind: UnitKind, ids: string[]) => void;
 }) {
   const TABS: { id: UnitsTab; label: string; icon: typeof Server; count: number }[] = [
     { id: "servers", label: "Servers", icon: Server, count: servers.length },
     { id: "keys", label: "Credentials", icon: KeyRound, count: keys.length },
     { id: "scripts", label: "Scripts", icon: FileCode2, count: scripts.length },
+    { id: "proxies", label: "Proxies", icon: Waypoints, count: proxies.length },
   ];
+  const kind = TAB_KIND[tab];
 
   return (
     <motion.div
@@ -104,12 +109,10 @@ export function UnitsView({
         </div>
         <button
           className="flex h-9 items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] px-3 text-[12px] font-medium text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
-          onClick={() =>
-            onAddUnit(tab === "servers" ? "server" : tab === "keys" ? "key" : "script")
-          }
+          onClick={() => onAddUnit(kind)}
         >
           <Plus size={13} strokeWidth={2} />
-          {tab === "servers" ? "Add server" : tab === "keys" ? "Add credential" : "Add script"}
+          {ADD_LABEL[kind]}
         </button>
       </div>
 
@@ -166,6 +169,19 @@ export function UnitsView({
             />
           )}
 
+          {tab === "proxies" && (
+            <ProxyGrid
+              proxies={proxies}
+              servers={servers}
+              onReorder={(ids) => onReorder("proxy", ids)}
+              onEdit={(p) => onEditUnit({ kind: "proxy", id: p.id })}
+              onDelete={async (p) => {
+                await db.deleteSshProxy(p.id);
+                onChanged();
+              }}
+            />
+          )}
+
           {tab === "scripts" && (
             <ScriptGrid
               scripts={scripts}
@@ -183,6 +199,22 @@ export function UnitsView({
     </motion.div>
   );
 }
+
+type UnitKind = "server" | "key" | "script" | "proxy";
+
+const TAB_KIND: Record<UnitsTab, UnitKind> = {
+  servers: "server",
+  keys: "key",
+  scripts: "script",
+  proxies: "proxy",
+};
+
+const ADD_LABEL: Record<UnitKind, string> = {
+  server: "Add server",
+  key: "Add credential",
+  script: "Add script",
+  proxy: "Add proxy",
+};
 
 /* ---------- Termius-style host rows ---------- */
 /**
@@ -459,6 +491,69 @@ function ScriptGrid({
             </span>
           </div>
       )}
+    </DragList>
+  );
+}
+
+/* ---------- Proxies list ---------- */
+
+/** Saved proxies (HTTP / SOCKS5). A server picks one in its settings. */
+function ProxyGrid({
+  proxies,
+  servers,
+  onReorder,
+  onEdit,
+  onDelete,
+}: {
+  proxies: SshProxy[];
+  servers: SshServer[];
+  onReorder: (ids: string[]) => void;
+  onEdit: (p: SshProxy) => void;
+  onDelete: (p: SshProxy) => void;
+}) {
+  if (proxies.length === 0)
+    return <Empty icon={Waypoints} text="No proxies yet — add an HTTP or SOCKS5 proxy, then pick it in a server's settings." />;
+  return (
+    <DragList items={proxies} onReorder={onReorder}>
+      {(p) => {
+        const users = servers.filter((s) => s.proxy_id === p.id).length;
+        return (
+          <div className={LIST_ROW + " cursor-pointer"} onClick={() => onEdit(p)} title="Edit proxy — drag to reorder">
+            <Avatar label={p.name} color={avatarColor(p.id)} icon={Waypoints} />
+            <span className="min-w-0 flex-1">
+              <span className="flex min-w-0 items-center gap-1.5">
+                <span className="truncate text-[13.5px] font-medium text-[var(--text-main)]">{p.name}</span>
+                <span className="shrink-0 rounded border border-[var(--border)] px-1 text-[9.5px] font-semibold uppercase tracking-wide text-[var(--text-dim)]">
+                  {p.kind === "socks5" ? "SOCKS5" : "HTTP"}
+                </span>
+              </span>
+              <span className="block truncate font-mono text-[11.5px] text-[var(--text-dim)]">
+                {p.username ? p.username + "@" : ""}
+                {p.host}:{p.port}
+                {users > 0 ? ` · ${users} server${users > 1 ? "s" : ""}` : ""}
+              </span>
+            </span>
+            <span className="flex shrink-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+              <span className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                <button
+                  className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                  title="Edit"
+                  onClick={() => onEdit(p)}
+                >
+                  <Pencil size={13} />
+                </button>
+                <button
+                  className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
+                  title="Delete"
+                  onClick={() => onDelete(p)}
+                >
+                  <Trash2 size={13} />
+                </button>
+              </span>
+            </span>
+          </div>
+        );
+      }}
     </DragList>
   );
 }

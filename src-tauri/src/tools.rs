@@ -237,6 +237,45 @@ pub fn list_dir(root: &Path, path: &str) -> ToolResult {
     ToolResult::ok(format!("{shown}:\n{}", names.join("\n")))
 }
 
+/// Folders never offered by the @-mention picker (build output, deps, VCS).
+const INDEX_SKIP: &[&str] = &[
+    ".git", "node_modules", "target", "dist", "build", "out", ".next", ".nuxt", ".svelte-kit",
+    ".venv", "venv", "__pycache__", ".cache", ".turbo", "coverage", ".gradle", ".idea", ".DS_Store",
+];
+/// Entries returned by `workspace_files` at most.
+const INDEX_MAX: usize = 20_000;
+
+/// Every file and folder under `root`, relative with `/` separators; folders
+/// end with `/`. Breadth-first, so a huge tree still yields its top levels.
+pub fn workspace_files(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
+    while let Some(dir) = queue.pop_front() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            if out.len() >= INDEX_MAX {
+                return out;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if INDEX_SKIP.contains(&name.as_str()) {
+                continue;
+            }
+            let path = e.path();
+            let Ok(rel) = path.strip_prefix(root) else { continue };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                out.push(format!("{rel}/"));
+                queue.push_back(path);
+            } else {
+                out.push(rel);
+            }
+        }
+    }
+    out
+}
+
 /// Recursive text search across the workspace.
 pub fn grep(root: &Path, pattern: &str, subdir: Option<&str>) -> ToolResult {
     let base = match subdir {

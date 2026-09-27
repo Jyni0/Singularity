@@ -81,6 +81,8 @@ export function toolLabel(step: db.AgentStepEvent): string {
     grep: "Search",
     run_command: "Run",
     ssh_exec: "SSH",
+    skill: "Skill",
+    mcp: "MCP",
   };
-  return verb[step.name] ?? step.name;
+  return verb[step.name] ?? step.name.replace(/^mcp__(.+?)__/, "$1 · ");
 }

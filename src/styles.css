@@ -626,3 +626,38 @@ textarea, input, [contenteditable="true"] { user-select: text; -webkit-user-sele
 
 /* Window close button hover (native-like) */
 .win-close:hover { background: #E81123; color: #fff; }
+
+/* ---------- Themed range slider (Temperature dropdown) ----------
+   The native WebView2 slider is Windows-blue whatever the theme; this one
+   draws its track and thumb from the theme tokens. --fill = filled share. */
+.range-theme {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  outline: none;
+  cursor: pointer;
+  background: linear-gradient(
+    to right,
+    var(--accent) 0%,
+    var(--accent) var(--fill, 50%),
+    var(--bg-elevated) var(--fill, 50%),
+    var(--bg-elevated) 100%
+  );
+}
+.range-theme::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--bg-surface);
+  border: 2px solid var(--accent);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  transition: transform 0.12s ease;
+}
+.range-theme:hover::-webkit-slider-thumb,
+.range-theme:focus-visible::-webkit-slider-thumb {
+  transform: scale(1.15);
+}

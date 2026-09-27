@@ -63,7 +63,7 @@ export function SshSidebar({
   /** Connection whose page is on screen. */
   activeConn: string | null;
   /** Row whose form is open in the right-hand panel (highlighted here). */
-  activePanel: { kind: "server" | "key" | "script"; id?: string } | null;
+  activePanel: { kind: "server" | "key" | "script" | "proxy"; id?: string } | null;
   /** Focus the server's connection of this kind; fresh=true opens a new one. */
   onOpenConn: (serverId: string, kind: "terminal" | "sftp", fresh?: boolean) => void;
   onSelectConn: (connId: string) => void;

@@ -32,15 +32,17 @@ export function ScrollArea({
 export function ScrollBox({
   children,
   className = "",
+  style,
 }: {
   children: React.ReactNode;
   className?: string;
+  style?: React.CSSProperties;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const thumb = useOverlayThumb(ref);
   return (
     <div className="relative">
-      <div ref={ref} className={`no-native-scrollbar overflow-y-auto ${className}`}>
+      <div ref={ref} className={`no-native-scrollbar overflow-y-auto ${className}`} style={style}>
         {children}
       </div>
       <Thumb thumb={thumb} />

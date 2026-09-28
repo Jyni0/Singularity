@@ -22,6 +22,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "net", "io-util", "process"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart", "rustls-tls"], default-features = false }
 futures-util = "0.3"
+bytes = "1"
 rand = "0.8"
 sha2 = "0.10"
 base64 = "0.22"

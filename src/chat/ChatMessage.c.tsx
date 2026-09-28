@@ -431,10 +431,10 @@ function HudCell({ label, value, title }: { label: string; value: string; title?
 function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?: boolean }) {
   const secs = (usage.elapsed_ms ?? 0) / 1000;
   const tps = secs > 0.5 ? usage.completion_tokens / secs : 0;
-  const cacheRate =
-    usage.prompt_tokens + usage.cached_tokens > 0
-      ? Math.round((usage.cached_tokens / (usage.prompt_tokens + usage.cached_tokens)) * 100)
-      : 0;
+  // prompt_tokens is the whole prompt, cache reads included (older Anthropic
+  // runs stored them apart — then cached can exceed prompt).
+  const promptAll = Math.max(usage.prompt_tokens, usage.cached_tokens);
+  const cacheRate = promptAll > 0 ? Math.round((usage.cached_tokens / promptAll) * 100) : 0;
   const fmt = (n: number) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(Math.round(n)));
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1.5 py-1">
@@ -448,7 +448,7 @@ function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?: boolea
       <HudCell
         label="cache"
         value={cacheRate + "%"}
-        title={"Cached prompt tokens: " + usage.cached_tokens + " of " + (usage.prompt_tokens + usage.cached_tokens)}
+        title={"Cached prompt tokens: " + usage.cached_tokens + " of " + promptAll}
       />
       <HudCell
         label="time"

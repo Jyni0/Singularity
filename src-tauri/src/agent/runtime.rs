@@ -150,9 +150,7 @@ impl RunCtx {
     fn add_usage(&self, input: u64, output: u64, cached: u64) {
         let mut u = self.usage.lock().unwrap();
         if u.first_input == 0 {
-            // Anthropic reports cache reads apart from input; the OpenAI
-            // family includes them in it.
-            u.first_input = if self.req.kind == "anthropic-messages" { input + cached } else { input };
+            u.first_input = input;
         }
         u.prompt_tokens += input;
         u.completion_tokens += output;
@@ -956,8 +954,11 @@ fn mcp_tool(b: &McpBinding) -> DynamicTool {
 /* ---------- Agent build + streaming ---------- */
 
 /// Builds one Rig agent (main or helper) on the request's provider.
-fn build_agent(ctx: &RunCtx, preamble: &str, tools: Vec<DynamicTool>) -> Result<rig_agent::Agent, String> {
+type CacheSeen = Option<Arc<Mutex<Option<super::cachenet::CacheSeen>>>>;
+
+fn build_agent(ctx: &RunCtx, preamble: &str, tools: Vec<DynamicTool>) -> Result<(rig_agent::Agent, CacheSeen), String> {
     let setup = model::build(&ctx.req)?;
+    let seen = setup.cache_seen.clone();
     let mut b = AgentBuilder::from_model_handle(setup.handle)
         .preamble(preamble)
         .default_max_turns(MAX_TURNS);
@@ -970,7 +971,7 @@ fn build_agent(ctx: &RunCtx, preamble: &str, tools: Vec<DynamicTool>) -> Result<
     if let Some(p) = setup.params {
         b = b.additional_params(p);
     }
-    Ok(b.dynamic_tools(tools).build())
+    Ok((b.dynamic_tools(tools).build(), seen))
 }
 
 /// Chat history → Rig messages; the LAST user turn becomes the prompt (with
@@ -1018,6 +1019,7 @@ fn to_messages(req: &AgentRequest, turns: &[crate::chat::ChatTurn]) -> (Vec<Mess
 async fn drive(
     ctx: &RunCtx,
     mut stream: rig_agent::agent::StreamingResult,
+    seen: &CacheSeen,
     to_ui: bool,
     mut on_text: impl FnMut(&str),
 ) -> (String, Option<String>) {
@@ -1073,7 +1075,23 @@ async fn drive(
             }
             MultiTurnStreamItem::CompletionCall(call) => {
                 let u = call.usage;
-                ctx.add_usage(u.input_tokens + u.cache_creation_input_tokens, u.output_tokens, u.cached_input_tokens);
+                // Input = the WHOLE prompt, cache reads included, for every
+                // provider (Anthropic reports reads apart from input).
+                let (mut input, mut cached) = if ctx.req.kind == "anthropic-messages" {
+                    (u.input_tokens + u.cache_creation_input_tokens + u.cached_input_tokens, u.cached_input_tokens)
+                } else {
+                    (u.input_tokens + u.cache_creation_input_tokens, u.cached_input_tokens)
+                };
+                // What the gateway itself reported (fields Rig does not read).
+                if let Some(s) = seen.as_ref().and_then(|s| s.lock().unwrap().take()) {
+                    cached = cached.max(s.cached);
+                    input = input.max(s.prompt);
+                    if s.cached > 0 && s.prompt < s.cached {
+                        // Anthropic-style report behind the gateway: reads apart from input.
+                        input = input.max(s.prompt + s.cached + s.created);
+                    }
+                }
+                ctx.add_usage(input, u.output_tokens, cached);
             }
             MultiTurnStreamItem::FinalResponse(resp) => {
                 if text.trim().is_empty() && !resp.output.trim().is_empty() {
@@ -1111,7 +1129,7 @@ async fn run_with_retry(
     let mut text = String::new();
     let mut attempt = 0usize;
     loop {
-        let agent = build_agent(ctx, preamble, tools())?;
+        let (agent, seen) = build_agent(ctx, preamble, tools())?;
         let stream = agent
             .stream_chat(prompt.clone(), history.clone())
             .max_turns(MAX_TURNS)
@@ -1119,7 +1137,7 @@ async fn run_with_retry(
             .tool_concurrency(parallel)
             .add_hook(UiHook::new(ctx.clone(), label, snapshot.clone()))
             .await;
-        let (part, err) = drive(ctx, stream, to_ui, &mut on_text).await;
+        let (part, err) = drive(ctx, stream, &seen, to_ui, &mut on_text).await;
         text.push_str(&part);
         let Some(err) = err else {
             return Ok(text);

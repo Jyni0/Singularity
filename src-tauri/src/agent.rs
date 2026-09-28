@@ -10,6 +10,7 @@
 //!   context   - history bounding
 //!   expand    - /commands, skills invoked by name and @mentions
 
+mod cachenet;
 mod context;
 mod expand;
 mod model;
@@ -427,7 +428,8 @@ async fn run_ssh_tool(app: &AppHandle, req: &AgentRequest, args: &Value) -> tool
 #[derive(Debug, Clone, Serialize)]
 pub struct RunUsage {
     pub run_id: String,
-    /// Sum of prompt tokens over all rounds of this run.
+    /// Sum of prompt tokens over all rounds of this run — the whole prompt,
+    /// cache reads included, for every provider.
     pub prompt_tokens: u64,
     /// Sum of completion tokens over all rounds.
     pub completion_tokens: u64,

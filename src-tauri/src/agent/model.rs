@@ -15,6 +15,9 @@ pub(super) struct ModelSetup {
     pub params: Option<Value>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
+    /// Cache numbers the provider reported for the latest response
+    /// (OpenAI-compatible transport, see cachenet.rs).
+    pub cache_seen: Option<std::sync::Arc<std::sync::Mutex<Option<super::cachenet::CacheSeen>>>>,
 }
 
 /// Anthropic thinking budget per effort level (None = thinking off).
@@ -70,7 +73,9 @@ pub(super) fn build(req: &AgentRequest) -> Result<ModelSetup, String> {
                 .map_err(fail)?;
             // Prompt caching: system prompt + tool schemas are byte-stable
             // across rounds, so repeat rounds read them from Anthropic's cache.
-            let model = client.completion_model(&req.model).with_automatic_caching();
+            // Plus explicit breakpoints on tools + system, so that layer stays
+            // cached across turns while the automatic one follows the history.
+            let model = client.completion_model(&req.model).with_automatic_caching().with_prompt_caching();
             let thinking = anthropic_thinking(effort);
             Ok(ModelSetup {
                 handle: ModelHandle::new(model),
@@ -79,6 +84,7 @@ pub(super) fn build(req: &AgentRequest) -> Result<ModelSetup, String> {
                 temperature: if thinking.is_some() { None } else { temperature },
                 // max_tokens must exceed the thinking budget.
                 max_tokens: Some(thinking.map(|b| b + 4096).unwrap_or(8192)),
+                cache_seen: None,
             })
         }
         "ollama" => {
@@ -92,6 +98,7 @@ pub(super) fn build(req: &AgentRequest) -> Result<ModelSetup, String> {
                 params: pick.map(|e| json!({ "think": e == "high" })),
                 temperature,
                 max_tokens: None,
+                cache_seen: None,
             })
         }
         // OpenAI (incl. "openai-responses" providers), OpenAI-compatible
@@ -102,9 +109,12 @@ pub(super) fn build(req: &AgentRequest) -> Result<ModelSetup, String> {
         // StreamingCompletionChunk"); /chat/completions is what these
         // providers always served the agent through.
         _ => {
+            let http = super::cachenet::CacheClient::new(&req.model);
+            let seen = http.seen.clone();
             let client = openai::Client::builder()
                 .api_key(key)
                 .base_url(&base)
+                .http_client(http)
                 .build()
                 .map_err(fail)?
                 .completions_api();
@@ -113,6 +123,7 @@ pub(super) fn build(req: &AgentRequest) -> Result<ModelSetup, String> {
                 params: pick.map(|e| json!({ "reasoning_effort": e })),
                 temperature,
                 max_tokens: None,
+                cache_seen: Some(seen),
             })
         }
     }

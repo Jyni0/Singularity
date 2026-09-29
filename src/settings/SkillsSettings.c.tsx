@@ -10,13 +10,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Sparkles, Plus, Trash2, FolderInput, FileInput, Save, X, FolderOpen } from "lucide-react";
 import * as db from "../core/db.r";
-import { SBUTTON, SINPUT } from "../ui/tokens.s";
-import { Switch } from "../ui/Switch.c";
-import { SettingsCard, Sep } from "./SettingsParts.c";
-
-const TEXTAREA =
-  "w-full resize-y rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 font-mono text-[12px] leading-relaxed text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
-const LABEL = "flex flex-col gap-1 text-[11px] text-[var(--text-dim)]";
+import { Switch, SettingsCard, Sep, Button, Input, TextArea, Alert, ConfirmBar, IconButton, Field } from "../components";
 
 interface Draft {
   original: string;
@@ -147,41 +141,36 @@ export function SkillsSettings({ workspace }: { workspace: string }) {
   const editor = draft && (
     <div className="flex flex-col gap-2.5 px-1.5 pb-2 pt-1">
       <div className="grid grid-cols-[220px_1fr] gap-2.5">
-        <label className={LABEL}>
-          Name (also the /command)
-          <input
-            className={`${SINPUT} w-full font-mono`}
+        <Field label="Name (also the /command)">
+          <Input className="font-mono"
             value={draft.name}
             placeholder="code-review"
             onChange={(e) => setDraft({ ...draft, name: e.target.value.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 64) })}
             autoFocus={draft.original === ""}
           />
-        </label>
-        <label className={LABEL}>
-          When to use it (the agent reads this to decide)
-          <input
-            className={`${SINPUT} w-full`}
+        </Field>
+        <Field label="When to use it (the agent reads this to decide)">
+          <Input
             value={draft.description}
             placeholder="Reviews a diff for bugs, security issues and style problems"
             onChange={(e) => setDraft({ ...draft, description: e.target.value })}
           />
-        </label>
+        </Field>
       </div>
-      <label className={LABEL}>
-        Instructions (Markdown — SKILL.md body)
-        <textarea className={TEXTAREA} rows={12} value={draft.body} onChange={(e) => setDraft({ ...draft, body: e.target.value })} />
-      </label>
+      <Field label="Instructions (Markdown — SKILL.md body)">
+        <TextArea mono rows={12} value={draft.body} onChange={(e) => setDraft({ ...draft, body: e.target.value })} />
+      </Field>
       <div className="flex items-center justify-end gap-2">
-        <button className={SBUTTON} onClick={close}>
+        <Button onClick={close}>
           <X size={13} className="mr-1" /> Cancel
-        </button>
-        <button
-          className="flex h-9 items-center rounded-md bg-[var(--accent)] px-3 text-[12px] text-white transition-colors hover:bg-[var(--accent-hover)] disabled:opacity-50"
+        </Button>
+        <Button
+          variant="primary"
           onClick={() => void save()}
           disabled={busy}
         >
-          <Save size={13} className="mr-1.5" /> Save skill
-        </button>
+          <Save size={13} /> Save skill
+        </Button>
       </div>
     </div>
   );
@@ -197,27 +186,25 @@ export function SkillsSettings({ workspace }: { workspace: string }) {
               <span className="font-mono text-[var(--text-muted)]">/name</span> in the prompt to use one directly.
             </div>
           </div>
-          <button className={SBUTTON} onClick={() => void importFrom(true)} title="Import a folder that contains SKILL.md">
+          <Button onClick={() => void importFrom(true)} title="Import a folder that contains SKILL.md">
             <FolderInput size={13} className="mr-1" /> Folder
-          </button>
-          <button className={SBUTTON} onClick={() => void importFrom(false)} title="Import a single SKILL.md / .md file">
+          </Button>
+          <Button onClick={() => void importFrom(false)} title="Import a single SKILL.md / .md file">
             <FileInput size={13} className="mr-1" /> File
-          </button>
-          <button className={SBUTTON} onClick={startNew}>
+          </Button>
+          <Button onClick={startNew}>
             <Plus size={13} className="mr-1" /> New skill
-          </button>
+          </Button>
         </div>
 
         {error && (
-          <div className="rounded-md border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-3 py-2 text-[12px] text-[var(--diff-del)]">
-            {error}
-          </div>
+          <Alert>{error}</Alert>
         )}
 
         {editing === "" && editor}
 
         {skills.length === 0 && editing !== "" && (
-          <div className="rounded-lg border border-dashed border-[var(--border)] px-3 py-4 text-center text-[12px] text-[var(--text-dim)]">
+          <div className="rounded-xl border border-dashed border-[var(--border)] px-3 py-4 text-center text-[12px] text-[var(--text-dim)]">
             No skills yet — create one, or import a folder with a SKILL.md.
           </div>
         )}
@@ -228,25 +215,21 @@ export function SkillsSettings({ workspace }: { workspace: string }) {
             <div key={`${s.source}:${s.name}`} className="flex flex-col">
               {i > 0 && <Sep />}
               {confirmDel === s.name ? (
-                <div className="flex items-center gap-2 rounded-lg border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-2.5 py-1.5 text-[12.5px] text-[var(--text-main)]">
-                  <span className="min-w-0 flex-1 truncate">Delete the skill “{s.name}” and its folder?</span>
-                  <button className="shrink-0 rounded-md bg-[var(--diff-del)] px-2.5 py-1 text-[11px] font-medium text-white" onClick={() => void remove(s.name)}>
-                    Delete
-                  </button>
-                  <button className="shrink-0 rounded-md px-2 py-1 text-[11px] text-[var(--text-muted)] hover:bg-[var(--hover-bg)]" onClick={() => setConfirmDel(null)}>
-                    Cancel
-                  </button>
-                </div>
+                <ConfirmBar
+                  message={<>Delete the skill “{s.name}” and its folder?</>}
+                  onConfirm={() => void remove(s.name)}
+                  onCancel={() => setConfirmDel(null)}
+                />
               ) : (
                 <div
-                  className="group flex cursor-pointer items-center gap-2 rounded-lg px-1.5 py-2 transition-colors hover:bg-[var(--hover-bg)]"
+                  className="group flex cursor-pointer items-center gap-2 rounded-xl px-1.5 py-2 transition-colors hover:bg-[var(--hover-bg)]"
                   onClick={() => void open(s)}
                 >
                   <Sparkles size={14} className={s.enabled ? "shrink-0 text-[var(--accent)]" : "shrink-0 text-[var(--text-dim)]"} />
                   <span className="max-w-[45%] shrink-0 truncate font-mono text-[12.5px] font-medium text-[var(--text-main)]">/{s.name}</span>
                   <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text-dim)]">{s.description || "No description"}</span>
                   {s.source !== "user" && (
-                    <span className="shrink-0 rounded border border-[var(--border)] px-1.5 text-[10px] text-[var(--text-dim)]" title={s.dir}>
+                    <span className="shrink-0 rounded-md border border-[var(--border)] px-1.5 text-[10px] text-[var(--text-dim)]" title={s.dir}>
                       {s.source === "builtin" ? "built-in" : "project"}
                     </span>
                   )}
@@ -254,16 +237,15 @@ export function SkillsSettings({ workspace }: { workspace: string }) {
                     <Switch on={s.enabled} onChange={(on) => void toggle(s, on)} ariaLabel="enable skill" />
                   </span>
                   {s.source === "user" && (
-                    <button
-                      className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-dim)] opacity-0 transition-all hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)] group-hover:opacity-100"
-                      title="Delete skill"
+                    <IconButton
+                      label="Delete skill" size="xs" tone="danger" reveal
                       onClick={(e) => {
                         e.stopPropagation();
                         setConfirmDel(s.name);
                       }}
                     >
                       <Trash2 size={12} />
-                    </button>
+                    </IconButton>
                   )}
                 </div>
               )}
@@ -279,7 +261,7 @@ export function SkillsSettings({ workspace }: { workspace: string }) {
                       </>
                     )}
                   </div>
-                  <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-words rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 font-mono text-[11.5px] text-[var(--text-main)]">
+                  <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-words rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 font-mono text-[11.5px] text-[var(--text-main)]">
                     {preview.body}
                   </pre>
                   {preview.files.length > 0 && (

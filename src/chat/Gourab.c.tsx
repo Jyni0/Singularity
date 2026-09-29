@@ -18,8 +18,8 @@ import "blobatar/motion.css";
 import "./gourab.css";
 import { Search } from "lucide-react";
 import { formatDuration } from "../utils/format.u";
-import { baseName } from "./FileIcon.c";
 import type { Segment } from "./message.i";
+import { baseName } from "../components";
 
 const MASCOT_NAME = "gourab";
 

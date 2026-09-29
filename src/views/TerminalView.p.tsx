@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { motion } from "motion/react";
-import { FolderOpen, LoaderCircle, X } from "lucide-react";
+import { FolderOpen, X } from "lucide-react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -8,8 +8,9 @@ import "@xterm/xterm/css/xterm.css";
 import { readText as clipboardRead, writeText as clipboardWrite } from "@tauri-apps/plugin-clipboard-manager";
 import * as db from "../core/db.r";
 import type { SshServer } from "../core/types.i";
-import { DEFAULT_TERMINAL_THEME, terminalTheme } from "../ui/TerminalTheme.s";
-// import { OsLogo } from "../ui/OsLogo.c";
+import { DEFAULT_TERMINAL_THEME, terminalTheme } from "../components/code/TerminalTheme.s";
+import { Button, Spinner } from "../components";
+// import { OsLogo } from "../components/icons/OsLogo.c";
 
 /** Fallbacks for the ssh_* appearance settings (persisted in SQLite). */
 const DEFAULT_SSH_TERMINAL = {
@@ -415,7 +416,7 @@ export function TerminalView({
           Logo only — no OS name text over the terminal. */}
       {status === "connecting" && (
         <div className="pointer-events-none absolute left-1/2 top-3 z-10 flex -translate-x-1/2 items-center gap-2 rounded-full border border-[var(--border)] bg-[var(--bg-surface)]/95 px-3.5 py-1.5 text-[12px] text-[var(--text-muted)] shadow-[var(--shadow-popup)] backdrop-blur">
-          <LoaderCircle size={12} className="animate-spin" />
+          <Spinner size={12} />
           <span className="font-mono">
             {server.username}@{server.host}
           </span>
@@ -424,12 +425,12 @@ export function TerminalView({
 
       {(status === "closed" || status === "error") && (
         <div className="absolute left-1/2 top-3 z-10 flex -translate-x-1/2 items-center gap-2 rounded-full border border-[var(--border)] bg-[var(--bg-surface)]/95 px-2 py-1.5 shadow-[var(--shadow-popup)] backdrop-blur">
-          <button
-            className="flex h-6 items-center gap-1.5 rounded-full bg-[var(--accent)] px-3 text-[11.5px] font-medium text-white transition-opacity hover:opacity-90"
+          <Button
+            variant="primary" size="xs"
             onClick={reconnect}
           >
             Reconnect
-          </button>
+          </Button>
           <button
             className="flex h-6 items-center gap-1.5 rounded-full px-3 text-[11.5px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
             onClick={onOpenFiles}

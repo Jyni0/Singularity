@@ -1,14 +1,13 @@
 import { useEffect, useState } from "react";
 import * as db from "../core/db.r";
-import { Switch } from "../ui/Switch.c";
-import { Combobox } from "../ui/Combobox.c";
-import { Segmented, SettingRow, SettingsCard, Sep } from "./SettingsParts.c";
 import {
   TERMINAL_THEMES,
   TERMINAL_THEME_NAMES,
   DEFAULT_TERMINAL_THEME,
+  terminalThemeLabel,
   terminalTheme,
-} from "../ui/TerminalTheme.s";
+} from "../components/code/TerminalTheme.s";
+import { Switch, Combobox, Segmented, SettingRow, SettingsCard, Sep } from "../components";
 
 /**
  * Settings → Terminal (SSH Client mode): the appearance and behaviour of
@@ -63,7 +62,7 @@ export function TerminalSettings() {
         <SettingRow title="Theme" hint="Color palette of the SSH console">
           <div className="w-[240px]">
             <Combobox
-              searchable={false}
+              placeholder="Search themes…"
               value={themeName}
               onChange={(v) => {
                 setThemeName(v);
@@ -71,7 +70,7 @@ export function TerminalSettings() {
               }}
               options={TERMINAL_THEME_NAMES.map((n) => ({
                 value: n,
-                label: n.charAt(0).toUpperCase() + n.slice(1),
+                label: terminalThemeLabel(n),
                 swatch: [terminalTheme(n).background ?? "#000", terminalTheme(n).blue ?? "#38f", terminalTheme(n).foreground ?? "#fff"],
               }))}
             />
@@ -80,7 +79,7 @@ export function TerminalSettings() {
         <Sep />
         {/* Live palette preview — 8 swatches of the picked theme */}
         <div
-          className="flex items-center gap-1 rounded-lg px-3 py-2.5"
+          className="flex items-center gap-1 rounded-xl px-3 py-2.5"
           style={{ background: theme.background }}
         >
           {([
@@ -123,7 +122,7 @@ export function TerminalSettings() {
         <SettingRow title="Font family" hint="Monospace font of the console">
           <div className="w-[240px]">
             <Combobox
-              searchable={false}
+              placeholder="Search themes…"
               value={fontFamily}
               onChange={(v) => {
                 setFontFamily(v);
@@ -152,7 +151,7 @@ export function TerminalSettings() {
         <SettingRow title="Scrollback" hint="Lines kept in history">
           <div className="w-[240px]">
             <Combobox
-              searchable={false}
+              placeholder="Search themes…"
               value={String(scrollback)}
               onChange={(v) => {
                 setScrollback(Number(v));
@@ -169,7 +168,7 @@ export function TerminalSettings() {
         <SettingRow title="Terminal type" hint="$TERM sent to the server">
           <div className="w-[240px]">
             <Combobox
-              searchable={false}
+              placeholder="Search themes…"
               value={termType}
               onChange={(v) => {
                 setTermType(v);

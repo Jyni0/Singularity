@@ -13,10 +13,8 @@ import {
   X,
 } from "lucide-react";
 import type { SshConn, SshKey, SshScript, SshServer, UnitsTab, ViewKind } from "../core/types.i";
-import { ROW, ROW_HOVER, ROW_ACTIVE, ROW_ICON } from "../ui/tokens.s";
-import { ScrollArea } from "../ui/ScrollArea.c";
-import { OsLogo } from "../ui/OsLogo.c";
 import { useDragOrder } from "../hooks/useDragOrder.h";
+import { ROW_ICON, ScrollArea, OsLogo, NavItem, RowActions } from "../components";
 
 /**
  * Sidebar of the SSH Client mode. Same anatomy as the Agent sidebar — nav
@@ -91,7 +89,7 @@ export function SshSidebar({
   const sectionHeader = (name: string, title: string, count: number, tab?: UnitsTab, addLabel?: string) => (
     <div className="group mb-1 mt-3 flex h-6 shrink-0 items-center pl-1 pr-0.5">
       <button
-        className="flex h-6 items-center gap-1 rounded text-[12px] font-medium text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
+        className="flex h-6 items-center gap-1 rounded-md text-[12px] font-medium text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
         onClick={() => toggle(name)}
         title={open[name] ? "Collapse" : "Expand"}
       >
@@ -108,7 +106,7 @@ export function SshSidebar({
       {tab && (
         <span className="ml-auto flex items-center gap-2">
           <button
-            className="flex items-center justify-center rounded p-0.5 text-[var(--text-muted)] opacity-60 transition-all hover:opacity-100"
+            className="flex items-center justify-center rounded-md p-0.5 text-[var(--text-muted)] opacity-60 transition-all hover:opacity-100"
             onClick={() => onAdd(tab)}
             title={addLabel}
           >
@@ -146,20 +144,20 @@ export function SshSidebar({
       {/* Header: the two pages of this mode */}
       <div className="px-2.5 pt-3">
         <nav className="flex flex-col gap-2">
-          <button
-            className={ROW + " " + (view === "units" ? ROW_ACTIVE : "") + " " + ROW_HOVER}
+          <NavItem
+            active={view === "units"}
+            icon={<Server size={16} strokeWidth={1.5} className="shrink-0" />}
             onClick={() => onShowView("units")}
           >
-            <Server size={16} strokeWidth={1.5} className="shrink-0" />
             <span>Units</span>
-          </button>
-          <button
-            className={ROW + " " + (view === "ssh-logs" ? ROW_ACTIVE : "") + " " + ROW_HOVER}
+          </NavItem>
+          <NavItem
+            active={view === "ssh-logs"}
+            icon={<ScrollText size={16} strokeWidth={1.5} className="shrink-0" />}
             onClick={() => onShowView("ssh-logs")}
           >
-            <ScrollText size={16} strokeWidth={1.5} className="shrink-0" />
             <span>Logs</span>
-          </button>
+          </NavItem>
         </nav>
       </div>
 
@@ -188,15 +186,9 @@ export function SshSidebar({
                 const srv = servers.find((x) => x.id === c.serverId);
                 return (
                   <>
-                    <button
-                      className={
-                        ROW + " w-full " +
-                        (isActive
-                          ? ROW_ACTIVE
-                          : isHover
-                            ? "bg-[var(--row-solid-hover)] text-[var(--text-main)]"
-                            : ROW_HOVER)
-                      }
+                    <NavItem
+                      active={isActive}
+                      hovered={isHover}
                       onClick={() => onSelectConn(c.id)}
                     >
                       {/* Terminal rows are identified by the SERVER LOGO (no
@@ -212,14 +204,9 @@ export function SshSidebar({
                         )
                       )}
                       <span className="truncate">{label}</span>
-                    </button>
+                    </NavItem>
                     {/* Hover: close the connection (kills its PTY session). */}
-                    <div
-                      className={
-                        "absolute right-0.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5 rounded-md bg-gradient-to-l from-[var(--row-solid-gradient)] via-[var(--row-solid-gradient)] to-transparent pl-4 transition-opacity duration-100 " +
-                        (isHover ? "opacity-100" : "pointer-events-none opacity-0")
-                      }
-                    >
+                    <RowActions show={isHover}>
                       <button
                         className={ROW_ICON}
                         title="Close connection"
@@ -230,7 +217,7 @@ export function SshSidebar({
                       >
                         <X size={13} strokeWidth={1.5} />
                       </button>
-                    </div>
+                    </RowActions>
                   </>
                 );
               }}
@@ -250,15 +237,9 @@ export function SshSidebar({
               const isHover = hovered === hoverKey;
               return (
                 <>
-                  <button
-                    className={
-                      ROW + " w-full " +
-                      (panelActive
-                        ? ROW_ACTIVE
-                        : isHover
-                          ? "bg-[var(--row-solid-hover)] text-[var(--text-main)]"
-                          : ROW_HOVER)
-                    }
+                  <NavItem
+                    active={panelActive}
+                    hovered={isHover}
                     onClick={() => onOpenConn(s.id, "terminal", true)}
                   >
                     {/* OS logo (detected on connect) with a live dot */}
@@ -276,14 +257,9 @@ export function SshSidebar({
                     <span className="ml-auto shrink-0 truncate font-mono text-[10px] text-[var(--text-dim)]">
                       {s.host}
                     </span>
-                  </button>
+                  </NavItem>
                   {/* Hover actions: files + settings */}
-                  <div
-                    className={
-                      "absolute right-0.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5 bg-gradient-to-l from-[var(--row-solid-gradient)] via-[var(--row-solid-gradient)] to-transparent pl-4 transition-opacity duration-100 " +
-                      (isHover ? "opacity-100" : "pointer-events-none opacity-0")
-                    }
-                  >
+                  <RowActions show={isHover}>
                     <button
                       className={ROW_ICON}
                       title="Open SFTP"
@@ -304,7 +280,7 @@ export function SshSidebar({
                     >
                       <Settings size={13} strokeWidth={1.5} />
                     </button>
-                  </div>
+                  </RowActions>
                 </>
               );
             }}
@@ -319,8 +295,8 @@ export function SshSidebar({
             {(k) => {
               const active = activePanel?.kind === "key" && activePanel.id === k.id;
               return (
-                <button
-                  className={ROW + " w-full " + (active ? ROW_ACTIVE : ROW_HOVER)}
+                <NavItem
+                  active={active}
                   onClick={() => onOpenPanel({ kind: "key", id: k.id })}
                 >
                   <KeyRound size={13} strokeWidth={1.5} className="shrink-0 text-[var(--text-muted)]" />
@@ -330,7 +306,7 @@ export function SshSidebar({
                       {k.fingerprint.slice(0, 16)}
                     </span>
                   )}
-                </button>
+                </NavItem>
               );
             }}
             </SideDragList>
@@ -346,8 +322,8 @@ export function SshSidebar({
               const rowKey = "script:" + s.id;
               return (
                 <>
-                  <button
-                    className={ROW + " w-full " + (active ? ROW_ACTIVE : ROW_HOVER)}
+                  <NavItem
+                    active={active}
                     // With a terminal on screen the script is pasted into it;
                     // otherwise the click opens the script's form.
                     onClick={() =>
@@ -357,13 +333,8 @@ export function SshSidebar({
                   >
                     <FileCode2 size={13} strokeWidth={1.5} className="shrink-0 text-[var(--text-muted)]" />
                     <span className="truncate">{s.name}</span>
-                  </button>
-                  <div
-                    className={
-                      "absolute right-0.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5 bg-gradient-to-l from-[var(--row-solid-gradient)] via-[var(--row-solid-gradient)] to-transparent pl-4 transition-opacity duration-100 " +
-                      (hovered === rowKey ? "opacity-100" : "pointer-events-none opacity-0")
-                    }
-                  >
+                  </NavItem>
+                  <RowActions show={hovered === rowKey}>
                     <button
                       className={ROW_ICON}
                       title="Edit script"
@@ -374,7 +345,7 @@ export function SshSidebar({
                     >
                       <Settings size={13} strokeWidth={1.5} />
                     </button>
-                  </div>
+                  </RowActions>
                 </>
               );
             }}
@@ -387,10 +358,9 @@ export function SshSidebar({
 
       {/* Footer: Settings, like the Agent sidebar */}
       <div className="mt-auto shrink-0 px-2.5 pb-3 pt-1">
-        <button className={ROW + " w-full " + ROW_HOVER} onClick={onOpenSettings}>
-          <Settings size={16} strokeWidth={1.5} className="shrink-0" />
+        <NavItem icon={<Settings size={16} strokeWidth={1.5} className="shrink-0" />} onClick={onOpenSettings}>
           <span>Settings</span>
-        </button>
+        </NavItem>
       </div>
 
       <div className="sidebar-resizer" onMouseDown={startResize} />
@@ -422,7 +392,7 @@ function SideDragList<T extends { id: string }>({
           key={item.id}
           value={item}
           as="div"
-          className="relative shrink-0 select-none rounded-md"
+          className="relative shrink-0 select-none rounded-xl"
           onDragStart={drag.onDragStart}
           onDragEnd={drag.onDragEnd}
           onClickCapture={drag.suppressClick}

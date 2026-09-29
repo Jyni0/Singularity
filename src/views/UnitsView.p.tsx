@@ -6,15 +6,14 @@ import {
   Plus,
   Pencil,
   Trash2,
-  LoaderCircle,
   X,
   ShieldAlert,
   Waypoints,
 } from "lucide-react";
 import * as db from "../core/db.r";
 import type { SshKey, SshProxy, SshScript, SshServer, UnitsTab } from "../core/types.i";
-import { OsLogo } from "../ui/OsLogo.c";
 import { useDragOrder } from "../hooks/useDragOrder.h";
+import { OsLogo, Alert, Spinner, Button } from "../components";
 
 /**
  * Units — the SSH Client mode's home page: one grid, three collections.
@@ -81,14 +80,14 @@ export function UnitsView({
     >
       {/* No navbar: the switcher IS the header; Add sits on its right. */}
       <div className="flex items-center gap-3">
-        <div className="flex h-9 w-fit gap-1 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] p-1">
+        <div className="flex h-9 w-fit gap-0.5 rounded-xl bg-[var(--bg-input)] p-[3px]">
         {TABS.map((t) => {
           const Icon = t.icon;
           return (
             <button
               key={t.id}
               className={
-                "relative flex h-6.5 items-center gap-1.5 rounded-md px-3 text-[12.5px] transition-colors " +
+                "relative flex h-full items-center gap-1.5 rounded-[9px] px-3 text-[12.5px] transition-colors " +
                 (tab === t.id ? "text-[var(--text-main)]" : "text-[var(--text-muted)] hover:text-[var(--text-main)]")
               }
               onClick={() => onTab(t.id)}
@@ -96,7 +95,7 @@ export function UnitsView({
               {tab === t.id && (
                 <motion.span
                   layoutId="units-tab-pill"
-                  className="absolute inset-0 rounded-md bg-[var(--bg-surface)] shadow-sm"
+                  className="absolute inset-0 rounded-[9px] bg-[var(--bg-elevated)] shadow-sm"
                   transition={{ type: "spring", stiffness: 500, damping: 40 }}
                 />
               )}
@@ -107,29 +106,21 @@ export function UnitsView({
           );
         })}
         </div>
-        <button
-          className="flex h-9 items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] px-3 text-[12px] font-medium text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
-          onClick={() => onAddUnit(kind)}
-        >
-          <Plus size={13} strokeWidth={2} />
+        <Button icon={<Plus size={13} strokeWidth={2} />} onClick={() => onAddUnit(kind)}>
           {ADD_LABEL[kind]}
-        </button>
+        </Button>
       </div>
 
       {notice && (
-        <div className="mt-3 flex items-center gap-2 rounded-lg border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-3 py-2 text-[12px] text-[var(--diff-del)]">
-          <X size={13} className="shrink-0" />
-          <span className="min-w-0 flex-1" title={notice}>{notice}</span>
-        </div>
+        <Alert className="mt-3" icon={<X size={13} />}>
+          <span title={notice}>{notice}</span>
+        </Alert>
       )}
       {tab === "keys" && !vaultBacked && (
-        <div className="mt-3 flex items-center gap-2 rounded-lg border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-3 py-2 text-[12px] text-[var(--diff-del)]">
-          <ShieldAlert size={13} className="shrink-0" />
-          <span>
-            The vault master key could not be persisted — stored secrets will
-            only decrypt during this session. Fix OS keyring access to keep them.
-          </span>
-        </div>
+        <Alert className="mt-3" icon={<ShieldAlert size={13} />}>
+          The vault master key could not be persisted — stored secrets will
+          only decrypt during this session. Fix OS keyring access to keep them.
+        </Alert>
       )}
 
       <AnimatePresence mode="wait">
@@ -254,13 +245,13 @@ function Avatar({ label, color, icon }: { label: string; color: string; icon?: t
   );
 }
 
-const LIST = "flex flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-surface)]";
+const LIST = "flex flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-surface)]";
 const LIST_ROW = "group flex items-center gap-3 px-3.5 py-2.5 transition-colors hover:bg-[var(--hover-bg)]";
 const ROW_DIV = "h-px bg-[var(--border-soft)]";
 
 function Empty({ icon: Icon, text }: { icon: typeof Server; text: string }) {
   return (
-    <div className="rounded-xl border border-dashed border-[var(--border)] p-10 text-center text-[13px] text-[var(--text-muted)]">
+    <div className="rounded-2xl border border-dashed border-[var(--border)] p-10 text-center text-[13px] text-[var(--text-muted)]">
       <Icon size={22} strokeWidth={1.4} className="mx-auto mb-2 text-[var(--text-dim)]" />
       {text}
     </div>
@@ -347,7 +338,7 @@ function ServerGrid({
                 )}
                 {busy && (
                   <span className="absolute inset-0 flex items-center justify-center rounded-full bg-black/40">
-                    <LoaderCircle size={16} className="animate-spin text-white" />
+                    <Spinner size={16} className="text-white" />
                   </span>
                 )}
                 {/* Live dot on the avatar, Termius-style */}
@@ -370,14 +361,14 @@ function ServerGrid({
                 onPointerDown={(e) => e.stopPropagation()}
               >
                 <button
-                  className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                  className="rounded-md p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
                   title="Edit"
                   onClick={() => onEdit(s)}
                 >
                   <Pencil size={13} />
                 </button>
                 <button
-                  className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
+                  className="rounded-md p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
                   title="Delete"
                   onClick={() => onDelete(s)}
                 >
@@ -421,14 +412,14 @@ function KeyGrid({
             <span className="flex shrink-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
               <span className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                 <button
-                  className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                  className="rounded-md p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
                   title="Edit"
                   onClick={() => onEdit(k)}
                 >
                   <Pencil size={13} />
                 </button>
                 <button
-                  className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
+                  className="rounded-md p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
                   title="Delete"
                   onClick={() => onDelete(k)}
                 >
@@ -474,14 +465,14 @@ function ScriptGrid({
             <span className="flex shrink-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
               <span className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                 <button
-                  className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                  className="rounded-md p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
                   title="Edit"
                   onClick={() => onEdit(s)}
                 >
                   <Pencil size={13} />
                 </button>
                 <button
-                  className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
+                  className="rounded-md p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
                   title="Delete"
                   onClick={() => onDelete(s)}
                 >
@@ -523,7 +514,7 @@ function ProxyGrid({
             <span className="min-w-0 flex-1">
               <span className="flex min-w-0 items-center gap-1.5">
                 <span className="truncate text-[13.5px] font-medium text-[var(--text-main)]">{p.name}</span>
-                <span className="shrink-0 rounded border border-[var(--border)] px-1 text-[9.5px] font-semibold uppercase tracking-wide text-[var(--text-dim)]">
+                <span className="shrink-0 rounded-md border border-[var(--border)] px-1 text-[9.5px] font-semibold uppercase tracking-wide text-[var(--text-dim)]">
                   {p.kind === "socks5" ? "SOCKS5" : "HTTP"}
                 </span>
               </span>
@@ -536,14 +527,14 @@ function ProxyGrid({
             <span className="flex shrink-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
               <span className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                 <button
-                  className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                  className="rounded-md p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
                   title="Edit"
                   onClick={() => onEdit(p)}
                 >
                   <Pencil size={13} />
                 </button>
                 <button
-                  className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
+                  className="rounded-md p-1 text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
                   title="Delete"
                   onClick={() => onDelete(p)}
                 >

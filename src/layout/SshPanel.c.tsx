@@ -11,17 +11,14 @@ import {
   RotateCcw,
   Info,
   Copy,
-  LoaderCircle,
   Eye,
   EyeOff,
   Waypoints,
 } from "lucide-react";
 import * as db from "../core/db.r";
 import type { SshKey, SshProxy, SshScript, SshServer } from "../core/types.i";
-import { ScrollArea } from "../ui/ScrollArea.c";
-import { Combobox } from "../ui/Combobox.c";
 import { useOverlayThumb } from "../hooks/useOverlayThumb.h";
-import { Thumb } from "../ui/Thumb.c";
+import { ScrollArea, Combobox, Thumb, FIELD_LABEL, Input, Button, Alert, Segmented, Spinner, IconButton, cx, TEXTAREA } from "../components";
 
 /**
  * SshPanel — the docked right-hand sidebar of SSH Client mode.
@@ -38,11 +35,7 @@ export type SshPanelTarget =
   | { kind: "script"; id?: string }
   | { kind: "proxy"; id?: string };
 
-const FIELD =
-  "h-9 w-full rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 text-[12.5px] text-[var(--text-main)] outline-none transition-colors focus:border-[var(--accent)]";
-const LABEL = "mb-1.5 block text-[11px] font-medium text-[var(--text-muted)]";
-const AREA =
-  "w-full resize-none rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 font-mono text-[11px] leading-[1.5] text-[var(--text-main)] outline-none transition-colors focus:border-[var(--accent)]";
+const AREA = cx(TEXTAREA, "resize-none font-mono text-[11px] leading-[1.5]");
 
 /**
  * PEM-key textarea with the app's OWN scrollbar: the native bar is hidden
@@ -155,13 +148,12 @@ export function SshPanel({
       <div className="flex h-11 shrink-0 items-center gap-2 border-b border-[var(--border)] px-4">
         <TitleIcon size={14} className="shrink-0 text-[var(--accent)]" />
         <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-[var(--text-main)]">{title}</span>
-        <button
-          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+        <IconButton
+          label="Close panel" size="xs"
           onClick={onClose}
-          title="Close panel"
         >
           <X size={13} />
-        </button>
+        </IconButton>
       </div>
 
       <ScrollArea className="min-h-0 flex-1" innerClassName="px-4 pt-4">
@@ -187,9 +179,7 @@ export function SshPanel({
 function ErrorLine({ error }: { error: string | null }) {
   if (!error) return null;
   return (
-    <div className="mt-3 rounded-md border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-3 py-2 text-[12px] leading-[1.5] text-[var(--diff-del)]">
-      {error}
-    </div>
+    <Alert className="mt-3">{error}</Alert>
   );
 }
 
@@ -210,26 +200,26 @@ function FormButtons({
     <div className="sticky bottom-0 -mx-4 mt-6 flex items-center gap-2 border-t border-[var(--border)] bg-[var(--bg-sidebar)] px-4 py-3">
       {onDelete && (
         <button
-          className="flex h-8 items-center gap-1.5 rounded-md border border-[var(--border)] px-2.5 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
+          className="flex h-8 items-center gap-1.5 rounded-lg border border-[var(--border)] px-2.5 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
           onClick={onDelete}
         >
           <Trash2 size={13} /> Delete
         </button>
       )}
       <span className="flex-1" />
-      <button
-        className="h-8 rounded-md border border-[var(--border)] px-3 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+      <Button
+        variant="secondary"
         onClick={onClose}
       >
         Cancel
-      </button>
-      <button
-        className="flex h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-4 text-[12px] font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+      </Button>
+      <Button
+        variant="primary"
         onClick={onSave}
         disabled={busy}
       >
         <Save size={13} /> {saveLabel}
-      </button>
+      </Button>
     </div>
   );
 }
@@ -358,7 +348,6 @@ function ServerForm({
     }
   };
 
-
   const clearPassword = async () => {
     if (!server) return;
     setBusy(true);
@@ -378,35 +367,35 @@ function ServerForm({
     <div className="h-full flex flex-col">
       <Section title="Connection">
         <div>
-          <label className={LABEL}>Label</label>
-          <input className={FIELD} value={name} onChange={(e) => setName(e.target.value)} placeholder="prod-web-1" autoFocus />
+          <label className={FIELD_LABEL}>Label</label>
+          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="prod-web-1" autoFocus />
         </div>
         <div>
-          <label className={LABEL}>Hostname or IP</label>
-          <input className={FIELD} value={host} onChange={(e) => setHost(e.target.value)} placeholder="10.0.0.5 or example.com" />
+          <label className={FIELD_LABEL}>Hostname or IP</label>
+          <Input value={host} onChange={(e) => setHost(e.target.value)} placeholder="10.0.0.5 or example.com" />
         </div>
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className={LABEL}>Port</label>
-            <input className={FIELD} value={port} onChange={(e) => setPort(e.target.value)} placeholder="22" />
+            <label className={FIELD_LABEL}>Port</label>
+            <Input value={port} onChange={(e) => setPort(e.target.value)} placeholder="22" />
           </div>
           <div>
-            <label className={LABEL}>Username</label>
-            <input className={FIELD} value={username} onChange={(e) => setUsername(e.target.value)} placeholder="root" />
+            <label className={FIELD_LABEL}>Username</label>
+            <Input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="root" />
           </div>
         </div>
       </Section>
 
       <Section title="Authentication">
         <div>
-          <label className={LABEL}>
+          <label className={FIELD_LABEL}>
             Password
             {server ? " — blank keeps the stored one" : ""}
           </label>
           <div className="flex gap-2">
             <div className="relative min-w-0 flex-1">
-              <input
-                className={FIELD + " pr-9"}
+              <Input
+                className="pr-9"
                 type={showPassword ? "text" : "password"}
                 autoComplete="off"
                 spellCheck={false}
@@ -415,20 +404,19 @@ function ServerForm({
                 placeholder={hasStoredPassword ? "•••••••• (stored)" : "optional"}
               />
               {(password || hasStoredPassword) && (
-                <button
+                <IconButton
                   type="button"
-                  className="absolute right-1.5 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                  label={showPassword ? "Hide password" : "Show password (hides again after 30 s; logged)"} size="xs" className="absolute right-1.5 top-1/2"
                   onClick={() => void toggleShow()}
-                  title={showPassword ? "Hide password" : "Show password (hides again after 30 s; logged)"}
                 >
                   {showPassword ? <EyeOff size={13} /> : <Eye size={13} />}
-                </button>
+                </IconButton>
               )}
             </div>
             {hasStoredPassword && (
               <button
                 type="button"
-                className="flex h-9 shrink-0 items-center gap-1 rounded-md border border-[var(--border)] px-2 text-[11px] text-[var(--text-muted)] transition-colors hover:border-[var(--diff-del)]/50 hover:text-[var(--diff-del)]"
+                className="flex h-9 shrink-0 items-center gap-1 rounded-lg border border-[var(--border)] px-2 text-[11px] text-[var(--text-muted)] transition-colors hover:border-[var(--diff-del)]/50 hover:text-[var(--diff-del)]"
                 onClick={() => void clearPassword()}
                 title="Remove the stored password"
               >
@@ -438,9 +426,9 @@ function ServerForm({
           </div>
         </div>
         <div>
-          <label className={LABEL}>Key credential — from the Credentials list only</label>
+          <label className={FIELD_LABEL}>Key credential — from the Credentials list only</label>
           {keys.length === 0 ? (
-            <div className="rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-[11.5px] text-[var(--text-muted)]">
+            <div className="rounded-lg border border-dashed border-[var(--border)] px-3 py-2 text-[11.5px] text-[var(--text-muted)]">
               No credentials yet — add or generate one in Credentials (sidebar +) first.
             </div>
           ) : (
@@ -466,9 +454,9 @@ function ServerForm({
 
       <Section title="Proxy">
         <div>
-          <label className={LABEL}>Connect through — optional</label>
+          <label className={FIELD_LABEL}>Connect through — optional</label>
           {proxies.length === 0 ? (
-            <div className="rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-[11.5px] text-[var(--text-muted)]">
+            <div className="rounded-lg border border-dashed border-[var(--border)] px-3 py-2 text-[11.5px] text-[var(--text-muted)]">
               No proxies yet — add one on the Units page (Proxies tab). Without one the server is reached directly.
             </div>
           ) : (
@@ -493,10 +481,10 @@ function ServerForm({
       {server && (
         <Section title="Security">
           <div>
-            <label className={LABEL}>Host key (pinned on first connect)</label>
+            <label className={FIELD_LABEL}>Host key (pinned on first connect)</label>
             <div className="flex items-center gap-2">
               <span
-                className="min-w-0 flex-1 truncate rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 font-mono text-[11px] text-[var(--text-muted)]"
+                className="min-w-0 flex-1 truncate rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 font-mono text-[11px] text-[var(--text-muted)]"
                 title={server.host_key || undefined}
               >
                 {server.host_key ? (
@@ -511,7 +499,7 @@ function ServerForm({
               {server.host_key && (
                 <button
                   type="button"
-                  className="flex h-9 shrink-0 items-center gap-1 rounded-md border border-[var(--border)] px-2 text-[11px] text-[var(--text-muted)] transition-colors hover:border-[var(--diff-del)]/50 hover:text-[var(--diff-del)]"
+                  className="flex h-9 shrink-0 items-center gap-1 rounded-lg border border-[var(--border)] px-2 text-[11px] text-[var(--text-muted)] transition-colors hover:border-[var(--diff-del)]/50 hover:text-[var(--diff-del)]"
                   onClick={() => void forgetHostKey()}
                   title="Only after the server was reinstalled — a changed key can mean an attack"
                 >
@@ -701,16 +689,16 @@ function KeyForm({
             <ShieldCheck size={13} /> {generated.comment || "Generated By Singularity"}
           </div>
           <div>
-            <label className={LABEL}>Name</label>
+            <label className={FIELD_LABEL}>Name</label>
             <div className="text-[12.5px] text-[var(--text-main)]">{generated.name}</div>
           </div>
           <div>
-            <label className={LABEL}>Fingerprint</label>
+            <label className={FIELD_LABEL}>Fingerprint</label>
             <div className="break-all font-mono text-[10.5px] text-[var(--text-muted)]">{generated.fingerprint}</div>
           </div>
           {generated.private_key && (
             <div>
-              <label className={LABEL}>Private key — shown only here, this once</label>
+              <label className={FIELD_LABEL}>Private key — shown only here, this once</label>
               <AreaField
                 className={AREA + " h-28"}
                 readOnly
@@ -720,7 +708,7 @@ function KeyForm({
             </div>
           )}
           <div>
-            <label className={LABEL}>Public key — put it on the server (authorized_keys)</label>
+            <label className={FIELD_LABEL}>Public key — put it on the server (authorized_keys)</label>
             <AreaField
               className={AREA + " h-24"}
               readOnly
@@ -729,7 +717,7 @@ function KeyForm({
             />
             <button
               type="button"
-              className="mt-2 flex h-7 items-center gap-1.5 rounded-md border border-[var(--border)] px-2.5 text-[11px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+              className="mt-2 flex h-7 items-center gap-1.5 rounded-lg border border-[var(--border)] px-2.5 text-[11px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
               onClick={() => void copyPublic(generated.public_key ?? "")}
             >
               <Copy size={11} /> {copied ? "Copied" : "Copy public key"}
@@ -737,13 +725,13 @@ function KeyForm({
           </div>
         </Section>
         <div className="sticky bottom-0 mt-4 flex justify-end gap-2 border-t border-[var(--border)] bg-[var(--bg-sidebar)] px-1 pt-3">
-          <button
+          <Button
             type="button"
-            className="flex h-8 items-center rounded-md bg-[var(--accent)] px-4 text-[12px] font-medium text-white transition-colors hover:bg-[var(--accent-hover)]"
+            variant="primary"
             onClick={onClose}
           >
             Done
-          </button>
+          </Button>
         </div>
       </div>
     );
@@ -753,37 +741,24 @@ function KeyForm({
     <div className="h-full flex flex-col">
       <Section title="Credential">
         <div>
-          <label className={LABEL}>Name</label>
-          <input className={FIELD} value={name} onChange={(e) => setName(e.target.value)} placeholder="deploy key" autoFocus />
+          <label className={FIELD_LABEL}>Name</label>
+          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="deploy key" autoFocus />
         </div>
         {!value && (
-          <div className="flex gap-1 rounded-md border border-[var(--border)] bg-[var(--bg-input)] p-0.5">
-            <button
-              type="button"
-              className={
-                "h-7 flex-1 rounded text-[11.5px] transition-colors " +
-                (mode === "generate" ? "bg-[var(--accent)] text-white" : "text-[var(--text-muted)] hover:text-[var(--text-main)]")
-              }
-              onClick={() => setMode("generate")}
-            >
-              Generate new
-            </button>
-            <button
-              type="button"
-              className={
-                "h-7 flex-1 rounded text-[11.5px] transition-colors " +
-                (mode === "paste" ? "bg-[var(--accent)] text-white" : "text-[var(--text-muted)] hover:text-[var(--text-main)]")
-              }
-              onClick={() => setMode("paste")}
-            >
-              Import existing
-            </button>
-          </div>
+          <Segmented
+            fill
+            options={[
+              { value: "generate", label: "Generate new" },
+              { value: "paste", label: "Import existing" },
+            ]}
+            value={mode}
+            onChange={setMode}
+          />
         )}
         {!value && mode === "generate" && (
           <>
             <div>
-              <label className={LABEL}>Algorithm</label>
+              <label className={FIELD_LABEL}>Algorithm</label>
               <Combobox
                 searchable={false}
                 value={algorithm}
@@ -792,8 +767,8 @@ function KeyForm({
               />
             </div>
             <div>
-              <label className={LABEL}>Passphrase — optional</label>
-              <input className={FIELD} type="password" value={passphrase} onChange={(e) => setPassphrase(e.target.value)} placeholder="encrypts the generated key" />
+              <label className={FIELD_LABEL}>Passphrase — optional</label>
+              <Input type="password" value={passphrase} onChange={(e) => setPassphrase(e.target.value)} placeholder="encrypts the generated key" />
             </div>
             <div className="flex items-start gap-1.5 text-[11px] leading-[1.5] text-[var(--text-dim)]">
               <Info size={12} className="mt-0.5 shrink-0" />
@@ -804,9 +779,8 @@ function KeyForm({
         )}
         {(value || mode === "paste") && (
           <div>
-            <label className={LABEL}>Passphrase{value ? "" : " (if the key is encrypted)"}</label>
-            <input
-              className={FIELD}
+            <label className={FIELD_LABEL}>Passphrase{value ? "" : " (if the key is encrypted)"}</label>
+            <Input
               type="password"
               value={passphrase}
               onChange={(e) => setPassphrase(e.target.value)}
@@ -817,10 +791,10 @@ function KeyForm({
         )}
         {(value || mode === "paste") && (
           <div>
-            <label className={LABEL}>Private key</label>
+            <label className={FIELD_LABEL}>Private key</label>
             {loadingSecrets ? (
-              <div className="flex h-32 items-center justify-center gap-2 rounded-md border border-[var(--border)] bg-[var(--bg-input)] text-[11.5px] text-[var(--text-dim)]">
-                <LoaderCircle size={13} className="animate-spin" /> Decrypting…
+              <div className="flex h-32 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] text-[11.5px] text-[var(--text-dim)]">
+                <Spinner size={13} /> Decrypting…
               </div>
             ) : (
               <AreaField
@@ -838,14 +812,14 @@ function KeyForm({
             when editing it comes from the decrypted row. */}
         {(value || mode === "paste") && (
           <div>
-            <label className={LABEL}>Public key</label>
+            <label className={FIELD_LABEL}>Public key</label>
             {publicKey ? (
               <>
                 <AreaField className={AREA + " h-16"} readOnly value={publicKey} onFocus={(e) => e.currentTarget.select()} />
                 <div className="mt-1.5 flex items-center gap-2">
                   <button
                     type="button"
-                    className="flex h-7 w-38 items-center gap-1.5 rounded-md border border-[var(--border)] px-2.5 text-[11px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                    className="flex h-7 w-38 items-center gap-1.5 rounded-lg border border-[var(--border)] px-2.5 text-[11px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
                     onClick={() => void copyPublic(publicKey)}
                   >
                     <Copy size={11} /> {copied ? "Copied" : "Copy public key"}
@@ -859,7 +833,7 @@ function KeyForm({
                 </div>
               </>
             ) : (
-              <div className="rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-[11px] text-[var(--text-dim)]">
+              <div className="rounded-lg border border-dashed border-[var(--border)] px-3 py-2 text-[11px] text-[var(--text-dim)]">
                 {privateKey.trim()
                   ? "Cannot parse this private key yet — check the body and passphrase."
                   : "Appears here once a private key is pasted."}
@@ -936,15 +910,15 @@ function ScriptForm({
     <div className="h-full flex flex-col">
       <Section title="Script">
         <div>
-          <label className={LABEL}>Label</label>
-          <input className={FIELD} value={name} onChange={(e) => setName(e.target.value)} placeholder="Disk usage" autoFocus />
+          <label className={FIELD_LABEL}>Label</label>
+          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Disk usage" autoFocus />
         </div>
         <div>
-          <label className={LABEL}>Description</label>
-          <input className={FIELD} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What it does (optional)" />
+          <label className={FIELD_LABEL}>Description</label>
+          <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What it does (optional)" />
         </div>
         <div>
-          <label className={LABEL}>Command</label>
+          <label className={FIELD_LABEL}>Command</label>
           <AreaField
             className={AREA + " h-44 text-[12px]"}
             value={content}
@@ -1045,50 +1019,44 @@ function ProxyForm({
     <div className="h-full flex flex-col">
       <Section title="Proxy">
         <div>
-          <label className={LABEL}>Label</label>
-          <input className={FIELD} value={name} onChange={(e) => setName(e.target.value)} placeholder="office socks" autoFocus />
+          <label className={FIELD_LABEL}>Label</label>
+          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="office socks" autoFocus />
         </div>
         <div>
-          <label className={LABEL}>Type</label>
-          <div className="flex gap-1 rounded-md border border-[var(--border)] bg-[var(--bg-input)] p-0.5">
-            {(["socks5", "http"] as const).map((k) => (
-              <button
-                key={k}
-                type="button"
-                className={
-                  "h-7 flex-1 rounded text-[11.5px] transition-colors " +
-                  (kind === k ? "bg-[var(--accent)] text-white" : "text-[var(--text-muted)] hover:text-[var(--text-main)]")
-                }
-                onClick={() => pickKind(k)}
-              >
-                {k === "socks5" ? "SOCKS5" : "HTTP"}
-              </button>
-            ))}
-          </div>
+          <label className={FIELD_LABEL}>Type</label>
+          <Segmented
+            fill
+            options={[
+              { value: "socks5", label: "SOCKS5" },
+              { value: "http", label: "HTTP" },
+            ]}
+            value={kind}
+            onChange={pickKind}
+          />
         </div>
         <div className="grid grid-cols-[1fr_96px] gap-3">
           <div>
-            <label className={LABEL}>Host</label>
-            <input className={FIELD} value={host} onChange={(e) => setHost(e.target.value)} placeholder="proxy.example.com" />
+            <label className={FIELD_LABEL}>Host</label>
+            <Input value={host} onChange={(e) => setHost(e.target.value)} placeholder="proxy.example.com" />
           </div>
           <div>
-            <label className={LABEL}>Port</label>
-            <input className={FIELD} value={port} onChange={(e) => setPort(e.target.value)} />
+            <label className={FIELD_LABEL}>Port</label>
+            <Input value={port} onChange={(e) => setPort(e.target.value)} />
           </div>
         </div>
       </Section>
 
       <Section title="Authentication — optional">
         <div>
-          <label className={LABEL}>Username</label>
-          <input className={FIELD} value={username} onChange={(e) => setUsername(e.target.value)} placeholder="none" autoComplete="off" />
+          <label className={FIELD_LABEL}>Username</label>
+          <Input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="none" autoComplete="off" />
         </div>
         <div>
-          <label className={LABEL}>Password{stored ? " — blank keeps the stored one" : ""}</label>
+          <label className={FIELD_LABEL}>Password{stored ? " — blank keeps the stored one" : ""}</label>
           <div className="flex gap-2">
             <div className="relative min-w-0 flex-1">
-              <input
-                className={FIELD + " pr-9"}
+              <Input
+                className="pr-9"
                 type={showPassword ? "text" : "password"}
                 autoComplete="off"
                 spellCheck={false}
@@ -1097,20 +1065,19 @@ function ProxyForm({
                 placeholder={stored ? "•••••••• (stored)" : "none"}
               />
               {password && (
-                <button
+                <IconButton
                   type="button"
-                  className="absolute right-1.5 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                  label={showPassword ? "Hide password" : "Show password"} size="xs" className="absolute right-1.5 top-1/2"
                   onClick={() => setShowPassword((v) => !v)}
-                  title={showPassword ? "Hide password" : "Show password"}
                 >
                   {showPassword ? <EyeOff size={13} /> : <Eye size={13} />}
-                </button>
+                </IconButton>
               )}
             </div>
             {stored && (
               <button
                 type="button"
-                className="flex h-9 shrink-0 items-center gap-1 rounded-md border border-[var(--border)] px-2 text-[11px] text-[var(--text-muted)] transition-colors hover:border-[var(--diff-del)]/50 hover:text-[var(--diff-del)]"
+                className="flex h-9 shrink-0 items-center gap-1 rounded-lg border border-[var(--border)] px-2 text-[11px] text-[var(--text-muted)] transition-colors hover:border-[var(--diff-del)]/50 hover:text-[var(--diff-del)]"
                 onClick={() => {
                   setClearPassword(true);
                   setPassword("");

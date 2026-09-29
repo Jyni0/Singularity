@@ -8,7 +8,6 @@ import {
   Upload,
   Download,
   RefreshCw,
-  LoaderCircle,
   X,
   Home,
   Save,
@@ -24,10 +23,8 @@ import {
 } from "lucide-react";
 import * as db from "../core/db.r";
 import type { SftpEntry, SshServer } from "../core/types.i";
-import { OsLogo } from "../ui/OsLogo.c";
-import { OverlayScroll, ScrollArea } from "../ui/ScrollArea.c";
-import { CodeEditor } from "../ui/CodeEditor.c";
-import { ContextMenu, type ContextMenuItem } from "../ui/ContextMenu.c";
+import { CodeEditor } from "../components/code/CodeEditor.c";
+import { OsLogo, OverlayScroll, ScrollArea, ContextMenu, type ContextMenuItem, Button, Spinner, IconButton } from "../components";
 
 /** A remote file open in the editor. */
 type OpenFile = {
@@ -513,12 +510,12 @@ export function FilesView({
   const fmtSize = (n: number) =>
     n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : n >= 1e6 ? (n / 1e6).toFixed(1) + " MB" : n >= 1e3 ? (n / 1e3).toFixed(1) + " KB" : n + " B";
 
-  const headerBtn = "flex h-6 items-center gap-1.5 rounded-md border border-[var(--border)] px-2 text-[11.5px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
+  const headerBtn = "flex h-6 items-center gap-1.5 rounded-lg border border-[var(--border)] px-2 text-[11.5px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
 
   const nameInput = (placeholder: string) => (
     <input
       autoFocus
-      className="w-full max-w-[360px] rounded border border-[var(--accent)] bg-[var(--bg-input)] px-1.5 py-0.5 text-[12.5px] text-[var(--text-main)] outline-none"
+      className="w-full max-w-[360px] rounded-md border border-[var(--accent)] bg-[var(--bg-input)] px-1.5 py-0.5 text-[12.5px] text-[var(--text-main)] outline-none"
       placeholder={placeholder}
       value={naming?.value ?? ""}
       onChange={(ev) => setNaming((n) => (n ? { ...n, value: ev.target.value } : n))}
@@ -551,8 +548,8 @@ export function FilesView({
       {...(file ? {} : dropHandlers)}
     >
       {dragOver && !file && (
-        <div className="pointer-events-none absolute inset-2 top-11 z-20 flex items-center justify-center rounded-xl border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/10">
-          <span className="flex items-center gap-2 rounded-lg bg-[var(--bg-surface)] px-3 py-2 text-[12.5px] text-[var(--text-main)] shadow-lg">
+        <div className="pointer-events-none absolute inset-2 top-11 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/10">
+          <span className="flex items-center gap-2 rounded-xl bg-[var(--bg-surface)] px-3 py-2 text-[12.5px] text-[var(--text-main)] shadow-lg">
             <Upload size={14} className="text-[var(--accent)]" />
             Drop to upload to <span className="font-mono">{dropDir ?? cwd}</span>
           </span>
@@ -566,21 +563,22 @@ export function FilesView({
           <span className="max-w-[120px] truncate font-medium text-[var(--text-muted)]">{server.name}</span>
         </span>
         <button
-          className="shrink-0 rounded px-1 py-0.5 text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+          className="shrink-0 rounded-md px-1 py-0.5 text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
           onClick={() => void load("/")}
           title="Root"
         >
           <Home size={12} />
         </button>
         <OverlayScroll
+          wheelX
           wrapperClassName="min-w-0 flex-1"
           className="flex items-center gap-0.5 overflow-x-auto"
         >
           {crumbs.map((c, i) => {
             const last = i === crumbs.length - 1;
             const cls = last
-              ? "shrink-0 rounded px-1 py-0.5 font-medium text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
-              : "shrink-0 rounded px-1 py-0.5 text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
+              ? "shrink-0 rounded-md px-1 py-0.5 font-medium text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+              : "shrink-0 rounded-md px-1 py-0.5 text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
             return (
               <span key={c.path} className="flex shrink-0 items-center">
                 <span className="text-[var(--text-dim)]">/</span>
@@ -594,7 +592,7 @@ export function FilesView({
         <span className="flex shrink-0 items-center gap-1">
           {!file &&
             (query !== null ? (
-              <span className="flex h-6 w-[190px] items-center gap-1.5 rounded-md border border-[var(--accent)] bg-[var(--bg-input)] px-2">
+              <span className="flex h-6 w-[190px] items-center gap-1.5 rounded-lg border border-[var(--accent)] bg-[var(--bg-input)] px-2">
                 <Search size={11} className="shrink-0 text-[var(--text-dim)]" />
                 <input
                   ref={searchRef}
@@ -647,20 +645,19 @@ export function FilesView({
           <button className={headerBtn} onClick={onOpenTerminal} title="Terminal of this server">
             <TerminalSquare size={12} />
           </button>
-          <button
-            className="flex h-6 items-center gap-1.5 rounded-md bg-[var(--accent)] px-2.5 text-[11.5px] font-medium text-white transition-opacity hover:opacity-90"
+          <Button
+            variant="primary" size="xs"
             onClick={() => void upload()}
             title="Upload file here (or drag files and folders onto the page)"
           >
             <Upload size={11} /> Upload
-          </button>
-          <button
-            className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+          </Button>
+          <IconButton
+            label="Close page" size="xs"
             onClick={onClose}
-            title="Close page"
           >
             <X size={12} />
-          </button>
+          </IconButton>
         </span>
       </div>
 
@@ -682,29 +679,29 @@ export function FilesView({
           </span>
           <button
             autoFocus
-            className="flex h-6 items-center rounded-md bg-[var(--diff-del)] px-2.5 text-[11.5px] font-medium text-white hover:opacity-90"
+            className="flex h-6 items-center rounded-lg bg-[var(--diff-del)] px-2.5 text-[11.5px] font-medium text-white hover:opacity-90"
             onClick={() => void doDelete(confirmDelete)}
           >
             Delete
           </button>
-          <button
-            className="flex h-6 items-center rounded-md px-2 text-[11.5px] text-[var(--text-muted)] hover:bg-[var(--hover-bg)]"
+          <Button
+            variant="secondary" size="xs"
             onClick={() => {
               setConfirmDelete(null);
               listRef.current?.focus();
             }}
           >
             Cancel
-          </button>
+          </Button>
         </div>
       )}
 
       {transfer && (
         <div className="flex shrink-0 items-center gap-2 border-b border-[var(--border)] bg-[var(--bg-surface)] px-4 py-1.5 text-[11.5px] text-[var(--text-muted)]">
           <span className="w-40 truncate font-mono">{transfer.file}</span>
-          <div className="h-1 min-w-[120px] flex-1 overflow-hidden rounded bg-[var(--hover-bg)]">
+          <div className="h-1 min-w-[120px] flex-1 overflow-hidden rounded-md bg-[var(--hover-bg)]">
             <div
-              className="h-full rounded bg-[var(--accent)] transition-all"
+              className="h-full rounded-md bg-[var(--accent)] transition-all"
               style={{
                 width: transfer.total
                   ? Math.min(100, (transfer.done / transfer.total) * 100) + "%"
@@ -730,36 +727,35 @@ export function FilesView({
               <span className="h-2 w-2 shrink-0 rounded-full bg-[var(--accent)]" title="Unsaved changes" />
             )}
             <span className="ml-auto flex shrink-0 items-center gap-1">
-              <button
-                className="flex h-6 items-center gap-1.5 rounded-md bg-[var(--accent)] px-2.5 text-[11.5px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+              <Button
+                variant="primary" size="xs"
                 disabled={file.loading || file.saving || !!file.error || file.text === file.saved}
                 onClick={() => void saveFile()}
                 title="Save to the server (Ctrl+S)"
               >
-                {file.saving ? <LoaderCircle size={11} className="animate-spin" /> : <Save size={11} />} Save
-              </button>
+                {file.saving ? <Spinner size={11} /> : <Save size={11} />} Save
+              </Button>
               {confirmDiscard ? (
                 <button
-                  className="flex h-6 items-center rounded-md px-2 text-[11.5px] text-[var(--diff-del)] transition-colors hover:bg-[var(--diff-del)]/10"
+                  className="flex h-6 items-center rounded-lg px-2 text-[11.5px] text-[var(--diff-del)] transition-colors hover:bg-[var(--diff-del)]/10"
                   onClick={closeFile}
                   title="Close without saving"
                 >
                   Discard changes?
                 </button>
               ) : (
-                <button
-                  className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                <IconButton
+                  label="Close file" size="xs"
                   onClick={closeFile}
-                  title="Close file"
                 >
                   <X size={12} />
-                </button>
+                </IconButton>
               )}
             </span>
           </div>
           {file.loading ? (
             <div className="flex items-center justify-center gap-2 p-8 text-[13px] text-[var(--text-muted)]">
-              <LoaderCircle size={14} className="animate-spin" /> Opening…
+              <Spinner size={14} /> Opening…
             </div>
           ) : file.error ? (
             <div className="p-8 text-center text-[13px] text-[var(--diff-del)]">{file.error}</div>
@@ -790,7 +786,7 @@ export function FilesView({
           <ScrollArea className="min-h-0 flex-1">
             {loading && entries.length === 0 ? (
               <div className="flex items-center justify-center gap-2 p-8 text-[13px] text-[var(--text-muted)]">
-                <LoaderCircle size={14} className="animate-spin" /> Listing…
+                <Spinner size={14} /> Listing…
               </div>
             ) : visible.length === 0 && !(naming && naming.mode !== "rename") ? (
               <div className="p-8 text-center text-[13px] text-[var(--text-muted)]">
@@ -876,7 +872,7 @@ export function FilesView({
                           >
                             {!e.isDir && (
                               <button
-                                className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--bg-input)] hover:text-[var(--text-main)]"
+                                className="rounded-md p-1 text-[var(--text-dim)] hover:bg-[var(--bg-input)] hover:text-[var(--text-main)]"
                                 title="Download"
                                 onClick={() => void download(e)}
                               >
@@ -884,7 +880,7 @@ export function FilesView({
                               </button>
                             )}
                             <button
-                              className="rounded p-1 text-[var(--text-dim)] hover:bg-[var(--bg-input)] hover:text-[var(--diff-del)]"
+                              className="rounded-md p-1 text-[var(--text-dim)] hover:bg-[var(--bg-input)] hover:text-[var(--diff-del)]"
                               title="Delete"
                               onClick={() => setConfirmDelete([e])}
                             >

@@ -9,12 +9,11 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { ChevronDown, ChevronRight, Loader2 } from "lucide-react";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import * as db from "../core/db.r";
 import { isCliKind, type ProviderKind } from "../core/types.i";
 import type { ContextReport } from "../hooks/useChat.h";
-import { POPOVER, popMotion } from "../ui/tokens.s";
-import { ScrollArea } from "../ui/ScrollArea.c";
+import { POPOVER, popMotion, ScrollArea, Spinner } from "../components";
 
 type Group = db.ContextPart["group"];
 
@@ -130,7 +129,7 @@ function Subscription({ usage, error }: { usage: db.CliUsage | null; error: stri
       </div>
       {!usage && !error && (
         <div className="flex items-center gap-1.5 text-[11.5px] text-[var(--text-dim)]">
-          <Loader2 size={11} className="animate-spin" /> Checking limits…
+          <Spinner size={11} /> Checking limits…
         </div>
       )}
       {error && !usage && <div className="text-[11.5px] text-[var(--text-dim)]">{error}</div>}
@@ -236,7 +235,7 @@ export function ContextMeter({
     <div className="relative shrink-0" ref={ref}>
       {/* Square hit area; the small donut sits in it. */}
       <button
-        className={`flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] ${
+        className={`flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] ${
           open ? "bg-[var(--hover-bg)]" : ""
         }`}
         onClick={() => {
@@ -245,7 +244,7 @@ export function ContextMeter({
         }}
         title={report ? `Context: ${summary}` : "Context usage"}
       >
-        {loading && !report ? <Loader2 size={12} className="animate-spin" /> : <Donut parts={parts} total={total} size={13} stroke={2.5} />}
+        {loading && !report ? <Spinner size={12} /> : <Donut parts={parts} total={total} size={13} stroke={2.5} />}
       </button>
 
       <AnimatePresence>
@@ -312,7 +311,7 @@ export function ContextMeter({
                           return (
                             <div key={p.label}>
                               <button
-                                className="flex w-full items-center gap-2 rounded-md px-2 py-[3px] text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+                                className="flex w-full items-center gap-2 rounded-lg px-2 py-[3px] text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
                                 onClick={() => setExpanded((e) => ({ ...e, [p.label]: !isOpen }))}
                               >
                                 <ChevronRight size={12} className={`shrink-0 text-[var(--text-dim)] transition-transform ${isOpen ? "rotate-90" : ""}`} />

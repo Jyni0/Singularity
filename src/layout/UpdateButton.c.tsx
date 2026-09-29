@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { ArrowDownToLine, ExternalLink, LoaderCircle } from "lucide-react";
+import { ArrowDownToLine, ExternalLink } from "lucide-react";
 import * as db from "../core/db.r";
 import type { UpdateInfo } from "../core/db.r";
+import { Button, Spinner } from "../components";
 
 /** Re-check GitHub this often while the app stays open. */
 const CHECK_EVERY_MS = 6 * 60 * 60 * 1000;
@@ -96,13 +97,13 @@ export function UpdateButton() {
   return (
     <div ref={boxRef} className="relative flex h-full items-center pr-1.5">
       <button
-        className="flex items-center gap-1.5 rounded-md bg-[var(--accent)]/15 px-2.5 py-1 text-[12px] font-medium text-[var(--accent)] transition-colors hover:bg-[var(--accent)]/25"
+        className="flex items-center gap-1.5 rounded-lg bg-[var(--accent)]/15 px-2.5 py-1 text-[12px] font-medium text-[var(--accent)] transition-colors hover:bg-[var(--accent)]/25"
         onClick={() => setOpen((o) => !o)}
         title={`Singularity ${update.version} is available`}
       >
         {installing ? (
           <>
-            <LoaderCircle size={13} className="animate-spin" />
+            <Spinner size={13} />
             {Math.round((progress ?? 0) * 100)}%
           </>
         ) : (
@@ -115,7 +116,7 @@ export function UpdateButton() {
       <AnimatePresence>
         {open && (
           <motion.div
-            className="absolute right-0 top-[calc(100%+4px)] z-[300] flex w-[320px] flex-col gap-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] p-3 shadow-[var(--shadow-popup)]"
+            className="absolute right-0 top-[calc(100%+4px)] z-[300] flex w-[320px] flex-col gap-2.5 rounded-xl border border-[var(--border)] bg-[var(--bg-surface)] p-3 shadow-[var(--shadow-popup)]"
             initial={{ opacity: 0, y: -4 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -4 }}
@@ -128,12 +129,12 @@ export function UpdateButton() {
               </div>
             </div>
             {update.notes.trim() && (
-              <div className="max-h-40 overflow-y-auto whitespace-pre-wrap rounded-md bg-[var(--bg-input)] p-2 text-[12px] text-[var(--text-muted)]">
+              <div className="max-h-40 overflow-y-auto whitespace-pre-wrap rounded-lg bg-[var(--bg-input)] p-2 text-[12px] text-[var(--text-muted)]">
                 {update.notes.trim()}
               </div>
             )}
             {installing && (
-              <div className="h-1 overflow-hidden rounded bg-[var(--bg-input)]">
+              <div className="h-1 overflow-hidden rounded-md bg-[var(--bg-input)]">
                 <div
                   className="h-full bg-[var(--accent)] transition-[width]"
                   style={{ width: `${Math.round((progress ?? 0) * 100)}%` }}
@@ -150,13 +151,13 @@ export function UpdateButton() {
               >
                 <ExternalLink size={12} /> Release page
               </a>
-              <button
-                className="rounded-md bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-white transition-colors hover:bg-[var(--accent-hover)] disabled:opacity-60"
+              <Button
+                variant="primary" size="sm"
                 disabled={installing}
                 onClick={() => void install()}
               >
                 {installing ? "Downloading…" : "Install update"}
-              </button>
+              </Button>
             </div>
             <div className="text-[11px] text-[var(--text-dim)]">
               The app closes while the installer runs.

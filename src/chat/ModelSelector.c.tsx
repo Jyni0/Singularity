@@ -4,8 +4,7 @@ import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Zap, Check, Server } from "lucide-react";
 import { Gateway } from "../core/types.i";
-import { LIP_CHIP, POPOVER, POPOVER_LABEL, popoverItem, popMotion } from "../ui/tokens.s";
-import { OverlayScroll } from "../ui/ScrollArea.c";
+import { LIP_CHIP, POPOVER, POPOVER_LABEL, popoverItem, popMotion, OverlayScroll } from "../components";
 
 export function ModelSelector({
   gateways,

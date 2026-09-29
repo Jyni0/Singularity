@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, ChevronDown, Search, X } from "lucide-react";
 import { OverlayScroll } from "./ScrollArea.c";
+import { cx } from "../cx.u";
+import { input } from "../tokens.s";
 
 /** One selectable entry. */
 export interface ComboboxOption {
@@ -126,7 +128,7 @@ export function Combobox({
       <button
         type="button"
         disabled={disabled}
-        className="flex h-9 w-full items-center gap-2 rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 text-left text-[12.5px] outline-none transition-colors hover:border-[var(--text-dim)] disabled:cursor-not-allowed disabled:opacity-50"
+        className={cx(input("md"), "flex items-center gap-2 text-left text-[12.5px] disabled:cursor-not-allowed", open && "border-[var(--accent)] hover:border-[var(--accent)]")}
         onClick={() => setOpen((v) => !v)}
       >
         {selected?.swatch && <SwatchDots colors={selected.swatch} />}
@@ -142,16 +144,16 @@ export function Combobox({
 
       {open && (
         <div
-          className="absolute left-0 right-0 top-[calc(100%+4px)] z-50 overflow-hidden rounded-md border border-[var(--border)] bg-[var(--bg-surface)] shadow-[var(--shadow-popup)]"
+          className="absolute left-0 right-0 top-[calc(100%+6px)] z-50 flex flex-col gap-1 overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-surface)] p-1.5 shadow-[var(--shadow-popup)]"
           onKeyDown={onKeyDown}
         >
-          {/* Search input pinned on top of the list */}
+          {/* Search pinned on top of the list: a filled pill, like the fields */}
           {searchable && (
-            <div className="flex items-center gap-1.5 border-b border-[var(--border)] px-2.5">
+            <div className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg bg-[var(--bg-input)] px-2.5">
               <Search size={12} className="shrink-0 text-[var(--text-dim)]" />
               <input
                 ref={inputRef}
-                className="h-8 w-full bg-transparent text-[12px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
+                className="h-full w-full bg-transparent text-[12px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder={placeholder}
@@ -171,7 +173,7 @@ export function Combobox({
               )}
             </div>
           )}
-          <OverlayScroll innerRef={listRef} tabIndex={-1} className="max-h-52 overflow-y-auto py-1">
+          <OverlayScroll innerRef={listRef} tabIndex={-1} className="flex max-h-52 flex-col gap-0.5 overflow-y-auto">
             {filtered.length === 0 ? (
               <div className="px-3 py-2 text-[11.5px] text-[var(--text-dim)]">{emptyText}</div>
             ) : (
@@ -180,7 +182,7 @@ export function Combobox({
                   key={o.value}
                   type="button"
                   className={
-                    "flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[12px] transition-colors " +
+                    "flex min-h-8 w-full shrink-0 items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors " +
                     (i === cursor ? "bg-[var(--hover-bg)]" : "")
                   }
                   onMouseEnter={() => setCursor(i)}

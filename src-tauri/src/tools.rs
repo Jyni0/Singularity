@@ -225,9 +225,17 @@ pub fn locate(hay: &str, needle: &str, replace: &str) -> Result<(usize, usize, S
     if lines.len() < want.len() {
         return Err(0);
     }
-    let hits: Vec<usize> = (0..=lines.len() - want.len())
-        .filter(|&i| (0..want.len()).all(|j| lines[i + j].1.trim() == want[j].trim()))
-        .collect();
+    let find = |same: &dyn Fn(&str, &str) -> bool| -> Vec<usize> {
+        (0..=lines.len() - want.len())
+            .filter(|&i| (0..want.len()).all(|j| same(lines[i + j].1, want[j])))
+            .collect()
+    };
+    let mut hits = find(&|a, b| a.trim() == b.trim());
+    if hits.is_empty() {
+        // Spacing inside the lines differs too ("a=b" vs "a = b", tabs).
+        let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        hits = find(&|a, b| squash(a) == squash(b));
+    }
     if hits.len() != 1 {
         return Err(hits.len());
     }
@@ -565,11 +573,26 @@ pub fn parse_patch(diff: &str) -> Vec<(String, String)> {
     static OPEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^<{5,9}\s*(SEARCH|ORIGINAL|FIND)\b").unwrap());
     static MID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^={5,9}\s*$").unwrap());
     static CLOSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^>{5,9}\s*(REPLACE|UPDATED)\b").unwrap());
+    // A diff JSON-escaped twice arrives as ONE line with literal "\n"s —
+    // no marker was ever on its own line ("no SEARCH/REPLACE blocks found").
+    let unescaped;
+    let diff = if !diff.contains('\n') && diff.contains("\\n") {
+        unescaped = diff.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"");
+        unescaped.as_str()
+    } else {
+        diff
+    };
     let mut hunks: Vec<(String, String)> = Vec::new();
     let mut search: Option<Vec<String>> = None;
     let mut replace: Option<Vec<String>> = None;
     let push = |hunks: &mut Vec<(String, String)>, s: Vec<String>, r: Vec<String>| {
-        hunks.push((unfence(&s).join("\n"), unfence(&r).join("\n")));
+        let (s, r) = (unfence(&s), unfence(&r));
+        // SEARCH copied from read_file output WITH its line numbers.
+        let s_numbered = has_line_numbers(&s);
+        let r_numbered = s_numbered && has_line_numbers(&r);
+        let s = if s_numbered { strip_line_numbers(&s) } else { s };
+        let r = if r_numbered { strip_line_numbers(&r) } else { r };
+        hunks.push((s.join("\n"), r.join("\n")));
     };
     for line in diff.lines() {
         let t = line.trim();
@@ -610,6 +633,25 @@ pub fn parse_patch(diff: &str) -> Vec<(String, String)> {
         hunks = parse_unified(diff);
     }
     hunks
+}
+
+/// read_file's line prefix: the number right-aligned in 5 columns + 2 spaces.
+static LINE_NO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s{0,6}\d{1,6}(  |\t)").unwrap());
+
+/// Every non-blank line starts with a read_file line number.
+fn has_line_numbers(lines: &[String]) -> bool {
+    let mut any = false;
+    for l in lines.iter().filter(|l| !l.trim().is_empty()) {
+        if !LINE_NO.is_match(l) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+fn strip_line_numbers(lines: &[String]) -> Vec<String> {
+    lines.iter().map(|l| LINE_NO.replace(l, "").into_owned()).collect()
 }
 
 /// Drops a code fence the model wrapped around one side of a block.
@@ -857,9 +899,20 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
                         at + len
                     ));
                 }
-                _ => errors.push(format!(
-                    "hunk {i}: SEARCH text not found in {path} and nothing similar exists — read_file it and copy the exact lines, or use write_file to rewrite the whole file"
-                )),
+                _ => {
+                    // Usually SEARCH came from an older version of the file
+                    // (an earlier edit changed it). Show what is there now.
+                    let lines: Vec<&str> = current.lines().collect();
+                    let now = if lines.len() <= 150 {
+                        let body: String = lines.iter().enumerate().map(|(n, l)| format!("{:>5}  {l}\n", n + 1)).collect();
+                        format!(" The file as it is NOW ({} lines):\n{body}", lines.len())
+                    } else {
+                        format!(" It has {} lines now — read_file the part you mean (its content may have changed since you read it).", lines.len())
+                    };
+                    errors.push(format!(
+                        "hunk {i}: SEARCH text not found in {path} and nothing similar exists — copy SEARCH exactly from the current file, or use write_file to rewrite the whole file.{now}"
+                    ))
+                }
             },
             Err(count) => errors.push(format!(
                 "hunk {i}: SEARCH text appears {count} times in {path} — add surrounding lines to make it unique"
@@ -2360,6 +2413,40 @@ x
         let stop = crate::bg::tool(&serde_json::json!({"action": "stop", "id": id}));
         assert!(stop.ok && stop.output.contains("stopped"), "{}", stop.output);
         assert!(crate::bg::list().iter().any(|t| t.id == id as u32 && !t.running));
+    }
+
+    #[test]
+    fn patch_forgives_line_numbers_escapes_and_spacing() {
+        let dir = std::env::temp_dir().join(format!("sing-patch2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "function A() {\n  return (\n    <div className=\"a\">\n      <p>hi</p>\n    </div>\n  );\n}\n";
+        std::fs::write(dir.join("A.tsx"), src).unwrap();
+        let read = || std::fs::read_to_string(dir.join("A.tsx")).unwrap();
+
+        // SEARCH copied with read_file's line numbers.
+        let numbered = "<<<<<<< SEARCH\n    4        <p>hi</p>\n=======\n    4        <p>hello</p>\n>>>>>>> REPLACE";
+        let res = apply_patch(&dir, "A.tsx", numbered, false);
+        assert!(res.ok, "{}", res.output);
+        assert!(read().contains("      <p>hello</p>\n"), "{}", read());
+
+        // The whole diff JSON-escaped once more: one line with literal \n.
+        let escaped = r"<<<<<<< SEARCH\n      <p>hello</p>\n=======\n      <p>hey</p>\n>>>>>>> REPLACE";
+        let res = apply_patch(&dir, "A.tsx", escaped, false);
+        assert!(res.ok, "{}", res.output);
+        assert!(read().contains("<p>hey</p>"));
+
+        // Different spacing inside the line.
+        let spaced = "<<<<<<< SEARCH\n<div className = \"a\" >\n=======\n<div className=\"b\">\n>>>>>>> REPLACE";
+        let res = apply_patch(&dir, "A.tsx", spaced, false);
+        assert!(res.ok, "{}", res.output);
+        assert!(read().contains("    <div className=\"b\">"), "{}", read());
+
+        // Nothing similar: the current file comes back in the error.
+        let stale = "<<<<<<< SEARCH\nconst zzz = qqq;\n=======\nx\n>>>>>>> REPLACE";
+        let res = apply_patch(&dir, "A.tsx", stale, false);
+        assert!(!res.ok && res.output.contains("as it is NOW") && res.output.contains("<p>hey</p>"), "{}", res.output);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

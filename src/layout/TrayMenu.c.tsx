@@ -14,7 +14,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Monitor, Power, CircleDot } from "lucide-react";
-import { ScrollBox } from "../ui/ScrollArea.c";
+import { ScrollBox } from "../components";
 
 interface RunRow {
   run_id: string;
@@ -68,10 +68,10 @@ export function TrayMenu() {
   }, [state]);
 
   const row =
-    "flex w-full items-center gap-1.5 rounded-md px-2 py-[5px] text-left text-[12px] text-[#E4E4E7] transition-colors hover:bg-white/[0.08]";
+    "flex w-full items-center gap-1.5 rounded-lg px-2 py-[5px] text-left text-[12px] text-[#E4E4E7] transition-colors hover:bg-white/[0.08]";
 
   return (
-    <div ref={cardRef} className="m-[6px] flex w-auto flex-col overflow-hidden rounded-lg border border-white/10 bg-[#1b1b1f]/95 p-1 shadow-[0_8px_24px_rgba(0,0,0,0.5)] backdrop-blur-xl">
+    <div ref={cardRef} className="m-[6px] flex w-auto flex-col overflow-hidden rounded-xl border border-white/10 bg-[#1b1b1f]/95 p-1 shadow-[0_8px_24px_rgba(0,0,0,0.5)] backdrop-blur-xl">
       {/* Header: name + version on one tight line */}
       <div className="flex items-baseline justify-between px-2 pb-1 pt-0.5">
         <span className="text-[12px] font-semibold text-[#F4F4F5]">Singularity</span>

@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState, memo } from "react";
-import { ArrowUp, Bug, Check, ChevronDown, ChevronRight, Copy, Loader2, Pencil, Wrench } from "lucide-react";
+import { ArrowUp, Bug, Check, ChevronDown, ChevronRight, Copy, Pencil, Wrench } from "lucide-react";
 import * as db from "../core/db.r";
 import { formatDuration } from "../utils/format.u";
 import { Markdown, ToolCall, ThinkBlock } from "./Markdown.c";
-import { FileIcon } from "./FileIcon.c";
 import { GourabDock } from "./Gourab.c";
 import type { Segment } from "./message.i";
+import { FileIcon, Button, Spinner, IconButton } from "../components";
 
 /*
  * Transcript rows, Antigravity-style: nothing sits in a boxed bubble. Prose,
@@ -42,16 +42,15 @@ function MessageBody({ text }: { text: string }) {
 
 function ActionButton({ title, onClick, children }: { title: string; onClick: () => void; children: React.ReactNode }) {
   return (
-    <button
-      className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text-main)]"
+    <IconButton
+      label={title} size="xs"
       onClick={(e) => {
         e.stopPropagation();
         onClick();
       }}
-      title={title}
     >
       {children}
-    </button>
+    </IconButton>
   );
 }
 
@@ -90,7 +89,7 @@ function EditBox({ initial, onCancel, onSave }: { initial: string; onCancel: () 
     <div className="flex flex-col gap-2">
       <textarea
         ref={ref}
-        className="min-h-[60px] w-full resize-none rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2 text-[14px] leading-relaxed text-[var(--text-main)] outline-none focus:border-[var(--accent)]/60"
+        className="min-h-[60px] w-full resize-none rounded-xl border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2 text-[14px] leading-relaxed text-[var(--text-main)] outline-none focus:border-[var(--accent)]/60"
         value={value}
         onChange={(e) => {
           setValue(e.target.value);
@@ -109,19 +108,19 @@ function EditBox({ initial, onCancel, onSave }: { initial: string; onCancel: () 
         <span className="mr-auto text-[11px] text-[var(--text-dim)]">
           Resending replaces everything after this prompt
         </span>
-        <button
-          className="h-7 rounded-md px-3 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text-main)]"
+        <Button
+          variant="secondary" size="sm"
           onClick={onCancel}
         >
           Cancel
-        </button>
-        <button
-          className="h-7 rounded-md bg-[var(--accent)] px-3 text-[12px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+        </Button>
+        <Button
+          variant="primary" size="sm"
           onClick={save}
           disabled={!value.trim()}
         >
           Send
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -182,12 +181,12 @@ function StepGroup({
   return (
     <div className="flex flex-col">
       <button
-        className="flex w-fit items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[12px] text-[var(--text-dim)] transition-colors select-none hover:bg-[var(--hover-bg)] hover:text-[var(--text-muted)]"
+        className="flex w-fit items-center gap-1.5 rounded-lg px-1.5 py-0.5 text-[12px] text-[var(--text-dim)] transition-colors select-none hover:bg-[var(--hover-bg)] hover:text-[var(--text-muted)]"
         onClick={() => setOpen(!open)}
         title="Show the actions of this turn"
       >
         {streaming && running ? (
-          <Loader2 size={12} className="animate-spin text-[var(--accent)]" />
+          <Spinner size={12} className="text-[var(--accent)]" />
         ) : (
           <Wrench size={12} strokeWidth={1.5} />
         )}
@@ -309,13 +308,13 @@ function ChatMessageView({
 
   if (role === "user") {
     return (
-      <div className="bg-[var(--hover-bg)] group relative -mx-3 flex flex-col gap-1.5 rounded-xl px-3 py-2 transition-colors">
+      <div className="bg-[var(--hover-bg)] group relative -mx-3 flex flex-col gap-1.5 rounded-2xl px-3 py-2 transition-colors">
         {images && images.length > 0 && (
           <div className="flex flex-wrap gap-2">
             {images.map((img, i) => (
               <button
                 key={i}
-                className="overflow-hidden rounded-lg border border-[var(--border)] transition-transform hover:scale-[1.02]"
+                className="overflow-hidden rounded-xl border border-[var(--border)] transition-transform hover:scale-[1.02]"
                 onClick={() => onInspectImage?.(img)}
                 title={`View ${img.name}`}
               >
@@ -362,7 +361,7 @@ function ChatMessageView({
     const grouped = groupSegments(segments);
     const usage = segments.find((s): s is Extract<Segment, { kind: "usage" }> => s.kind === "usage");
     return (
-      <div className="group -mx-3 flex flex-col gap-1.5 rounded-xl px-3 py-2 transition-colors hover:bg-[var(--hover-bg)]/40">
+      <div className="group -mx-3 flex flex-col gap-1.5 rounded-2xl px-3 py-2 transition-colors hover:bg-[var(--hover-bg)]/40">
         {grouped.map((seg, i) => {
           const isLast = i === grouped.length - 1;
           if ("group" in seg) {
@@ -402,7 +401,7 @@ function ChatMessageView({
   }
 
   return (
-    <div className="group -mx-3 flex flex-col gap-1.5 rounded-xl px-3 py-2 transition-colors hover:bg-[var(--hover-bg)]/40">
+    <div className="group -mx-3 flex flex-col gap-1.5 rounded-2xl px-3 py-2 transition-colors hover:bg-[var(--hover-bg)]/40">
       {answerText && <Markdown text={text} />}
       {error && <ErrorText text={error} />}
       <LiveTail streaming={streaming} lastChange={lastChange} />
@@ -494,7 +493,7 @@ function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?: boolea
       />
       {streaming && (
         <span className="flex items-center gap-1 text-[9.5px] uppercase tracking-wide text-[var(--accent)]">
-          <Loader2 size={9} className="animate-spin" /> live
+          <Spinner size={9} /> live
         </span>
       )}
     </div>

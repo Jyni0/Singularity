@@ -12,8 +12,8 @@ import type { Msg, PanelOpen, PanelTabSpec } from "./message.i";
 import { collectSteps } from "./message.u";
 import { computeDiff } from "../utils/diff.u";
 import type * as db from "../core/db.r";
-import { OverlayScroll } from "../ui/ScrollArea.c";
 import { BgTaskView } from "./BackgroundTasks.c";
+import { OverlayScroll, IconButton } from "../components";
 
 /** Renders a file's diff, reused by the file tab. */
 function FileDiffBody({ step }: { step: db.AgentStepEvent }) {
@@ -56,8 +56,6 @@ function FileDiffBody({ step }: { step: db.AgentStepEvent }) {
 }
 
 /** Small icon button used in the panel header. */
-const ICON_BTN =
-  "shrink-0 rounded-md p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
 
 /** Icon per tab type. */
 function tabIcon(t: PanelTabSpec) {
@@ -83,7 +81,7 @@ function TabBody({ tab, msgs }: { tab: PanelTabSpec; msgs: Msg[] }) {
         <img
           src={tab.image.data_url}
           alt={tab.image.name}
-          className="max-w-full rounded-lg border border-[var(--border)] object-contain"
+          className="max-w-full rounded-xl border border-[var(--border)] object-contain"
         />
       </OverlayScroll>
     );
@@ -195,6 +193,7 @@ export function InspectionPanel({
 
       {/* Closeable tabs across the top - one per opened item. */}
       <OverlayScroll
+        wheelX
         wrapperClassName="shrink-0 border-b border-[var(--border)]"
         className="flex items-center gap-1 overflow-x-auto px-2 py-1.5"
       >
@@ -203,7 +202,7 @@ export function InspectionPanel({
           return (
             <div
               key={t.id}
-              className={`group flex h-7 max-w-[170px] shrink-0 items-center gap-1.5 rounded-md border px-2 text-[12px] transition-colors ${
+              className={`group flex h-7 max-w-[170px] shrink-0 items-center gap-1.5 rounded-lg border px-2 text-[12px] transition-colors ${
                 isActive
                   ? "border-[var(--border)] bg-[var(--bg-elevated)] text-[var(--text-main)]"
                   : "border-transparent text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
@@ -218,7 +217,7 @@ export function InspectionPanel({
                 <span className="truncate">{t.label}</span>
               </button>
               <button
-                className={`shrink-0 rounded p-0.5 text-[var(--text-dim)] transition-opacity hover:text-[var(--text-main)] ${
+                className={`shrink-0 rounded-md p-0.5 text-[var(--text-dim)] transition-opacity hover:text-[var(--text-main)] ${
                   isActive ? "opacity-100" : "opacity-0 group-hover:opacity-100"
                 }`}
                 onClick={() => onCloseTab(t.id)}
@@ -229,9 +228,9 @@ export function InspectionPanel({
             </div>
           );
         })}
-        <button className={`${ICON_BTN} ml-auto`} onClick={onCloseAll} title="Close all tabs">
+        <IconButton size="xs" className="ml-auto" onClick={onCloseAll} label="Close all tabs">
           <X size={14} />
-        </button>
+        </IconButton>
       </OverlayScroll>
 
       {active ? (

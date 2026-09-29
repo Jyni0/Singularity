@@ -1,15 +1,10 @@
 import { useMemo, useState } from "react";
 import { CalendarClock, Save } from "lucide-react";
-import { Modal } from "../ui/Modal.c";
-import { Combobox } from "../ui/Combobox.c";
 import type { Model, Project, Provider, ScheduledTask } from "../core/types.i";
 import { NO_PROJECT } from "../core/types.i";
 import type { ScheduleKind } from "../utils/cron.u";
 import { WEEKDAYS, cronError, describeSchedule, nextRun, presetCron, presetFields } from "../utils/cron.u";
-
-const FIELD =
-  "h-9 w-full rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 text-[12.5px] text-[var(--text-main)] outline-none transition-colors focus:border-[var(--accent)]";
-const LABEL = "mb-1.5 block text-[11px] font-medium text-[var(--text-muted)]";
+import { Modal, Combobox, FIELD_LABEL, Input, TextArea, Button, Alert, Segmented, cx, input } from "../components";
 
 const KINDS: Array<{ id: ScheduleKind; label: string }> = [
   { id: "hourly", label: "Every hour" },
@@ -119,15 +114,15 @@ export function ScheduleModal({
   return (
     <Modal title={task ? "Edit Scheduled Task" : "Schedule Task"} onClose={onClose} width={560} overflowVisible>
       <div>
-        <label className={LABEL}>Name</label>
-        <input className={FIELD} value={name} onChange={(e) => setName(e.target.value)} placeholder="Nightly code review" autoFocus />
+        <label className={FIELD_LABEL}>Name</label>
+        <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nightly code review" autoFocus />
       </div>
 
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <label className={LABEL}>Model</label>
+          <label className={FIELD_LABEL}>Model</label>
           {modelOptions.length === 0 ? (
-            <div className="flex h-9 items-center rounded-md border border-dashed border-[var(--border)] px-2.5 text-[11.5px] text-[var(--text-muted)]">
+            <div className="flex h-9 items-center rounded-lg border border-dashed border-[var(--border)] px-2.5 text-[11.5px] text-[var(--text-muted)]">
               No models — add one in Settings → Models
             </div>
           ) : (
@@ -135,9 +130,9 @@ export function ScheduleModal({
           )}
         </div>
         <div>
-          <label className={LABEL}>Project (required)</label>
+          <label className={FIELD_LABEL}>Project (required)</label>
           {realProjects.length === 0 ? (
-            <div className="flex h-9 items-center rounded-md border border-dashed border-[var(--border)] px-2.5 text-[11.5px] text-[var(--text-muted)]">
+            <div className="flex h-9 items-center rounded-lg border border-dashed border-[var(--border)] px-2.5 text-[11.5px] text-[var(--text-muted)]">
               No projects — create one first (File → New Project)
             </div>
           ) : (
@@ -153,26 +148,12 @@ export function ScheduleModal({
       </div>
 
       <div>
-        <label className={LABEL}>Runs</label>
-        <div className="flex gap-1 rounded-md border border-[var(--border)] bg-[var(--bg-input)] p-0.5">
-          {KINDS.map((k) => (
-            <button
-              key={k.id}
-              type="button"
-              className={
-                "h-7 flex-1 rounded text-[11.5px] transition-colors " +
-                (kind === k.id ? "bg-[var(--accent)] text-white" : "text-[var(--text-muted)] hover:text-[var(--text-main)]")
-              }
-              onClick={() => setKind(k.id)}
-            >
-              {k.label}
-            </button>
-          ))}
-        </div>
+        <label className={FIELD_LABEL}>Runs</label>
+        <Segmented fill options={KINDS.map((k) => ({ value: k.id, label: k.label }))} value={kind} onChange={setKind} />
         <div className="mt-2 flex items-center gap-2">
           {kind === "weekly" && (
             <select
-              className={FIELD + " w-[150px]"}
+              className={cx(input(), "w-[150px]")}
               value={weekday}
               onChange={(e) => setWeekday(Number(e.target.value))}
             >
@@ -184,11 +165,11 @@ export function ScheduleModal({
             </select>
           )}
           {(kind === "daily" || kind === "weekly") && (
-            <input type="time" className={FIELD + " w-[120px]"} value={time} onChange={(e) => setTime(e.target.value || "09:00")} />
+            <Input type="time" className="w-[120px]" value={time} onChange={(e) => setTime(e.target.value || "09:00")} />
           )}
           {kind === "cron" && (
-            <input
-              className={FIELD + " font-mono"}
+            <Input
+              className="font-mono"
               value={cron}
               onChange={(e) => setCron(e.target.value)}
               placeholder="minute hour day month weekday — e.g. 0 9 * * 1-5"
@@ -207,9 +188,9 @@ export function ScheduleModal({
       </div>
 
       <div>
-        <label className={LABEL}>Prompt</label>
-        <textarea
-          className="h-32 w-full resize-none rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 text-[12.5px] leading-[1.5] text-[var(--text-main)] outline-none transition-colors focus:border-[var(--accent)]"
+        <label className={FIELD_LABEL}>Prompt</label>
+        <TextArea
+          className="h-32 resize-none text-[12.5px]"
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           placeholder="Review yesterday's commits on main and list anything risky."
@@ -217,26 +198,24 @@ export function ScheduleModal({
       </div>
 
       {error && (
-        <div className="rounded-md border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-3 py-2 text-[12px] text-[var(--diff-del)]">
-          {error}
-        </div>
+        <Alert>{error}</Alert>
       )}
 
       <div className="mt-2 flex justify-end gap-2">
-        <button
-          className="h-8 rounded-lg border border-[var(--border)] px-3 text-[13px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+        <Button
+          variant="secondary"
           onClick={onClose}
         >
           Cancel
-        </button>
-        <button
-          className="flex h-8 items-center rounded-lg bg-[var(--accent)] px-3 text-[13px] text-white transition-colors hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+        </Button>
+        <Button
+          variant="primary"
           onClick={() => void save()}
           disabled={busy}
         >
-          {task ? <Save size={14} className="mr-1.5" /> : <CalendarClock size={14} className="mr-1.5" />}
+          {task ? <Save size={14} /> : <CalendarClock size={14} />}
           {task ? "Save" : "Schedule"}
-        </button>
+        </Button>
       </div>
     </Modal>
   );

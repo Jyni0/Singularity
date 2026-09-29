@@ -1,9 +1,8 @@
 /* ---------- The prompt box's `/` and `@` menu ---------- */
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { motion } from "motion/react";
-import { LoaderCircle } from "lucide-react";
-import { POPOVER, POPOVER_LABEL, popoverItem, popMotion } from "../ui/tokens.s";
-import { ScrollBox } from "../ui/ScrollArea.c";
+import {  } from "lucide-react";
+import { POPOVER, POPOVER_LABEL, popoverItem, popMotion, ScrollBox, Spinner } from "../components";
 
 export interface ComposerItem {
   id: string;
@@ -75,7 +74,7 @@ export function ComposerMenu({
       {!grouped && (
         <div className={POPOVER_LABEL}>
           <span className="truncate">{title}</span>
-          {loading && <LoaderCircle size={11} className="shrink-0 animate-spin" />}
+          {loading && <Spinner size={11} />}
         </div>
       )}
       <div ref={listRef}>
@@ -101,7 +100,7 @@ export function ComposerMenu({
                 {it.detail && <span className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--text-dim)]">{it.detail}</span>}
                 {!it.detail && <span className="flex-1" />}
                 {it.badge && (
-                  <span className="shrink-0 rounded border border-[var(--border)] px-1.5 text-[10px] text-[var(--text-dim)]">
+                  <span className="shrink-0 rounded-md border border-[var(--border)] px-1.5 text-[10px] text-[var(--text-dim)]">
                     {it.badge}
                   </span>
                 )}

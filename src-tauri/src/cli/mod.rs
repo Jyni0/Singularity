@@ -386,7 +386,7 @@ pub(crate) async fn agy_slug(launch: &Launch, model: &str, effort: &str) -> Stri
         .collect();
     let order: &[&str] = match effort {
         "low" => &["low", "medium", "high"],
-        "high" | "xhigh" | "max" | "ultracode" => &["high", "medium", "low"],
+        "high" | "xhigh" | "max" | "ultra" | "ultracode" => &["high", "medium", "low"],
         _ => &["medium", "high", "low"],
     };
     order

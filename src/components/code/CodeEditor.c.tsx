@@ -4,7 +4,7 @@
  * through onChange, and Mod-S calls onSave.
  */
 import { useEffect, useRef } from "react";
-import { shortcutKey } from "../utils/keys.u";
+import { shortcutKey } from "../../utils/keys.u";
 import { Compartment, EditorState, type Extension } from "@codemirror/state";
 import {
   EditorView,

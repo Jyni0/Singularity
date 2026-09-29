@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Check } from "lucide-react";
 import { Effort, ProviderKind, effortsFor } from "../core/types.i";
-import { LIP_CHIP, POPOVER, POPOVER_LABEL, popoverItem, popMotion } from "../ui/tokens.s";
+import { LIP_CHIP, POPOVER, POPOVER_LABEL, popoverItem, popMotion } from "../components";
 
 const EFFORT_LABEL: Record<Effort, string> = {
   low: "Low",
@@ -11,11 +11,16 @@ const EFFORT_LABEL: Record<Effort, string> = {
   high: "High",
   xhigh: "xHigh",
   max: "Max",
+  ultra: "Ultra",
   ultracode: "Ultracode",
 };
 
+/** OpenAI (Codex) names its levels its own way. */
+const OPENAI_LABEL: Partial<Record<Effort, string>> = { low: "Light", xhigh: "Extra High" };
+
 /** Label of a level for this provider — Anthropic calls xhigh "Extra". */
 export function effortLabel(level: Effort, kind?: ProviderKind): string {
+  if (kind === "openai-cli" && OPENAI_LABEL[level]) return OPENAI_LABEL[level]!;
   if (level === "xhigh" && kind === "anthropic-cli") return "Extra";
   return EFFORT_LABEL[level];
 }

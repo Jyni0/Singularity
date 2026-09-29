@@ -22,21 +22,17 @@ import {
 } from "lucide-react";
 import type { Model, Project, Provider, Theme, PermMode } from "../core/types.i";
 import { APP_VERSION, NO_PROJECT, THEME_LIST } from "../core/types.i";
-import { Combobox } from "../ui/Combobox.c";
-import { SBUTTON, SINPUT } from "../ui/tokens.s";
-import { ScrollArea, ScrollBox } from "../ui/ScrollArea.c";
 import { ModelsSettings } from "./ModelsSettings.c";
 import { AgentsSettings } from "./AgentsSettings.c";
 import type * as db from "../core/db.r";
 import { TerminalSettings } from "./TerminalSettings.c";
 import { ProjectSelect, ProjectSettingsPanel } from "./ProjectSettings.c";
-import { SettingRow, SettingsCard, Sep, Segmented } from "./SettingsParts.c";
-import { Switch } from "../ui/Switch.c";
 import { LogsSettings } from "./LogsSettings.c";
 import { SkillsSettings } from "./SkillsSettings.c";
-import { GEN_ANIMATIONS, type GenAnimation } from "../ui/GenerationGlow.c";
+import { GEN_ANIMATIONS, type GenAnimation } from "../components/effects/GenerationGlow.c";
 import { McpSettings } from "./McpSettings.c";
 import { PluginsSettings } from "./PluginsSettings.c";
+import { Combobox, ScrollArea, ScrollBox, SettingRow, SettingsCard, Sep, Segmented, Button, Input, Switch, ConfirmBar, IconButton, NavItem as SideItem } from "../components";
 
 export type SettingsSection =
   | "general"
@@ -207,18 +203,15 @@ export function SettingsModal({
     const Icon = it.icon;
     const on = effectiveSection === it.id;
     return (
-      <button
+      <SideItem
         key={it.id}
-        className={`flex h-8 w-full items-center gap-2.5 rounded-md px-2.5 text-left text-[13px] transition-colors ${
-          on
-            ? "bg-[var(--hover-bg)] text-[var(--text-main)]"
-            : "text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-        }`}
+        active={on}
+        className={on ? "text-[var(--text-main)]" : ""}
+        icon={<Icon size={15} strokeWidth={1.7} className="shrink-0" />}
         onClick={() => setSection(it.id)}
       >
-        <Icon size={15} strokeWidth={1.7} className="shrink-0" />
         <span className="truncate">{it.label}</span>
-      </button>
+      </SideItem>
     );
   };
 
@@ -248,14 +241,15 @@ export function SettingsModal({
       onClick={onClose}
     >
       <motion.div
-        className="flex h-[min(720px,calc(100vh-40px))] w-[min(980px,calc(100vw-40px))] overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-app)] shadow-[0_25px_50px_-12px_rgba(0,0,0,0.7)]"
+        className="bg-[var(--bg-surface)] flex h-[min(720px,calc(100vh-40px))] w-[min(1260px,calc(100vw-40px))] overflow-hidden rounded-3xl border border-[var(--border)] shadow-[0_25px_50px_-12px_rgba(0,0,0,0.7)]"
         initial={{ opacity: 0, scale: 0.97 }}
         animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.2, ease: "easeOut" }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Left column — sections, grouped; About pinned to the bottom. */}
-        <div className="flex w-[200px] shrink-0 flex-col border-r border-[var(--border-soft)] bg-[var(--bg-surface)]">
+        {/* <div className="flex w-[200px] shrink-0 flex-col border-r border-[var(--border-soft)] bg-[var(--bg-surface)]"> */}
+        <div className="flex w-[200px] shrink-0 flex-col">
           <ScrollArea className="min-h-0 flex-1" innerClassName="flex flex-col gap-4 px-2 py-3">
             {navItems.map((grp, gi) => (
               <div key={grp.group ?? gi} className="flex flex-col gap-0.5">
@@ -270,6 +264,9 @@ export function SettingsModal({
         {/* Right column — content */}
         {/* min-w-0: long content (paths, descriptions) must truncate inside
             the column, never widen it past the modal. */}
+        {/* A card inset in the modal: the border runs all the way round and
+            the rounded corners stay put while the content scrolls. */}
+        <div className="my-2 mr-2 flex min-w-0 flex-1 overflow-hidden rounded-[18px] border border-[var(--border)] bg-[var(--bg-app)]">
         <ScrollArea className="min-w-0 flex-1" innerClassName="min-w-0 px-8 py-6">
           <div className="mb-5 flex items-start">
             <div className="min-w-0">
@@ -278,13 +275,12 @@ export function SettingsModal({
               </div>
               <div className="mt-0.5 text-[12.5px] text-[var(--text-dim)]">{titles[effectiveSection][1]}</div>
             </div>
-            <button
-              className="ml-auto flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+            <IconButton
+              label="Close" className="ml-auto"
               onClick={onClose}
-              title="Close"
             >
               <X size={14} />
-            </button>
+            </IconButton>
           </div>
 
           {effectiveSection === "appearance" && (
@@ -402,33 +398,19 @@ export function SettingsModal({
                   {projects.map((p) =>
                     confirmDel === p.name ? (
                       /* Inline delete confirmation — the row turns into the question. */
-                      <span
+                      <ConfirmBar
                         key={p.name}
-                        className="flex items-center gap-2 rounded-lg border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-2.5 py-1.5 text-[12.5px] text-[var(--text-main)]"
-                      >
-                        <span className="min-w-0 flex-1 truncate">
-                          Delete “{p.name}”? Its {p.conversations.length} chats move to “No project”.
-                        </span>
-                        <button
-                          className="shrink-0 rounded-md bg-[var(--diff-del)] px-2.5 py-1 text-[11px] font-medium text-white"
-                          onClick={async () => {
-                            await onDeleteProject(p.name);
-                            setConfirmDel(null);
-                          }}
-                        >
-                          Delete
-                        </button>
-                        <button
-                          className="shrink-0 rounded-md px-2 py-1 text-[11px] text-[var(--text-muted)] hover:bg-[var(--hover-bg)]"
-                          onClick={() => setConfirmDel(null)}
-                        >
-                          Cancel
-                        </button>
-                      </span>
+                        message={<>Delete “{p.name}”? Its {p.conversations.length} chats move to “No project”.</>}
+                        onConfirm={async () => {
+                          await onDeleteProject(p.name);
+                          setConfirmDel(null);
+                        }}
+                        onCancel={() => setConfirmDel(null)}
+                      />
                     ) : (
                       <span
                         key={p.name}
-                        className="group flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+                        className="group flex items-center gap-2 rounded-xl px-2.5 py-1.5 text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
                       >
                         <Folder size={12} className="shrink-0 text-[var(--text-muted)]" />
                         <span className="min-w-0 truncate">{p.name}</span>
@@ -441,24 +423,22 @@ export function SettingsModal({
                           {p.conversations.length}
                         </span>
                         {/* Row actions: open this project's settings, or delete it. */}
-                        <button
-                          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] opacity-0 transition-all hover:bg-[var(--bg-input)] hover:text-[var(--text-main)] group-hover:opacity-100"
-                          title="Edit this project's settings"
+                        <IconButton
+                          label="Edit this project's settings" size="xs" reveal
                           onClick={() => {
                             setSettingsProject(p.name);
                             setSection("project-settings");
                           }}
                         >
                           <SettingsIcon size={12} />
-                        </button>
+                        </IconButton>
                         {p.name !== NO_PROJECT && (
-                          <button
-                            className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] opacity-0 transition-all hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)] group-hover:opacity-100"
-                            title="Delete project"
+                          <IconButton
+                            label="Delete project" size="xs" tone="danger" reveal
                             onClick={() => setConfirmDel(p.name)}
                           >
                             <Trash2 size={12} />
-                          </button>
+                          </IconButton>
                         )}
                       </span>
                     )
@@ -467,16 +447,15 @@ export function SettingsModal({
               </SettingsCard>
               <SettingsCard>
                 <SettingRow title="New project" hint="Adds a folder to the sidebar tree">
-                  <input
-                    className={SINPUT}
+                  <Input className="w-[240px]"
                     placeholder="Project name…"
                     value={name}
                     onChange={(e) => setName(e.target.value)}
                     onKeyDown={(e) => e.key === "Enter" && add()}
                   />
-                  <button className={`${SBUTTON} ml-2`} onClick={add} disabled={!name.trim()}>
+                  <Button className="ml-2" onClick={add} disabled={!name.trim()}>
                     Add
-                  </button>
+                  </Button>
                 </SettingRow>
               </SettingsCard>
             </div>
@@ -493,8 +472,7 @@ export function SettingsModal({
                   />
                 </SettingRow>
               </SettingsCard>
-              <SettingsCard>
-                <ProjectSettingsPanel
+              <ProjectSettingsPanel
                   project={projects.find((p) => p.name === settingsProject) ?? null}
                   onRename={async (oldName, newName) => {
                     await onRenameProject(oldName, newName);
@@ -507,7 +485,6 @@ export function SettingsModal({
                     setSettingsProject(null);
                   }}
                 />
-              </SettingsCard>
             </div>
           )}
 
@@ -526,6 +503,7 @@ export function SettingsModal({
             </SettingsCard>
           )}
         </ScrollArea>
+        </div>
       </motion.div>
     </motion.div>
   );

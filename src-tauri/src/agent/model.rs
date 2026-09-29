@@ -74,7 +74,7 @@ fn build_model(req: &AgentRequest) -> Result<ModelSetup, String> {
     let effort = match req.effort.as_str() {
         // Levels above High exist only for the subscription CLIs; an API
         // provider gets its highest level instead.
-        "xhigh" | "max" | "ultracode" if crate::cli::Cli::from_kind(&req.kind).is_none() => "high",
+        "xhigh" | "max" | "ultra" | "ultracode" if crate::cli::Cli::from_kind(&req.kind).is_none() => "high",
         e => e,
     };
     // "medium" is every provider's default — only low/high are sent.

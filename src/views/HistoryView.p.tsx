@@ -39,7 +39,7 @@ export function HistoryView({
             {p.conversations.map((c) => (
               <button
                 key={c.id}
-                className="flex h-8 w-full items-center gap-2 rounded-lg px-3 text-left text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+                className="flex h-8 w-full items-center gap-2 rounded-xl px-3 text-left text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
                 onClick={() => onOpen(p.name, c.id)}
               >
                 <MessageSquare size={16} strokeWidth={1.5} className="shrink-0" />

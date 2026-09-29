@@ -1,4 +1,4 @@
-import { OS_ICONS } from "../core/types.i";
+import { OS_ICONS } from "../../core/types.i";
 
 /** Deterministic avatar color from an id — Termius-style palette. */
 const AVATAR_COLORS = [

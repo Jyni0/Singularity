@@ -1,7 +1,7 @@
 {
   "name": "singularity",
   "private": true,
-  "version": "0.7.0",
+  "version": "0.7.5",
   "description": "Next-Gen Agentic Desktop — orchestration workspace for autonomous AI agents",
   "type": "module",
   "scripts": {
@@ -48,6 +48,7 @@
     "motion": "^13.4.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "tailwind-merge": "^3.7.0",
     "tailwindcss": "^4.3.3",
     "three": "^0.186.1"
   },

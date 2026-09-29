@@ -10,7 +10,6 @@ import {
   FileCode2,
   GitBranch,
   Globe,
-  Loader2,
   Puzzle,
   RefreshCw,
   Search,
@@ -22,9 +21,7 @@ import {
 import * as db from "../core/db.r";
 import { BUILTIN_PLUGINS, loadDisabledTools, saveDisabledTools } from "../core/plugins.u";
 import { ADDON_CATEGORIES, ADDON_PLUGINS, addonServer, addonServerId, addonValues, type AddonPlugin } from "../core/addons.u";
-import { SBUTTON, SINPUT } from "../ui/tokens.s";
-import { Switch } from "../ui/Switch.c";
-import { Segmented, SettingsCard } from "./SettingsParts.c";
+import { Switch, Segmented, SettingsCard, Button, IconButton, Input, SECTION_HEADING, Spinner } from "../components";
 
 const ICONS: Record<string, React.ReactNode> = {
   files: <FileCode2 size={15} />,
@@ -34,13 +31,9 @@ const ICONS: Record<string, React.ReactNode> = {
   ssh: <Server size={15} />,
 };
 
-const HEADING = "px-1 text-[11px] font-medium uppercase tracking-wide text-[var(--text-dim)]";
-const ICON_BTN =
-  "flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)] disabled:opacity-40";
-
 function PluginIcon({ children }: { children: React.ReactNode }) {
   return (
-    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[var(--bg-elevated)] text-[var(--text-muted)]">
+    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--bg-elevated)] text-[var(--text-muted)]">
       {children}
     </span>
   );
@@ -86,11 +79,11 @@ function AddonCard({ plugin, server, onChanged }: { plugin: AddonPlugin; server:
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 text-[13px] text-[var(--text-main)]">
             {plugin.title}
-            {server && <span className="rounded bg-[var(--bg-elevated)] px-1.5 py-[1px] text-[10px] text-[var(--accent)]">installed</span>}
+            {server && <span className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-[1px] text-[10px] text-[var(--accent)]">installed</span>}
           </div>
           <div className="mt-0.5 text-[12px] text-[var(--text-dim)]">{plugin.description}</div>
           <div className="mt-1 text-[11px] text-[var(--text-dim)]">
-            <span className="rounded bg-[var(--bg-elevated)] px-1.5 py-[1px]">{plugin.category}</span>
+            <span className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-[1px]">{plugin.category}</span>
             <span className="ml-2">
               {plugin.install.type === "http" ? "Hosted — nothing to install" : `Needs Node.js${plugin.needs ? ` + ${plugin.needs}` : ""}`}
               {plugin.install.type === "http" && plugin.needs ? ` · needs ${plugin.needs}` : ""}
@@ -99,17 +92,16 @@ function AddonCard({ plugin, server, onChanged }: { plugin: AddonPlugin; server:
         </div>
         {server ? (
           <div className="flex shrink-0 items-center gap-1">
-            <button
-              className={ICON_BTN}
-              title={plugin.install.type === "npm" ? "Reinstall / update" : "Check again"}
+            <IconButton
+              label={plugin.install.type === "npm" ? "Reinstall / update" : "Check again"}
               disabled={busy}
               onClick={() => void install(addonValues(plugin, server), server.enabled)}
             >
-              {busy ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
-            </button>
-            <button
-              className={`${ICON_BTN} hover:!text-[var(--diff-del)]`}
-              title="Remove"
+              {busy ? <Spinner size={13} /> : <RefreshCw size={13} />}
+            </IconButton>
+            <IconButton
+              className="hover:!text-[var(--diff-del)]"
+              label="Remove"
               disabled={busy}
               onClick={() =>
                 void db.deleteMcpServer(server.id).then(() => {
@@ -119,7 +111,7 @@ function AddonCard({ plugin, server, onChanged }: { plugin: AddonPlugin; server:
               }
             >
               <Trash2 size={13} />
-            </button>
+            </IconButton>
             <span className="ml-1">
               <Switch
                 on={server.enabled}
@@ -129,18 +121,17 @@ function AddonCard({ plugin, server, onChanged }: { plugin: AddonPlugin; server:
             </span>
           </div>
         ) : (
-          <button className={`${SBUTTON} h-8 gap-1.5`} disabled={missing || busy} onClick={() => void install(values)}>
-            {busy ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+          <Button className="h-8 gap-1.5" disabled={missing || busy} onClick={() => void install(values)}>
+            {busy ? <Spinner size={13} /> : <Download size={13} />}
             Install
-          </button>
+          </Button>
         )}
       </div>
       {!server &&
         (plugin.fields ?? []).map((f) => (
           <label key={f.key} className="ml-11 flex items-center gap-3 text-[12px] text-[var(--text-muted)]">
             <span className="w-[140px] shrink-0">{f.label}</span>
-            <input
-              className={`${SINPUT} !w-auto flex-1 font-mono`}
+            <Input className="w-auto flex-1 font-mono"
               type={f.secret ? "password" : "text"}
               autoComplete="off"
               placeholder={f.placeholder}
@@ -153,10 +144,10 @@ function AddonCard({ plugin, server, onChanged }: { plugin: AddonPlugin; server:
         <div className="ml-11 flex items-center gap-2 text-[11.5px] text-[#f59e0b]">
           <AlertTriangle size={12} className="shrink-0" />
           <span className="flex-1">Installed the old way (npx), which fails on Windows.</span>
-          <button className={`${SBUTTON} h-7 gap-1.5`} onClick={() => void install(addonValues(plugin, server), server.enabled)}>
+          <Button className="h-7 gap-1.5" onClick={() => void install(addonValues(plugin, server), server.enabled)}>
             <RefreshCw size={12} />
             Reinstall
-          </button>
+          </Button>
         </div>
       )}
       {state.kind !== "idle" && (
@@ -170,7 +161,7 @@ function AddonCard({ plugin, server, onChanged }: { plugin: AddonPlugin; server:
           ) : state.kind === "err" ? (
             <AlertTriangle size={12} className="mt-[2px] shrink-0" />
           ) : (
-            <Loader2 size={12} className="mt-[2px] shrink-0 animate-spin" />
+            <Spinner size={12} className="mt-[2px]" />
           )}
           <span className="min-w-0 whitespace-pre-wrap break-words">{state.text}</span>
         </div>
@@ -254,7 +245,7 @@ export function PluginsSettings() {
                   <div className="mt-0.5 text-[12px] text-[var(--text-dim)]">{p.description}</div>
                   <div className="mt-1.5 flex flex-wrap gap-1">
                     {p.tools.map((t) => (
-                      <span key={t} className="rounded bg-[var(--bg-elevated)] px-1.5 py-[1px] font-mono text-[10.5px] text-[var(--text-dim)]">
+                      <span key={t} className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-[1px] font-mono text-[10.5px] text-[var(--text-dim)]">
                         {t}
                       </span>
                     ))}
@@ -273,8 +264,7 @@ export function PluginsSettings() {
         <>
           <div className="relative">
             <Search size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--text-dim)]" />
-            <input
-              className={`${SINPUT} !w-full pl-8`}
+            <Input className="pl-8"
               placeholder="Search plugins…"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
@@ -282,17 +272,15 @@ export function PluginsSettings() {
           </div>
           <div className="flex flex-wrap gap-1">
             {[null, ...ADDON_CATEGORIES].map((c) => (
-              <button
+              <Button
                 key={c ?? "all"}
-                className={`rounded-full border px-2.5 py-[3px] text-[11.5px] transition-colors ${
-                  category === c
-                    ? "border-[var(--accent)] bg-[var(--accent)]/15 text-[var(--text-main)]"
-                    : "border-[var(--border)] text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-                }`}
+                size="xs"
+                variant={category === c ? "primary" : "secondary"}
+                className="rounded-full font-normal"
                 onClick={() => setCategory(c)}
               >
                 {c ?? "All"}
-              </button>
+              </Button>
             ))}
           </div>
 
@@ -309,22 +297,22 @@ export function PluginsSettings() {
                   </div>
                   {bulk && <div className="mt-1 text-[11.5px] text-[var(--text-muted)]">{bulk}</div>}
                 </div>
-                <button className={`${SBUTTON} h-8 gap-1.5`} disabled={bulk !== null && bulk.endsWith("…")} onClick={() => void installRecommended()}>
-                  {bulk?.endsWith("…") ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+                <Button className="h-8 gap-1.5" disabled={bulk !== null && bulk.endsWith("…")} onClick={() => void installRecommended()}>
+                  {bulk?.endsWith("…") ? <Spinner size={13} /> : <Download size={13} />}
                   Install all
-                </button>
+                </Button>
               </div>
             </SettingsCard>
           )}
 
           {groups.length === 0 && (
-            <div className="rounded-lg border border-dashed border-[var(--border)] px-3 py-4 text-center text-[12px] text-[var(--text-dim)]">
+            <div className="rounded-xl border border-dashed border-[var(--border)] px-3 py-4 text-center text-[12px] text-[var(--text-dim)]">
               {tab === "Installed" && installed.length === 0 ? "Nothing installed yet — see Discover." : "No plugins match."}
             </div>
           )}
           {groups.map(([cat, items]) => (
             <div key={cat} className="flex flex-col gap-3">
-              <div className={`${HEADING} mt-2`}>{cat}</div>
+              <div className={`${SECTION_HEADING} mt-2`}>{cat}</div>
               {items.map((p) => (
                 <AddonCard key={p.id} plugin={p} server={serverOf(p)} onChanged={reload} />
               ))}

@@ -47,12 +47,12 @@ export function ModelCaps({ kind, baseUrl, modelId, rowId }: { kind: string; bas
       {info && known && (
         <>
           {info.context !== null && (
-            <span className="rounded bg-[var(--bg-elevated)] px-1.5 py-[1px] text-[var(--text-muted)]" title="Context window (tokens)">
+            <span className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-[1px] text-[var(--text-muted)]" title="Context window (tokens)">
               {fmtTokens(info.context)} ctx
             </span>
           )}
           {info.maxOutput !== null && (
-            <span className="rounded bg-[var(--bg-elevated)] px-1.5 py-[1px]" title="Longest answer (tokens)">
+            <span className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-[1px]" title="Longest answer (tokens)">
               {fmtTokens(info.maxOutput)} out
             </span>
           )}

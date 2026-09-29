@@ -45,7 +45,7 @@ export function SshLogsView() {
       transition={{ duration: 0.2, ease: "easeOut" }}
     >
       {logs.length === 0 && (
-        <div className="rounded-xl border border-dashed border-[var(--border)] p-10 text-center text-[13px] text-[var(--text-muted)]">
+        <div className="rounded-2xl border border-dashed border-[var(--border)] p-10 text-center text-[13px] text-[var(--text-muted)]">
           Nothing yet — connect to a unit and the trail starts here.
         </div>
       )}
@@ -57,7 +57,7 @@ export function SshLogsView() {
           return (
             <div key={day.key} className="flex flex-col">
               <button
-                className="group flex h-8 items-center gap-1.5 rounded-lg px-2 text-left text-[12.5px] font-medium text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                className="group flex h-8 items-center gap-1.5 rounded-xl px-2 text-left text-[12.5px] font-medium text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
                 onClick={() => setToggled((prev) => ({ ...prev, [day.key]: !open }))}
                 title={open ? "Collapse" : "Expand"}
               >
@@ -67,7 +67,7 @@ export function SshLogsView() {
                 <span>{day.label}</span>
                 <span className="font-mono text-[11px] font-normal text-[var(--text-dim)]">{day.logs.length}</span>
                 {failed > 0 && (
-                  <span className="rounded bg-[var(--diff-del)]/15 px-1.5 text-[10px] font-medium text-[var(--diff-del)]">
+                  <span className="rounded-md bg-[var(--diff-del)]/15 px-1.5 text-[10px] font-medium text-[var(--diff-del)]">
                     {failed} failed
                   </span>
                 )}
@@ -97,7 +97,7 @@ export function SshLogsView() {
 
 function LogRow({ log: l }: { log: SshLog }) {
   return (
-    <div className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-[12.5px] transition-colors hover:bg-[var(--hover-bg)]">
+    <div className="flex items-center gap-2.5 rounded-xl px-3 py-1.5 text-[12.5px] transition-colors hover:bg-[var(--hover-bg)]">
       {/* Time of day — the day itself is the section header. */}
       <span className="min-w-10 w-fit shrink-0 font-mono text-[11px] text-[var(--text-dim)]">{timeOf(l.created_at)}</span>
       {/* Actor: you or the agent */}
@@ -128,7 +128,7 @@ function LogRow({ log: l }: { log: SshLog }) {
       </span>
 
       {!l.ok && (
-        <span className="shrink-0 rounded bg-[var(--diff-del)]/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[var(--diff-del)]">
+        <span className="shrink-0 rounded-md bg-[var(--diff-del)]/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[var(--diff-del)]">
           failed
         </span>
       )}

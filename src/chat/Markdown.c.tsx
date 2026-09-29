@@ -8,9 +8,8 @@
  * over how a shell command is presented (with its own copy button).
  */
 import { useState, type ReactNode } from "react";
-import { ScrollBox } from "../ui/ScrollArea.c";
-import { FileIcon, baseName, dirName } from "./FileIcon.c";
-import { Bot, Brain, Check, Copy, Eye, FileDiff, FilePlus2, FolderOpen, Loader2, Pencil, Search, Server, Terminal, Wrench, ChevronRight, Sparkles, Plug, FileSearch, CornerDownRight, FolderCog, GitBranch, Globe, Link2, Activity } from "lucide-react";
+import { Bot, Brain, Check, Copy, Eye, FileDiff, FilePlus2, FolderOpen, Pencil, Search, Server, Terminal, Wrench, ChevronRight, Sparkles, Plug, FileSearch, CornerDownRight, FolderCog, GitBranch, Globe, Link2, Activity } from "lucide-react";
+import { ScrollBox, FileIcon, baseName, dirName, Spinner } from "../components";
 
 /* ---------- Inline formatting ---------- */
 
@@ -34,7 +33,7 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
       out.push(
         <code
           key={key}
-          className="rounded bg-[var(--bg-input)] px-1.5 py-0.5 font-mono text-[12px] text-[var(--text-main)]"
+          className="rounded-md bg-[var(--bg-input)] px-1.5 py-0.5 font-mono text-[12px] text-[var(--text-main)]"
         >
           {token.slice(1, -1)}
         </code>
@@ -93,7 +92,7 @@ function CodeBlock({ code, lang }: { code: string; lang: string }) {
   };
 
   return (
-    <div className="group relative my-2 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-input)]">
+    <div className="group relative my-2 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-input)]">
       <div className="flex items-center gap-2 border-b border-[var(--border-soft)] px-3 py-1.5">
         {isShell ? (
           <Terminal size={11} className="shrink-0 text-[var(--text-dim)]" />
@@ -108,7 +107,7 @@ function CodeBlock({ code, lang }: { code: string; lang: string }) {
           </span>
         )}
         <button
-          className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-[var(--text-dim)] opacity-0 transition-opacity hover:text-[var(--text-main)] group-hover:opacity-100"
+          className="ml-auto flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-[var(--text-dim)] opacity-0 transition-opacity hover:text-[var(--text-main)] group-hover:opacity-100"
           onClick={copy}
           title="Copy"
         >
@@ -256,7 +255,7 @@ function Table({ rows, keyPrefix }: { rows: string[]; keyPrefix: string }) {
   const [header, ...body] = rows;
 
   return (
-    <ScrollBox className="my-2 overflow-x-auto rounded-lg border border-[var(--border)]">
+    <ScrollBox className="my-2 overflow-x-auto rounded-xl border border-[var(--border)]">
       <table className="w-full border-collapse text-[12px]">
         <thead>
           <tr className="bg-[var(--bg-input)]">
@@ -446,7 +445,7 @@ export function ThinkBlock({ text, live }: { text: string; live?: boolean }) {
   return (
     <div className="flex flex-col">
       <button
-        className="flex w-fit items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[12px] text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-muted)]"
+        className="flex w-fit items-center gap-1.5 rounded-lg px-1.5 py-0.5 text-[12px] text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-muted)]"
         onClick={() => setOpen(!open)}
       >
         <Brain size={12} className={live ? "animate-pulse text-[var(--accent)]" : ""} />
@@ -479,7 +478,7 @@ export function ToolCall({ call }: { call: ToolCallView }) {
 
   return (
     <div
-      className={`group/tool flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-[12.5px] transition-colors ${
+      className={`group/tool flex min-w-0 items-center gap-2 rounded-lg px-1.5 py-1 text-[12.5px] transition-colors ${
         clickable ? "cursor-pointer hover:bg-[var(--hover-bg)]" : ""
       }`}
       onClick={clickable ? call.onInspect : undefined}
@@ -487,13 +486,13 @@ export function ToolCall({ call }: { call: ToolCallView }) {
       role={clickable ? "button" : undefined}
     >
       {running ? (
-        <Loader2 size={13} className="shrink-0 animate-spin text-[var(--accent)]" />
+        <Spinner size={13} className="text-[var(--accent)]" />
       ) : (
         <Icon size={13} strokeWidth={1.6} className={`shrink-0 ${ok ? "text-[var(--text-dim)]" : "text-[var(--diff-del)]"}`} />
       )}
       <span className="shrink-0 text-[var(--text-muted)]">{meta.label}</span>
       {owner && (
-        <span className="shrink-0 rounded bg-[var(--accent)]/12 px-1.5 text-[10.5px] text-[var(--accent)]">{owner}</span>
+        <span className="shrink-0 rounded-md bg-[var(--accent)]/12 px-1.5 text-[10.5px] text-[var(--accent)]">{owner}</span>
       )}
       {path !== null ? (
         <>

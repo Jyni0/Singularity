@@ -186,7 +186,7 @@ impl Job {
         // Levels each CLI accepts (the UI offers only these; anything else
         // falls back to the CLI's own default).
         let levels: &[&str] = match m.cli {
-            Cli::Codex => &["low", "medium", "high", "xhigh"],
+            Cli::Codex => &["low", "medium", "high", "xhigh", "ultra"],
             Cli::Claude => &["low", "medium", "high", "xhigh", "max", "ultracode"],
             Cli::Antigravity => &["low", "medium", "high"],
         };

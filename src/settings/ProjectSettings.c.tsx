@@ -1,20 +1,15 @@
 import { useState } from "react";
-import { Folder, FolderOpen, Shield, Trash2 } from "lucide-react";
+import { FolderOpen, Trash2 } from "lucide-react";
 import type { Project, PermMode } from "../core/types.i";
 import { NO_PROJECT } from "../core/types.i";
-import { Combobox } from "../ui/Combobox.c";
-import { SBUTTON } from "../ui/tokens.s";
+import { Combobox, SettingRow, SettingsCard, Sep, Segmented, Button, Input, Alert } from "../components";
 
 /** Per-project command permission choices. */
 const PERM_MODES: Array<{ id: PermMode; label: string; hint: string }> = [
-  { id: "bypass", label: "Bypass all", hint: "Run commands right away, never ask" },
-  { id: "default", label: "As default", hint: "Use the global setting" },
-  { id: "ask", label: "Always ask", hint: "Ask before every command" },
+  { id: "bypass", label: "Never ask", hint: "The agent runs shell commands right away" },
+  { id: "default", label: "Default", hint: "Follows the global setting in Permissions" },
+  { id: "ask", label: "Always ask", hint: "The agent asks before every shell command" },
 ];
-
-/** Shared settings-field geometry: h-9 to match Combobox/SBUTTON/SINPUT. */
-const INPUT_CLS =
-  "h-9 w-full rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-3 text-[13px] text-[var(--text-main)] outline-none transition-colors focus:border-[var(--accent)]";
 
 /**
  * One project's settings: rename, change directory, command permission,
@@ -54,14 +49,15 @@ export function ProjectSettingsPanel({
 
   if (!project) {
     return (
-      <p className="rounded-xl border border-[var(--border)] bg-[var(--bg-surface)] px-4 py-6 text-center text-[13px] text-[var(--text-dim)]">
-        Pick a project above to edit its settings.
-      </p>
+      <SettingsCard>
+        <p className="py-3 text-center text-[13px] text-[var(--text-dim)]">Pick a project above to edit its settings.</p>
+      </SettingsCard>
     );
   }
 
   const save = async () => {
     const n = name.trim();
+    if (!n) setName(project.name);
     if (!n || n === project.name || busy) return;
     setBusy(true);
     setError(null);
@@ -117,138 +113,94 @@ export function ProjectSettingsPanel({
     }
   };
 
-  return (
-    <div className="flex flex-col gap-4">
-      <label className="flex flex-col gap-1.5">
-        <span className="text-[12px] font-medium text-[var(--text-muted)]">Name</span>
-        <div className="flex gap-2">
-          <input
-            className={INPUT_CLS}
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && void save()}
-          />
-          <button
-            className={SBUTTON + " shrink-0 !px-4"}
-            disabled={!name.trim() || name.trim() === project.name || busy}
-            onClick={() => void save()}
-          >
-            Save
-          </button>
-        </div>
-      </label>
+  const mode = project.permMode ?? "default";
+  const modeInfo = PERM_MODES.find((m) => m.id === mode) ?? PERM_MODES[1];
 
-      {/* Directory — editable now: type a path or pick a folder via the OS dialog. */}
-      <div className="flex flex-col gap-1.5">
-        <span className="text-[12px] font-medium text-[var(--text-muted)]">Directory</span>
-        <div className="flex gap-2">
-          <input
-            className={INPUT_CLS + " font-mono !text-[11.5px]"}
-            value={path}
-            onChange={(e) => setPath(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && void savePath()}
-            placeholder={project.path ? project.path : "no folder — agents use the default workspace"}
+  return (
+    <>
+      <SettingsCard>
+        <SettingRow title="Name" hint="Shown in the sidebar and the project picker — Enter to save">
+          <Input className="w-[240px]"
+            value={name}
+            disabled={busy}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void save();
+              if (e.key === "Escape") setName(project.name);
+            }}
+            onBlur={() => void save()}
             spellCheck={false}
           />
-          <button
-            className={SBUTTON + " shrink-0 gap-1.5 !px-3"}
-            onClick={() => void browse()}
-            disabled={busy}
-            title="Pick a folder…"
-          >
-            <FolderOpen size={13} /> Browse
-          </button>
-        </div>
-        {path.trim() !== (project.path ?? "") && (
-          <div className="flex items-center gap-1.5 text-[11px] text-[var(--text-dim)]">
-            <Folder size={11} className="shrink-0" />
-            <span className="min-w-0 flex-1 truncate">Current: {project.path || "not set"}</span>
-            <button
-              className="rounded bg-[var(--accent)] px-2 py-0.5 text-[11px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+        </SettingRow>
+        <Sep />
+        <SettingRow title="Directory" hint="The folder agents work in for this project">
+          <div className="flex w-[240px] items-center gap-1.5">
+            <Input className="min-w-0 flex-1 font-mono text-[11px]"
+              value={path}
               disabled={busy}
-              onClick={() => void savePath()}
-            >
-              Apply
-            </button>
+              onChange={(e) => setPath(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void savePath();
+                if (e.key === "Escape") setPath(project.path ?? "");
+              }}
+              onBlur={() => void savePath()}
+              placeholder="default workspace"
+              title={project.path || "No folder set"}
+              spellCheck={false}
+            />
+            <Button className="w-9 px-0" onClick={() => void browse()} disabled={busy} title="Pick a folder…">
+              <FolderOpen size={14} />
+            </Button>
           </div>
-        )}
-      </div>
+        </SettingRow>
+      </SettingsCard>
 
-      {/* Command permission: three explicit modes instead of a boolean. */}
-      <div className="flex flex-col gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2.5">
-        <div className="flex items-start gap-2">
-          <Shield size={16} className="mt-0.5 shrink-0 text-[var(--text-muted)]" />
-          <div className="flex flex-1 flex-col gap-0.5">
-            <span className="text-[12px] font-medium text-[var(--text-main)]">
-              Command permission
-            </span>
-            <span className="text-[11px] text-[var(--text-dim)]">
-              Who decides whether the agent may run shell commands in this project.
-            </span>
-          </div>
-        </div>
-        <div className="flex flex-col gap-1.5 pl-6">
-          {PERM_MODES.map((m) => (
-            <button
-              key={m.id}
-              className={"flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-left transition-colors " +
-                ((project.permMode ?? "default") === m.id
-                  ? "border-[var(--accent)] bg-[var(--accent)]/10"
-                  : "border-[var(--border)] hover:bg-[var(--hover-bg)]")}
-              onClick={() => void onPermMode(project.name, m.id)}
-            >
-              <span
-                className={"flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border " +
-                  ((project.permMode ?? "default") === m.id
-                    ? "border-[var(--accent)]"
-                    : "border-[var(--text-dim)]")}
-              >
-                {(project.permMode ?? "default") === m.id && (
-                  <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
-                )}
-              </span>
-              <span className="flex flex-col">
-                <span className="text-[12px] font-medium text-[var(--text-main)]">{m.label}</span>
-                <span className="text-[10px] text-[var(--text-dim)]">{m.hint}</span>
-              </span>
-            </button>
-          ))}
-        </div>
-      </div>
+      <SettingsCard>
+        <SettingRow title="Command permission" hint={modeInfo.hint}>
+          <Segmented
+            options={PERM_MODES.map((m) => m.label)}
+            value={modeInfo.label}
+            onChange={(label) => {
+              const next = PERM_MODES.find((m) => m.label === label);
+              if (next && next.id !== mode) void onPermMode(project.name, next.id);
+            }}
+          />
+        </SettingRow>
+      </SettingsCard>
 
       {error && (
-        <div className="rounded-md border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-3 py-2 text-[12px] text-[var(--diff-del)]">
-          {error}
-        </div>
+        <Alert>{error}</Alert>
       )}
 
-      {confirming ? (
-        <div className="flex items-center gap-2 rounded-lg border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-3 py-2.5">
-          <span className="flex-1 text-[12px] text-[var(--text-main)]">
-            Delete this project? Its chats move to "No project".
-          </span>
-          <button
-            className="rounded-md bg-[var(--diff-del)] px-2.5 py-1 text-[11px] font-medium text-white"
-            onClick={() => void remove()}
-          >
-            Delete
-          </button>
-          <button
-            className="rounded-md px-2 py-1 text-[11px] text-[var(--text-muted)] hover:bg-[var(--hover-bg)]"
-            onClick={() => setConfirming(false)}
-          >
-            Cancel
-          </button>
-        </div>
-      ) : (
-        <button
-          className="flex items-center gap-2 self-start rounded-lg px-3 py-1.5 text-[12px] text-[var(--diff-del)] transition-colors hover:bg-[var(--hover-bg)]"
-          onClick={() => setConfirming(true)}
+      <SettingsCard>
+        <SettingRow
+          title="Delete project"
+          hint={confirming ? "Sure? This cannot be undone." : 'Its chats are kept and move to "No project"'}
         >
-          <Trash2 size={13} /> Delete project
-        </button>
-      )}
-    </div>
+          {confirming ? (
+            <div className="flex items-center gap-1.5">
+              <Button onClick={() => setConfirming(false)} disabled={busy}>
+                Cancel
+              </Button>
+              <Button
+                className="gap-1.5 bg-[var(--diff-del)] text-white hover:opacity-90"
+                onClick={() => void remove()}
+                disabled={busy}
+              >
+                <Trash2 size={13} /> Delete
+              </Button>
+            </div>
+          ) : (
+            <Button
+              className="gap-1.5 text-[var(--diff-del)]"
+              onClick={() => setConfirming(true)}
+            >
+              <Trash2 size={13} /> Delete…
+            </Button>
+          )}
+        </SettingRow>
+      </SettingsCard>
+    </>
   );
 }
 

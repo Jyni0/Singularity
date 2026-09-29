@@ -14,8 +14,6 @@ import { toAttachments, formatSize } from "../utils/attachments.u";
 import { useDictation } from "../hooks/useDictation.h";
 import { BgTasksChip } from "./BackgroundTasks.c";
 import { useOverlayThumb } from "../hooks/useOverlayThumb.h";
-import { Thumb } from "../ui/Thumb.c";
-import { ScrollBox } from "../ui/ScrollArea.c";
 
 import { EffortChip } from "./EffortChip.c";
 import { ModelSelector } from "./ModelSelector.c";
@@ -23,6 +21,7 @@ import { ProjectPicker } from "./ProjectPicker.c";
 
 import { ComposerMenu, type ComposerItem } from "./ComposerMenu.c";
 import { detectTrigger, mentionText, rankFiles, replaceToken, splitPath } from "./composer.u";
+import { Thumb, ScrollBox, IconButton } from "../components";
 
 /** What a `/` action asks the app to do. */
 export type PromptCommand = "new" | "skills" | "mcp" | "compact";
@@ -510,17 +509,15 @@ export function PromptBox({
                   )}
                   <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100">
                     {!busy && (
-                      <button
-                        className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--accent)] transition-colors hover:bg-[var(--hover-bg)]"
-                        title="Send now"
+                      <IconButton
+                        label="Send now" size="xs" className="text-[var(--accent)]"
                         onClick={() => onRunQueued?.(q.id)}
                       >
                         <Play size={12} />
-                      </button>
+                      </IconButton>
                     )}
-                    <button
-                      className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-                      title="Edit — moves it back into the prompt box"
+                    <IconButton
+                      label="Edit — moves it back into the prompt box" size="xs"
                       onClick={() => {
                         const item = onTakeQueued?.(q.id);
                         if (!item) return;
@@ -533,14 +530,13 @@ export function PromptBox({
                       }}
                     >
                       <Pencil size={11} />
-                    </button>
-                    <button
-                      className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)]"
-                      title="Remove from the queue"
+                    </IconButton>
+                    <IconButton
+                      label="Remove from the queue" size="xs" tone="danger"
                       onClick={() => onTakeQueued?.(q.id)}
                     >
                       <X size={12} />
-                    </button>
+                    </IconButton>
                   </div>
                 </div>
               ))}
@@ -718,13 +714,12 @@ export function PromptBox({
                 e.target.value = "";
               }}
             />
-            <button
-              className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+            <IconButton
+              label="Attach files or images (or drag them onto the prompt)"
               onClick={() => fileInput.current?.click()}
-              title="Attach files or images (or drag them onto the prompt)"
             >
               <Plus size={16} strokeWidth={1.6} />
-            </button>
+            </IconButton>
             {/* Mic: records audio, then transcribes it fully on-device
                 (Whisper.cpp in Rust) — no provider, no network. */}
             <button

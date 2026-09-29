@@ -1,18 +1,15 @@
 import { motion } from "motion/react";
-import { Timer, CalendarClock, Play, Pause, Pencil, Trash2, LoaderCircle, MessageSquare, FolderOpen, Cpu } from "lucide-react";
-import { SBUTTON } from "../ui/tokens.s";
+import { Timer, CalendarClock, Play, Pause, Pencil, Trash2, MessageSquare, FolderOpen, Cpu } from "lucide-react";
 import type { Model, ScheduledTask } from "../core/types.i";
 import { describeSchedule, type ScheduleKind } from "../utils/cron.u";
 import { nextRunOf } from "../hooks/useScheduledTasks.h";
+import { Button, IconButton, Spinner } from "../components";
 
 const when = (d: Date | number | null) => {
   if (d === null) return "—";
   const date = typeof d === "number" ? new Date(d * 1000) : d;
   return date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 };
-
-const ICON_BTN =
-  "flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)] disabled:opacity-40";
 
 /** Scheduled Tasks — recurring agent jobs: list, pause, run now, edit, delete. */
 export function TasksView({
@@ -49,9 +46,9 @@ export function TasksView({
     >
       <div className="flex items-center gap-2 text-[18px] font-semibold text-[var(--text-main)]">
         <Timer size={18} strokeWidth={1.5} /> Scheduled Tasks
-        <button className={`${SBUTTON} ml-auto`} onClick={onNew}>
+        <Button className="ml-auto" onClick={onNew}>
           <CalendarClock size={14} className="mr-1.5" /> Schedule Task
-        </button>
+        </Button>
       </div>
       <div className="mb-4 mt-1 text-[13px] text-[var(--text-muted)]">
         Recurring agent jobs — each run opens a new chat in the task's project. They run while Singularity is open
@@ -59,14 +56,14 @@ export function TasksView({
       </div>
 
       {tasks.length === 0 && (
-        <div className="rounded-xl border border-dashed border-[var(--border)] p-10 text-center text-[13px] text-[var(--text-muted)]">
+        <div className="rounded-2xl border border-dashed border-[var(--border)] p-10 text-center text-[13px] text-[var(--text-muted)]">
           <CalendarClock size={22} strokeWidth={1.4} className="mx-auto mb-2 text-[var(--text-dim)]" />
           No scheduled tasks yet.
         </div>
       )}
 
       {tasks.length > 0 && (
-        <div className="flex flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-surface)]">
+        <div className="flex flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-surface)]">
           {tasks.map((t, i) => {
             const running = runningIds.includes(t.id);
             const next = nextRunOf(t);
@@ -84,7 +81,7 @@ export function TasksView({
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
                       <span className="truncate text-[13.5px] font-medium text-[var(--text-main)]">{t.name}</span>
-                      <span className="shrink-0 rounded border border-[var(--border)] px-1.5 text-[10.5px] text-[var(--text-muted)]">
+                      <span className="shrink-0 rounded-md border border-[var(--border)] px-1.5 text-[10.5px] text-[var(--text-muted)]">
                         {describeSchedule(t.kind as ScheduleKind, t.schedule)}
                       </span>
                       {!t.enabled && <span className="shrink-0 text-[10.5px] uppercase tracking-wide text-[var(--text-dim)]">paused</span>}
@@ -105,22 +102,22 @@ export function TasksView({
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-0.5">
-                    <button className={ICON_BTN} title="Run now" disabled={running} onClick={() => onRunNow(t)}>
-                      {running ? <LoaderCircle size={14} className="animate-spin" /> : <Play size={14} />}
-                    </button>
-                    <button className={ICON_BTN} title={t.enabled ? "Pause" : "Resume"} onClick={() => onToggle(t, !t.enabled)}>
+                    <IconButton label="Run now" disabled={running} onClick={() => onRunNow(t)}>
+                      {running ? <Spinner size={14} /> : <Play size={14} />}
+                    </IconButton>
+                    <IconButton label={t.enabled ? "Pause" : "Resume"} onClick={() => onToggle(t, !t.enabled)}>
                       {t.enabled ? <Pause size={14} /> : <CalendarClock size={14} />}
-                    </button>
-                    <button className={ICON_BTN} title="Edit" onClick={() => onEdit(t)}>
+                    </IconButton>
+                    <IconButton label="Edit" onClick={() => onEdit(t)}>
                       <Pencil size={13} />
-                    </button>
-                    <button
-                      className={ICON_BTN + " hover:!text-[var(--diff-del)]"}
-                      title="Delete"
+                    </IconButton>
+                    <IconButton
+                      className="hover:!text-[var(--diff-del)]"
+                      label="Delete"
                       onClick={() => onDelete(t)}
                     >
                       <Trash2 size={13} />
-                    </button>
+                    </IconButton>
                   </div>
                 </div>
               </div>

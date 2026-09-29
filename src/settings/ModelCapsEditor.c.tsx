@@ -8,10 +8,7 @@
 import { useEffect, useState } from "react";
 import { Image, FileText, Wrench, Brain, RotateCcw } from "lucide-react";
 import * as db from "../core/db.r";
-import { Switch } from "../ui/Switch.c";
-
-const SINPUT =
-  "h-8 w-full rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 text-[12px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
+import { Switch, Input, Button } from "../components";
 
 /** "128k" / "1M" / "200000" → tokens; "" → null (automatic). */
 function parseTokens(raw: string): number | null {
@@ -85,12 +82,11 @@ export function ModelCapsEditor({ kind, baseUrl, modelId, rowId }: { kind: strin
   ];
 
   return (
-    <div className="mx-2 mb-1.5 mt-0.5 flex flex-col gap-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2.5">
+    <div className="mx-2 mb-1.5 mt-0.5 flex flex-col gap-2.5 rounded-xl border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2.5">
       <div className="flex items-end gap-3">
         <label className="flex flex-1 flex-col gap-1">
           <span className="text-[11px] text-[var(--text-dim)]">Context window — tokens</span>
-          <input
-            className={`${SINPUT} font-mono`}
+          <Input className="font-mono"
             value={ctxDraft}
             placeholder={detected?.context ? `auto · ${fmt(detected.context)}` : "e.g. 128k"}
             onChange={(e) => setCtxDraft(e.target.value)}
@@ -103,8 +99,7 @@ export function ModelCapsEditor({ kind, baseUrl, modelId, rowId }: { kind: strin
         </label>
         <label className="flex flex-1 flex-col gap-1">
           <span className="text-[11px] text-[var(--text-dim)]">Longest answer — tokens</span>
-          <input
-            className={`${SINPUT} font-mono`}
+          <Input className="font-mono"
             value={outDraft}
             placeholder={detected?.maxOutput ? `auto · ${fmt(detected.maxOutput)}` : "provider default"}
             onChange={(e) => setOutDraft(e.target.value)}
@@ -135,12 +130,9 @@ export function ModelCapsEditor({ kind, baseUrl, modelId, rowId }: { kind: strin
           {caps ? "Set by hand." : "Automatic — from the model catalog where it knows the model."}
         </span>
         {caps && (
-          <button
-            className="flex items-center gap-1 text-[11px] text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
-            onClick={() => void reset()}
-          >
-            <RotateCcw size={11} /> Automatic
-          </button>
+          <Button variant="ghost" size="xs" icon={<RotateCcw size={11} />} onClick={() => void reset()}>
+            Automatic
+          </Button>
         )}
       </div>
     </div>

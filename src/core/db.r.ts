@@ -655,7 +655,6 @@ export function seedMemory(projects: Project[], providers: Provider[], models: M
   memory.models = models;
 }
 
-
 /* ---------- OAuth tokens (Google sign-in) ---------- */
 
 interface TokenRow {

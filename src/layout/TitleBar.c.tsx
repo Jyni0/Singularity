@@ -176,7 +176,7 @@ export function TitleBar({
         {Object.keys(MENUS).map((m) => (
           <div key={m} className="relative flex h-full items-center">
             <button
-              className={`mr-0.5 rounded px-2.5 py-1 text-[13px] transition-colors ${
+              className={`mr-0.5 rounded-md px-2.5 py-1 text-[13px] transition-colors ${
                 openMenu === m
                   ? "bg-[var(--hover-bg)] text-[var(--text-main)]"
                   : "text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
@@ -193,7 +193,7 @@ export function TitleBar({
             <AnimatePresence>
               {openMenu === m && (
                 <motion.div
-                  className="absolute left-0 top-[calc(100%+4px)] z-[300] flex min-w-[230px] flex-col gap-0.5 rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] p-1 shadow-[var(--shadow-popup)]"
+                  className="absolute left-0 top-[calc(100%+4px)] z-[300] flex min-w-[230px] flex-col gap-0.5 rounded-xl border border-[var(--border)] bg-[var(--bg-surface)] p-1 shadow-[var(--shadow-popup)]"
                   initial={{ opacity: 0, y: -4 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -4 }}
@@ -205,7 +205,7 @@ export function TitleBar({
                     ) : (
                       <button
                         key={item.label}
-                        className="flex w-full items-center gap-1.5 rounded-md px-2.5 py-1.5 text-left text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+                        className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
                         onClick={() => runItem(item)}
                       >
                         {m === "Mode" && (

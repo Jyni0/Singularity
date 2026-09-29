@@ -32,7 +32,7 @@ export function Modal({
     >
       <motion.div
         className={
-          "flex flex-col rounded-2xl border border-[var(--border)] bg-[var(--bg-surface)] shadow-[var(--shadow-popup)] " +
+          "flex flex-col rounded-3xl border border-[var(--border)] bg-[var(--bg-surface)] shadow-[var(--shadow-popup)] " +
           (overflowVisible ? "overflow-visible" : "overflow-hidden")
         }
         style={{ width: `min(${width}px, calc(100vw - 48px))` }}
@@ -45,7 +45,7 @@ export function Modal({
         <div className="flex items-center border-b border-[var(--border)] px-5 py-4">
           <span className="flex-1 text-[20px] font-semibold text-[var(--text-main)]">{title}</span>
           <button
-            className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+            className="flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
             onClick={onClose}
             title="Close"
           >

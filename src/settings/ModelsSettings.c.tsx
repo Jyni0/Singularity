@@ -22,16 +22,11 @@ import {
   Check,
   X,
   AlertTriangle,
-  Loader2,
   Eye,
   EyeOff,
-  Plug,
-  KeyRound,
   LogOut,
   CircleCheck,
   ChevronDown,
-  Gauge,
-  Pencil,
   Download,
   LogIn,
   SlidersHorizontal,
@@ -39,28 +34,29 @@ import {
 import type { Model, OAuthTokens, Provider, ProviderKind } from "../core/types.i";
 import { PROVIDER_TEMPLATES, isCliKind, compareModels } from "../core/types.i";
 import * as db from "../core/db.r";
-import { Switch } from "../ui/Switch.c";
-import { ScrollBox } from "../ui/ScrollArea.c";
 import { ModelCaps } from "./ModelCaps.c";
 import { ModelCapsEditor } from "./ModelCapsEditor.c";
+import { Switch, ScrollBox, Button, IconButton, Input, Spinner, Segmented, SettingRow, Sep, GoogleMark, ProviderLogo } from "../components";
 
-const SBUTTON =
-  "flex h-[30px] shrink-0 items-center justify-center gap-1.5 rounded-md bg-[var(--bg-elevated)] px-3 text-[12px] text-[var(--text-main)] transition-colors hover:bg-[var(--bg-input)] disabled:cursor-not-allowed disabled:opacity-50";
-const PRIMARY_BUTTON =
-  "flex h-[30px] shrink-0 items-center justify-center gap-1.5 rounded-md bg-[var(--accent)] px-3 text-[12px] text-white transition-colors hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-50";
-const SINPUT =
-  "h-8 w-full rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 text-[12px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
+/** "https://api.example.com/v1" → "api.example.com" (empty for CLIs). */
+function hostOf(url: string): string {
+  try {
+    return url ? new URL(url).host : "";
+  } catch {
+    return url;
+  }
+}
 
 function StatusDot({ status }: { status: Provider["status"] }) {
   const color =
     status === "ready"
-      ? "bg-[var(--accent)]"
+      ? "bg-[var(--diff-add)]"
       : status === "error"
         ? "bg-[var(--diff-del)]"
         : status === "checking"
           ? "animate-pulse bg-[var(--text-main)]"
           : "bg-[var(--text-dim)]";
-  return <span className={`h-2 w-2 shrink-0 rounded-full ${color}`} title={status} />;
+  return <span className={`block h-2.5 w-2.5 shrink-0 rounded-full ${color}`} title={status} />;
 }
 
 /**
@@ -85,30 +81,6 @@ function explainGoogleError(raw: string): string {
     return "The OAuth client type must be Desktop app — Web clients reject the loopback redirect we use.";
   }
   return raw;
-}
-
-/** Small inline "Google" mark for the sign-in button. */
-function GoogleMark() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 48 48" aria-hidden="true">
-      <path
-        fill="#4285F4"
-        d="M45 24.5c0-1.6-.1-2.8-.4-4H24v8.5h11.9c-.2 2-1.5 5-4.5 6.9l-.1.1 6.6 5.1.5.1C42.5 37.1 45 31.3 45 24.5"
-      />
-      <path
-        fill="#34A853"
-        d="M24 46c5.9 0 10.9-1.9 14.4-5.3l-6.9-5.3c-1.9 1.3-4.4 2.2-7.5 2.2-5.9 0-10.9-3.9-12.7-9.3l-.1.1-6.8 5.3-.1.1C7.9 40.9 15.4 46 24 46"
-      />
-      <path
-        fill="#FBBC05"
-        d="M11.3 28.3c-.5-1.4-.8-2.8-.8-4.3s.3-3 .7-4.3v-.1L4.3 14.2l-.1.1C2.8 17.2 2 20.5 2 24s.8 6.8 2.2 9.7z"
-      />
-      <path
-        fill="#EA4335"
-        d="M24 10.1c4.2 0 7 1.8 8.6 3.3l6.3-6.1C35 3.9 30 2 24 2 15.4 2 7.9 7.1 4.2 14.3l7.1 5.4c1.8-5.4 6.8-9.6 12.7-9.6"
-      />
-    </svg>
-  );
 }
 
 /* ---------- Google OAuth block ---------- */
@@ -213,17 +185,13 @@ function GoogleAuth({
           <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text-main)]">
             Connected as <span className="font-mono">{tokens?.email || "Google account"}</span>
           </span>
-          <button className={SBUTTON} onClick={() => pullModels(provider)} disabled={busy}>
-            {busy ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+          <Button onClick={() => pullModels(provider)} disabled={busy}>
+            {busy ? <Spinner size={13} /> : <RefreshCw size={13} />}
             Sync models
-          </button>
-          <button
-            className="flex h-[30px] w-[30px] items-center justify-center rounded-md text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
-            onClick={signOut}
-            title="Sign out"
-          >
+          </Button>
+          <IconButton tone="danger" label="Sign out" onClick={signOut}>
             <LogOut size={14} />
-          </button>
+          </IconButton>
         </div>
       ) : (
         <>
@@ -232,7 +200,7 @@ function GoogleAuth({
             is the reliable one — it is the public API and works on the free tier.
           </div>
 
-          <div className="flex flex-col gap-2 rounded-lg bg-[var(--bg-input)] px-3 py-2.5 text-[12px] text-[var(--text-muted)]">
+          <div className="flex flex-col gap-2 rounded-xl bg-[var(--bg-input)] px-3 py-2.5 text-[12px] text-[var(--text-muted)]">
             <div className="flex items-start gap-2">
               <span className="shrink-0 font-mono text-[var(--text-dim)]">1.</span>
               <span className="min-w-0 flex-1">
@@ -258,8 +226,10 @@ function GoogleAuth({
           </div>
 
           {/* Sign-in stays available, but only with the user's own client. */}
-          <button
-            className="flex items-center gap-1.5 self-start text-[11px] text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
+          <Button
+            variant="ghost"
+            size="xs"
+            className="-ml-2.5 self-start"
             onClick={() => setShowAdvanced(!showAdvanced)}
           >
             <ChevronDown
@@ -267,7 +237,7 @@ function GoogleAuth({
               className={`transition-transform ${showAdvanced ? "" : "-rotate-90"}`}
             />
             Sign in with Google instead (needs your own OAuth client)
-          </button>
+          </Button>
 
           <AnimatePresence initial={false}>
             {showAdvanced && (
@@ -294,15 +264,13 @@ function GoogleAuth({
                   </a>{" "}
                   and enable the Generative Language API in that project.
                 </div>
-                <input
-                  className={`${SINPUT} font-mono`}
+                <Input className="font-mono"
                   value={clientId}
                   placeholder="123456-abc123.apps.googleusercontent.com"
                   onChange={(e) => setClientId(e.target.value)}
                   autoComplete="off"
                 />
-                <input
-                  className={`${SINPUT} font-mono`}
+                <Input className="font-mono"
                   type="password"
                   value={clientSecret}
                   placeholder="GOCSPX-… (optional)"
@@ -310,23 +278,22 @@ function GoogleAuth({
                   autoComplete="off"
                 />
                 <div className="flex justify-end">
-                  <button
-                    className={SBUTTON}
+                  <Button
                     onClick={signIn}
                     disabled={busy || !clientId.trim()}
                     title={
                       clientId.trim()
-                        ? "Opens your browser to sign in"
-                        : "Paste your own client ID first"
+                      ? "Opens your browser to sign in"
+                      : "Paste your own client ID first"
                     }
                   >
                     {busy ? (
-                      <Loader2 size={13} className="animate-spin" />
+                      <Spinner size={13} />
                     ) : (
                       <GoogleMark />
                     )}
                     {stage === "browser" ? "Waiting for browser…" : "Sign in with Google"}
-                  </button>
+                  </Button>
                 </div>
               </motion.div>
             )}
@@ -335,7 +302,7 @@ function GoogleAuth({
       )}
 
       {error && (
-        <div className="flex items-start gap-2 rounded-lg px-2.5 py-2 text-[12px] text-[var(--diff-del)]">
+        <div className="flex items-start gap-2 rounded-xl px-2.5 py-2 text-[12px] text-[var(--diff-del)]">
           <AlertTriangle size={13} className="mt-0.5 shrink-0" />
           <span>{error}</span>
         </div>
@@ -365,6 +332,51 @@ const API_FORMATS: { kind: ProviderKind; label: string }[] = [
   { kind: "anthropic-messages", label: "Anthropic Messages" },
 ];
 
+/** A provider setting: title + hint on the left, a fixed-width control on the right. */
+function Row({ title, hint, children }: { title: React.ReactNode; hint?: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <SettingRow title={title} hint={hint}>
+      <div className="w-[300px]">{children}</div>
+    </SettingRow>
+  );
+}
+
+/** Password-style field with a show / hide toggle (API keys). */
+function SecretInput({
+  value,
+  onChange,
+  onBlur,
+  placeholder,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onBlur?: () => void;
+  placeholder?: string;
+}) {
+  const [show, setShow] = useState(false);
+  return (
+    <div className="relative">
+      <Input
+        className="pr-9 font-mono"
+        type={show ? "text" : "password"}
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        onBlur={onBlur}
+        autoComplete="off"
+      />
+      <IconButton
+        size="xs"
+        className="absolute right-1.5 top-1/2 -translate-y-1/2"
+        label={show ? "Hide key" : "Show key"}
+        onClick={() => setShow(!show)}
+      >
+        {show ? <EyeOff size={13} /> : <Eye size={13} />}
+      </IconButton>
+    </div>
+  );
+}
+
 function ChoiceRow<T extends string>({
   label,
   options,
@@ -379,21 +391,12 @@ function ChoiceRow<T extends string>({
   return (
     <div className="flex flex-col gap-1.5">
       <label className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">{label}</label>
-      <div className="flex flex-wrap gap-1.5">
-        {options.map((o) => (
-          <button
-            key={o.id}
-            className={`flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-[12px] transition-colors ${
-              value === o.id
-                ? "border-[var(--accent)] bg-[var(--hover-bg)] text-[var(--text-main)]"
-                : "border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
-            }`}
-            onClick={() => onPick(o.id)}
-          >
-            {o.label}
-          </button>
-        ))}
-      </div>
+      <Segmented
+        className="w-fit"
+        options={options.map((o) => ({ value: o.id, label: o.label }))}
+        value={value}
+        onChange={onPick}
+      />
     </div>
   );
 }
@@ -420,7 +423,6 @@ function AddProvider({
   const [name, setName] = useState(defaultName("openai", "openai-cli"));
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [showKey, setShowKey] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const pick = (c: AuthChoice, api: ProviderKind) => {
@@ -456,7 +458,7 @@ function AddProvider({
 
   return (
     <motion.div
-      className="flex flex-col gap-3 rounded-xl border border-[var(--accent)] bg-[var(--bg-surface)] px-4 py-3.5"
+      className="flex flex-col gap-3 rounded-2xl border border-[var(--border)] bg-[var(--bg-surface)] px-4 py-3.5"
       initial={{ opacity: 0, height: 0 }}
       animate={{ opacity: 1, height: "auto" }}
       exit={{ opacity: 0, height: 0 }}
@@ -464,12 +466,9 @@ function AddProvider({
     >
       <div className="flex items-center justify-between">
         <span className="text-[13px] font-medium text-[var(--text-main)]">Add a provider</span>
-        <button
-          className="rounded p-1 text-[var(--text-dim)] hover:text-[var(--text-main)]"
-          onClick={onCancel}
-        >
+        <IconButton label="Cancel" onClick={onCancel}>
           <X size={14} />
-        </button>
+        </IconButton>
       </div>
 
       <ChoiceRow label="Provider" options={AUTH_CHOICES} value={choice} onPick={(c) => pick(c, apiKind)} />
@@ -495,73 +494,40 @@ function AddProvider({
 
       <div className="text-[12px] text-[var(--text-dim)]">{template.hint}</div>
 
-      <div className="flex flex-col gap-1.5">
-        <label className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
-          Display name
-        </label>
-        <input className={SINPUT} value={name} onChange={(e) => setName(e.target.value)} />
+      <div className="flex flex-col gap-3 rounded-xl bg-[var(--bg-app)]/40 px-3 py-3">
+        <Row title="Name" hint="How it shows in the model picker">
+          <Input value={name} onChange={(e) => setName(e.target.value)} />
+        </Row>
+        {!cli && (
+          <Row title={template.local ? "Endpoint" : "Base URL"} hint="Where requests go">
+            <Input className="font-mono" value={baseUrl} placeholder="https://…" onChange={(e) => setBaseUrl(e.target.value)} />
+          </Row>
+        )}
+        {template.needsKey && (
+          <Row title="API key" hint="Stored locally, sent only to this provider">
+            <SecretInput value={apiKey} onChange={setApiKey} placeholder="sk-…" />
+          </Row>
+        )}
       </div>
 
-      {!cli && (
-        <div className="flex flex-col gap-1.5">
-          <label className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
-            {template.local ? "Endpoint" : "Base URL"}
-          </label>
-          <input
-            className={`${SINPUT} font-mono`}
-            value={baseUrl}
-            placeholder="https://…"
-            onChange={(e) => setBaseUrl(e.target.value)}
-          />
-        </div>
-      )}
-
-      {template.needsKey && (
-        <div className="flex flex-col gap-1.5">
-          <label className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
-            <KeyRound size={11} /> API key
-          </label>
-          <div className="relative">
-            <input
-              className={`${SINPUT} pr-9 font-mono`}
-              type={showKey ? "text" : "password"}
-              value={apiKey}
-              placeholder="sk-…"
-              onChange={(e) => setApiKey(e.target.value)}
-              autoComplete="off"
-            />
-            <button
-              className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-[var(--text-dim)] hover:text-[var(--text-main)]"
-              onClick={() => setShowKey(!showKey)}
-            >
-              {showKey ? <EyeOff size={13} /> : <Eye size={13} />}
-            </button>
-          </div>
-          <div className="text-[11px] text-[var(--text-dim)]">
-            Stored locally in the app database and sent only to this provider.
-          </div>
-        </div>
-      )}
-
       {cli && (
-        <div className="rounded-lg bg-[var(--bg-input)] px-3 py-2 text-[12px] text-[var(--text-muted)]">
+        <div className="rounded-xl bg-[var(--bg-input)] px-3 py-2 text-[12px] text-[var(--text-muted)]">
           No API key. After adding, the CLI downloads in the background — open the card and press{" "}
           <b>Sign in</b> to connect your account.
         </div>
       )}
 
       <div className="flex justify-end gap-2 pt-1">
-        <button className={SBUTTON} onClick={onCancel}>
+        <Button onClick={onCancel}>
           Cancel
-        </button>
-        <button
-          className={PRIMARY_BUTTON}
+        </Button>
+        <Button variant="primary"
           onClick={submit}
           disabled={busy || !name.trim() || (template.needsKey && !db.isLocalUrl(baseUrl) && !apiKey.trim())}
         >
-          {busy ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
+          {busy ? <Spinner size={13} /> : <Plus size={13} />}
           Add provider
-        </button>
+        </Button>
       </div>
     </motion.div>
   );
@@ -672,7 +638,7 @@ function CliAuth({
     <div className="flex flex-col gap-3 border-t border-[var(--border)] px-4 py-3">
       {!status ? (
         <div className="flex items-center gap-2 text-[12px] text-[var(--text-dim)]">
-          <Loader2 size={13} className="animate-spin" /> Checking {tool}…
+          <Spinner size={13} /> Checking {tool}…
         </div>
       ) : !status.installed ? (
         installing ? (
@@ -696,9 +662,9 @@ function CliAuth({
             <span className="min-w-0 flex-1 text-[12px] text-[var(--text-muted)]">
               {tool} is not installed yet.
             </span>
-            <button className={SBUTTON} onClick={() => void load(true)}>
+            <Button onClick={() => void load(true)}>
               <Download size={13} /> Download
-            </button>
+            </Button>
           </div>
         )
       ) : signedIn ? (
@@ -710,15 +676,17 @@ function CliAuth({
           {busy === "logout" && ownWindowLogin && (
             <span className="shrink-0 text-[11px] text-[var(--text-dim)]">If an agy window opens, type /logout there</span>
           )}
-          <button
-            className="flex h-[30px] shrink-0 items-center gap-1.5 rounded-md px-2 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)] disabled:opacity-50"
+          <Button
+            variant="ghost"
+            size="sm"
+            className="hover:text-[var(--diff-del)]"
+            icon={busy === "logout" ? <Spinner size={14} /> : <LogOut size={14} />}
             onClick={signOut}
             disabled={busy !== null}
             title="Sign out — then Sign in with another account"
           >
-            {busy === "logout" ? <Loader2 size={14} className="animate-spin" /> : <LogOut size={14} />}
             Sign out
-          </button>
+          </Button>
         </div>
       ) : (
         <div className="flex items-center gap-2">
@@ -729,10 +697,10 @@ function CliAuth({
                 : "Finish signing in in your browser…"
               : `Connect your ${account} account — requests then run on its subscription.`}
           </span>
-          <button className={PRIMARY_BUTTON} onClick={signIn} disabled={busy !== null}>
-            {busy === "login" ? <Loader2 size={13} className="animate-spin" /> : <LogIn size={13} />}
+          <Button variant="primary" onClick={signIn} disabled={busy !== null}>
+            {busy === "login" ? <Spinner size={13} /> : <LogIn size={13} />}
             {busy === "login" ? "Waiting for sign-in…" : "Sign in"}
-          </button>
+          </Button>
         </div>
       )}
 
@@ -743,7 +711,7 @@ function CliAuth({
       )}
 
       {error && (
-        <div className="flex items-start gap-2 rounded-lg px-2.5 py-2 text-[12px] text-[var(--diff-del)]">
+        <div className="flex items-start gap-2 rounded-xl px-2.5 py-2 text-[12px] text-[var(--diff-del)]">
           <AlertTriangle size={13} className="mt-0.5 shrink-0" />
           <span className="min-w-0 whitespace-pre-wrap break-words">{error}</span>
         </div>
@@ -776,12 +744,19 @@ function ProviderCard({
 }) {
   const [expanded, setExpanded] = useState(initiallyExpanded);
   const [key, setKey] = useState(provider.api_key);
-  const [showKey, setShowKey] = useState(false);
   const [url, setUrl] = useState(provider.base_url);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
-  /** Inline rename state. */
-  const [renaming, setRenaming] = useState(false);
+  /** Short result of a Refresh, shown where the button was, then gone. */
+  const [flash, setFlash] = useState<{ ok: boolean; text: string } | null>(null);
+  const flashTimer = useRef<number | undefined>(undefined);
+  const showFlash = (f: { ok: boolean; text: string }) => {
+    setFlash(f);
+    window.clearTimeout(flashTimer.current);
+    flashTimer.current = window.setTimeout(() => setFlash(null), 1600);
+  };
+  useEffect(() => () => window.clearTimeout(flashTimer.current), []);
+  /** Display name draft — saved on blur / Enter. */
   const [nameDraft, setNameDraft] = useState(provider.name);
   /** Manual model creation state. */
   const [showAddModel, setShowAddModel] = useState(false);
@@ -865,6 +840,7 @@ function ProviderCard({
     if (result.error || result.models.length === 0) {
       await persist({ status: "error" });
       setMessage({ kind: "err", text: explainGoogleError(result.error ?? "No models returned") });
+      showFlash({ ok: false, text: "Failed" });
     } else {
       await db.replaceModels(provider.id, result.models);
       // Swap this provider's models in the parent state so the list and the
@@ -874,7 +850,7 @@ function ProviderCard({
         ...result.models,
       ]);
       await persist({ status: "ready", last_sync: Math.floor(Date.now() / 1000) });
-      setMessage({ kind: "ok", text: `Found ${result.models.length} models` });
+      showFlash({ ok: true, text: `${result.models.length} models` });
     }
     setBusy(false);
   };
@@ -888,7 +864,6 @@ function ProviderCard({
   /** Saves the new display name; the id stays stable, so models survive. */
   const saveName = async () => {
     const next = nameDraft.trim();
-    setRenaming(false);
     if (!next || next === provider.name) {
       setNameDraft(provider.name);
       return;
@@ -900,89 +875,75 @@ function ProviderCard({
   const canRefresh = isGoogle ? provider.auth === "bearer" || !!key.trim() : true;
 
   return (
-    <div className="flex flex-col rounded-xl border border-[var(--border)] bg-[var(--bg-surface)]">
-      <div className="flex items-center gap-2.5 px-4 py-3">
-        <StatusDot status={provider.status} />
-        <button
-          className="flex min-w-0 flex-1 flex-col items-start text-left"
-          onClick={() => setExpanded(!expanded)}
-        >
-          {renaming ? (
-            // Inline rename: Enter or blur saves, Escape cancels.
-            <input
-              autoFocus
-              className="w-full max-w-[260px] rounded-md border border-[var(--accent)] bg-[var(--bg-input)] px-1.5 py-0.5 text-[13px] font-medium text-[var(--text-main)] outline-none"
-              value={nameDraft}
-              onClick={(e) => e.stopPropagation()}
-              onChange={(e) => setNameDraft(e.target.value)}
-              onBlur={() => void saveName()}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void saveName();
-                if (e.key === "Escape") {
-                  setNameDraft(provider.name);
-                  setRenaming(false);
-                }
-              }}
-            />
-          ) : (
-            <span className="flex items-center gap-1.5 truncate text-[13px] font-medium text-[var(--text-main)]">
-              {provider.name}
-              {isGoogle && provider.auth === "bearer" && tokens?.access_token && (
-                <span className="rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--accent)]">
-                  signed in
-                </span>
-              )}
-            </span>
-          )}
-          <span className="truncate font-mono text-[11px] text-[var(--text-dim)]">
-            {provider.kind}
-            {provider.base_url ? ` · ${provider.base_url}` : ""}
+    <div className="flex flex-col rounded-2xl border border-[var(--border)] bg-[var(--bg-surface)]">
+      {/* Header: the whole row opens the card; actions are same-size icon buttons. */}
+      <div
+        className={`group flex cursor-pointer items-center gap-3 px-3 py-2.5 transition-colors hover:bg-[var(--hover-bg)] ${
+          expanded ? "rounded-t-2xl" : "rounded-2xl"
+        }`}
+        onClick={() => setExpanded(!expanded)}
+      >
+        {/* Monogram tile with the connection status in its corner. */}
+        <span className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--bg-input)] text-[14px] font-semibold text-[var(--text-main)]">
+          {ProviderLogo({ kind: provider.kind, size: 18 }) ?? (provider.name.trim()[0] ?? "?").toUpperCase()}
+          <span className="absolute -bottom-0.5 -right-0.5 rounded-full border-2 border-[var(--bg-surface)]">
+            <StatusDot status={provider.status} />
           </span>
-        </button>
-        <span className="shrink-0 rounded-md bg-[var(--bg-elevated)] px-2 py-0.5 font-mono text-[11px] text-[var(--text-dim)]">
-          {mine.length} models
         </span>
-        <button
-          className={SBUTTON}
-          onClick={refresh}
-          disabled={busy || !canRefresh}
-          title={canRefresh ? "Fetch the model list" : "Connect this provider first"}
-        >
-          {busy ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
-          Refresh
-        </button>
-        <button
-          className="flex h-[30px] w-[30px] items-center justify-center rounded-md text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-          onClick={() => {
-            setNameDraft(provider.name);
-            setRenaming(true);
-          }}
-          title="Rename provider"
-        >
-          <Pencil size={14} />
-        </button>
-        <button
-          className="flex h-[30px] w-[30px] items-center justify-center rounded-md text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
-          onClick={remove}
-          title="Remove provider"
-        >
-          <Trash2 size={14} />
-        </button>
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="flex items-center gap-1.5 truncate text-[13px] font-medium text-[var(--text-main)]">
+            {provider.name}
+            {isGoogle && provider.auth === "bearer" && tokens?.access_token && (
+              <span className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--accent)]">
+                signed in
+              </span>
+            )}
+          </span>
+          <span className="truncate text-[11.5px] text-[var(--text-dim)]">
+            {template?.label ?? provider.kind}
+            {hostOf(provider.base_url) && ` · ${hostOf(provider.base_url)}`}
+            {` · ${mine.length} model${mine.length === 1 ? "" : "s"}`}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
+          {flash ? (
+            <motion.span
+              key={flash.text}
+              className={`flex h-7 items-center gap-1 px-1.5 text-[12px] ${flash.ok ? "text-[var(--diff-add)]" : "text-[var(--diff-del)]"}`}
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              transition={{ duration: 0.12 }}
+            >
+              {flash.ok ? <Check size={13} /> : <AlertTriangle size={13} />}
+              {flash.text}
+            </motion.span>
+          ) : (
+            <IconButton
+              label={canRefresh ? "Refresh the model list" : "Connect this provider first"}
+              onClick={refresh}
+              disabled={busy || !canRefresh}
+            >
+              {busy ? <Spinner size={14} /> : <RefreshCw size={14} />}
+            </IconButton>
+          )}
+          <IconButton tone="danger" label="Remove provider" onClick={remove}>
+            <Trash2 size={14} />
+          </IconButton>
+          <IconButton label={expanded ? "Collapse" : "Expand"} onClick={() => setExpanded(!expanded)}>
+            <ChevronDown size={15} className={`transition-transform ${expanded ? "rotate-180" : ""}`} />
+          </IconButton>
+        </div>
       </div>
 
       <AnimatePresence>
         {message && (
           <motion.div
-            className={`mx-4 mb-2 flex items-start gap-2 rounded-lg px-2.5 py-2 text-[12px] ${
-              message.kind === "ok"
-                ? "bg-[var(--hover-bg)] text-[var(--text-main)]"
-                : "text-[var(--diff-del)]"
-            }`}
+            className="mx-4 mb-2 flex items-start gap-2 rounded-xl px-2.5 py-2 text-[12px] text-[var(--diff-del)]"
             initial={{ opacity: 0, y: -4 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -4 }}
           >
-            {message.kind === "ok" ? <Check size={13} /> : <AlertTriangle size={13} />}
+            <AlertTriangle size={13} className="mt-0.5 shrink-0" />
             <span>{message.text}</span>
           </motion.div>
         )}
@@ -1013,211 +974,168 @@ function ProviderCard({
             exit={{ height: 0, opacity: 0 }}
             transition={{ duration: 0.18, ease: "easeOut" }}
           >
-            <div className="flex flex-col gap-3 border-t border-[var(--border)] px-4 py-3">
+            <div className="flex flex-col gap-3 border-t border-[var(--border-soft)] px-4 py-3.5">
+              {/* ---- Connection ---- */}
+              <Row title="Name" hint="How it shows in the model picker">
+                <Input
+                  value={nameDraft}
+                  onChange={(e) => setNameDraft(e.target.value)}
+                  onBlur={() => void saveName()}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") e.currentTarget.blur();
+                    if (e.key === "Escape") {
+                      setNameDraft(provider.name);
+                      requestAnimationFrame(() => (e.target as HTMLInputElement).blur());
+                    }
+                  }}
+                />
+              </Row>
               {!isCli && (
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
-                    Base URL
-                  </label>
-                  <input
-                    className={`${SINPUT} font-mono`}
-                    value={url}
-                    onChange={(e) => setUrl(e.target.value)}
-                    onBlur={() => persist({})}
-                  />
-                </div>
+                <Row title="Base URL" hint="Where requests go">
+                  <Input className="font-mono" value={url} onChange={(e) => setUrl(e.target.value)} onBlur={() => persist({})} />
+                </Row>
               )}
-
               {/* API key is an alternative to signing in for Google. */}
               {!isCli && (!isGoogle || provider.auth !== "bearer") && template?.needsKey !== false && (
-                <div className="flex flex-col gap-1.5">
-                  <label className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
-                    <KeyRound size={11} />
-                    {isGoogle ? "API key (alternative to signing in)" : "API key"}
-                  </label>
-                  <div className="relative">
-                    <input
-                      className={`${SINPUT} pr-9 font-mono`}
-                      type={showKey ? "text" : "password"}
-                      value={key}
-                      onChange={(e) => setKey(e.target.value)}
-                      onBlur={() => persist({})}
-                      placeholder="not set"
-                      autoComplete="off"
-                    />
-                    <button
-                      className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-[var(--text-dim)] hover:text-[var(--text-main)]"
-                      onClick={() => setShowKey(!showKey)}
-                    >
-                      {showKey ? <EyeOff size={13} /> : <Eye size={13} />}
-                    </button>
-                  </div>
-                </div>
+                <Row title="API key" hint={isGoogle ? "Instead of signing in" : "Stored locally, sent only to this provider"}>
+                  <SecretInput value={key} onChange={setKey} onBlur={() => persist({})} placeholder="not set" />
+                </Row>
               )}
 
               {/* Subscriptions (CLIs) are automatic: always on, the vendor */}
               {/* meters them, and the model list comes from the CLI. */}
               {!isCli && (
                 <>
-                  <div className="flex items-center justify-between rounded-lg bg-[var(--bg-input)] px-3 py-2">
-                    <span className="flex items-center gap-2 text-[12px] text-[var(--text-muted)]">
-                      <Plug size={13} />
-                      Enabled for the model picker
-                    </span>
-                    <Switch
-                      on={provider.enabled}
-                      onChange={(next) => persist({ enabled: next })}
-                      ariaLabel="toggle provider"
-                    />
-                  </div>
+                  <SettingRow title="Show in the model picker" hint="Off hides its models without deleting them">
+                    <Switch on={provider.enabled} onChange={(next) => persist({ enabled: next })} ariaLabel="toggle provider" />
+                  </SettingRow>
 
+                  <Sep />
                   {/* Rate limits — enforced in Rust (limiter.rs) before every */}
                   {/* provider call: chat streams, the agent loop and parallel */}
                   {/* decomposed subtasks all share this budget. */}
-                  <div className="flex flex-col gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2.5">
-                    <div className="flex items-center justify-between">
-                      <span className="flex items-center gap-2 text-[12px] font-medium text-[var(--text-main)]">
-                        <Gauge size={13} className="text-[var(--text-muted)]" />
-                        No limits
-                      </span>
-                      <Switch
-                        on={noLimits}
-                        onChange={(next) => {
-                          setRpmDraft(next ? "0" : String(rpmDraft === "0" ? 60 : rpmDraft));
-                          setConcDraft(next ? "0" : String(concDraft === "0" ? 3 : concDraft));
-                          persist(next ? { rate_limit_rpm: 0, concurrency: 0 } : { rate_limit_rpm: 60, concurrency: 3 });
-                        }}
-                        ariaLabel="toggle provider limits"
-                      />
-                    </div>
-                    <div className={"flex items-end gap-3 " + (noLimits ? "pointer-events-none opacity-40" : "")}>
-                      <label className="flex flex-1 flex-col gap-1">
-                        <span className="text-[11px] text-[var(--text-dim)]">Rate limit — requests / min</span>
-                        <input
-                          className={SINPUT + " !w-full"}
+                  <SettingRow
+                    title="Limit requests"
+                    hint={noLimits ? "Unlimited — requests go out as fast as they come" : "Extra requests wait instead of failing"}
+                  >
+                    <Switch
+                      on={!noLimits}
+                      onChange={(limit) => {
+                        setRpmDraft(limit ? String(rpmDraft === "0" ? 60 : rpmDraft) : "0");
+                        setConcDraft(limit ? String(concDraft === "0" ? 3 : concDraft) : "0");
+                        persist(limit ? { rate_limit_rpm: 60, concurrency: 3 } : { rate_limit_rpm: 0, concurrency: 0 });
+                      }}
+                      ariaLabel="toggle provider limits"
+                    />
+                  </SettingRow>
+                  {!noLimits && (
+                    <>
+                      <SettingRow title="Requests per minute" hint="0 = no cap">
+                        <Input
+                          className="w-[110px]"
                           type="number"
                           min={0}
                           value={rpmDraft}
                           onChange={(e) => setRpmDraft(e.target.value)}
                           onBlur={() => persist({ rate_limit_rpm: clampLimit(rpmDraft) })}
                         />
-                      </label>
-                      <label className="flex flex-1 flex-col gap-1">
-                        <span className="text-[11px] text-[var(--text-dim)]">Concurrency — parallel requests</span>
-                        <input
-                          className={SINPUT + " !w-full"}
+                      </SettingRow>
+                      <SettingRow title="Parallel requests" hint="Also caps how many subtasks run at once · 0 = no cap">
+                        <Input
+                          className="w-[110px]"
                           type="number"
                           min={0}
                           value={concDraft}
                           onChange={(e) => setConcDraft(e.target.value)}
                           onBlur={() => persist({ concurrency: clampLimit(concDraft) })}
                         />
-                      </label>
-                    </div>
-                    <span className="text-[10.5px] leading-[1.5] text-[var(--text-dim)]">
-                      Requests beyond the limit wait instead of failing; concurrency
-                      also caps how many decomposed subtasks run at once. 0 = unlimited.
-                    </span>
-                  </div>
+                      </SettingRow>
+                    </>
+                  )}
                 </>
               )}
 
-
-              {mine.length > 0 && (
-                <div className="flex flex-col gap-1">
-                  <span className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
-                    Models
-                  </span>
-                  <ScrollBox className="flex max-h-[320px] flex-col gap-0.5 pr-1">
-                    {mine.map((m) => (
-                      <div key={m.id} className="flex flex-col">
-                        <div className="group flex items-center gap-2 rounded-md px-2 py-1 text-[12px] text-[var(--text-main)] hover:bg-[var(--hover-bg)]">
-                          <span className="min-w-0 flex-1 truncate font-mono" title={m.model_id}>{m.name}</span>
-                          <ModelCaps kind={provider.kind} baseUrl={provider.base_url} modelId={m.model_id} rowId={m.id} />
-                          {/* API models: context, answer length and abilities are set by hand. */}
-                          {isApi && (
-                            <button
-                              className={`flex h-5 w-5 shrink-0 items-center justify-center rounded transition-opacity hover:text-[var(--text-main)] ${
-                                capsOpen === m.id ? "text-[var(--accent)]" : "text-[var(--text-dim)] opacity-0 group-hover:opacity-100"
-                              }`}
-                              onClick={() => setCapsOpen(capsOpen === m.id ? null : m.id)}
-                              title="Context, images, files, tools…"
-                            >
-                              <SlidersHorizontal size={11} />
-                            </button>
-                          )}
-                          <button
-                            className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-[var(--text-dim)] opacity-0 transition-opacity hover:text-[var(--diff-del)] group-hover:opacity-100"
-                            onClick={() => removeModelRow(m.id)}
-                            title="Remove model"
-                          >
-                            <Trash2 size={11} />
-                          </button>
-                        </div>
-                        {isApi && capsOpen === m.id && (
-                          <ModelCapsEditor kind={provider.kind} baseUrl={provider.base_url} modelId={m.model_id} rowId={m.id} />
-                        )}
-                      </div>
-                    ))}
-                  </ScrollBox>
+              {/* ---- Models ---- */}
+              <Sep />
+              <div className="flex items-center gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="text-[13px] text-[var(--text-main)]">Models</div>
+                  <div className="mt-0.5 text-[12px] leading-snug text-[var(--text-dim)]">
+                    {provider.last_sync
+                      ? `${mine.length} · synced ${new Date(provider.last_sync * 1000).toLocaleString()}`
+                      : isCli
+                        ? "Load from the CLI once it is installed and signed in"
+                        : "Press Refresh to fetch the list, or add models by hand"}
+                  </div>
                 </div>
-              )}
-
-              {/* Manual model creation — for gateways without a list endpoint. */}
-              {!isCli && (
-                <div className="flex flex-col gap-1.5">
-                  <button
-                    className="flex items-center gap-1.5 self-start text-[11px] text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
-                    onClick={() => setShowAddModel(!showAddModel)}
-                  >
-                    <Plus
-                      size={11}
-                      className={`transition-transform ${showAddModel ? "rotate-45" : ""}`}
-                    />
-                    Add model manually
-                  </button>
-                  <AnimatePresence initial={false}>
-                    {showAddModel && (
-                      <motion.div
-                        className="flex items-center gap-2 overflow-hidden"
-                        initial={{ height: 0, opacity: 0 }}
-                        animate={{ height: "auto", opacity: 1 }}
-                        exit={{ height: 0, opacity: 0 }}
-                        transition={{ duration: 0.15, ease: "easeOut" }}
-                      >
-                        <input
-                          className={`${SINPUT} w-[38%] font-mono`}
-                          placeholder="model id — e.g. claude-sonnet-4-5"
-                          value={newModelId}
-                          onChange={(e) => setNewModelId(e.target.value)}
-                        />
-                        <input
-                          className={`${SINPUT} flex-1 font-mono`}
-                          placeholder="display name (optional)"
-                          value={newModelName}
-                          onChange={(e) => setNewModelName(e.target.value)}
-                        />
-                        <button
-                          className={SBUTTON}
-                          onClick={addModelRow}
-                          disabled={!newModelId.trim()}
-                          title="Add this model to the picker"
-                        >
-                          <Plus size={13} />
-                        </button>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </div>
-              )}
-
-              <div className="text-[11px] text-[var(--text-dim)]">
-                {provider.last_sync
-                  ? `Last synced ${new Date(provider.last_sync * 1000).toLocaleString()}`
-                  : isCli
-                    ? "The model list loads from the CLI once it is installed and signed in."
-                    : "Never synced — press Refresh to fetch the model list, or add models manually."}
+                {/* Manual model creation — for gateways without a list endpoint. */}
+                {!isCli && (
+                  <Button size="sm" icon={<Plus size={13} className={`transition-transform ${showAddModel ? "rotate-45" : ""}`} />} onClick={() => setShowAddModel(!showAddModel)}>
+                    {showAddModel ? "Cancel" : "Add model"}
+                  </Button>
+                )}
               </div>
+              <AnimatePresence initial={false}>
+                {showAddModel && (
+                  <motion.div
+                    className="flex items-center gap-2 overflow-hidden"
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ duration: 0.15, ease: "easeOut" }}
+                  >
+                    <Input
+                      size="sm"
+                      className="flex-1 font-mono"
+                      placeholder="model id — e.g. claude-sonnet-4-5"
+                      value={newModelId}
+                      onChange={(e) => setNewModelId(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && void addModelRow()}
+                    />
+                    <Input
+                      size="sm"
+                      className="flex-1"
+                      placeholder="display name (optional)"
+                      value={newModelName}
+                      onChange={(e) => setNewModelName(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && void addModelRow()}
+                    />
+                    <Button size="sm" variant="primary" onClick={addModelRow} disabled={!newModelId.trim()}>
+                      Add
+                    </Button>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+              {mine.length > 0 && (
+                <ScrollBox className="-mx-2 flex max-h-[320px] flex-col gap-0.5 px-0.5">
+                  {mine.map((m) => (
+                    <div key={m.id} className="flex flex-col">
+                      <div className="group flex h-8 items-center gap-2 rounded-lg px-2 text-[12px] text-[var(--text-main)] hover:bg-[var(--hover-bg)]">
+                        <span className="min-w-0 flex-1 truncate font-mono" title={m.model_id}>{m.name}</span>
+                        <ModelCaps kind={provider.kind} baseUrl={provider.base_url} modelId={m.model_id} rowId={m.id} />
+                        {/* API models: context, answer length and abilities are set by hand. */}
+                        {isApi && (
+                          <IconButton
+                            size="xs"
+                            reveal={capsOpen !== m.id}
+                            className={capsOpen === m.id ? "text-[var(--accent)]" : ""}
+                            label="Context, images, files, tools…"
+                            onClick={() => setCapsOpen(capsOpen === m.id ? null : m.id)}
+                          >
+                            <SlidersHorizontal size={12} />
+                          </IconButton>
+                        )}
+                        <IconButton size="xs" tone="danger" reveal label="Remove model" onClick={() => removeModelRow(m.id)}>
+                          <Trash2 size={12} />
+                        </IconButton>
+                      </div>
+                      {isApi && capsOpen === m.id && (
+                        <ModelCapsEditor kind={provider.kind} baseUrl={provider.base_url} modelId={m.model_id} rowId={m.id} />
+                      )}
+                    </div>
+                  ))}
+                </ScrollBox>
+              )}
             </div>
           </motion.div>
         )}
@@ -1296,7 +1214,7 @@ export function ModelsSettings({
   return (
     <div className="flex flex-col gap-3">
       {!persistent && (
-        <div className="flex items-start gap-2 rounded-xl border border-[var(--border)] px-4 py-3 text-[12px] text-[var(--text-muted)]">
+        <div className="flex items-start gap-2 rounded-2xl border border-[var(--border)] px-4 py-3 text-[12px] text-[var(--text-muted)]">
           <AlertTriangle size={14} className="mt-0.5 shrink-0" />
           <span>
             Running outside the desktop shell, so changes live in memory only. Launch with{" "}
@@ -1311,9 +1229,9 @@ export function ModelsSettings({
           {models.length === 1 ? "" : "s"}
         </div>
         {!adding && (
-          <button className={PRIMARY_BUTTON} onClick={() => setAdding(true)}>
+          <Button variant="primary" onClick={() => setAdding(true)}>
             <Plus size={13} /> Add provider
-          </button>
+          </Button>
         )}
       </div>
 
@@ -1336,7 +1254,7 @@ export function ModelsSettings({
       ))}
 
       {providers.length === 0 && !adding && (
-        <div className="rounded-xl border border-dashed border-[var(--border)] px-4 py-8 text-center text-[13px] text-[var(--text-dim)]">
+        <div className="rounded-2xl border border-dashed border-[var(--border)] px-4 py-8 text-center text-[13px] text-[var(--text-dim)]">
           No providers yet. Sign in with OpenAI, Anthropic or Google, run Ollama, or add an API endpoint.
         </div>
       )}

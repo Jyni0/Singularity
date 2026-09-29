@@ -1,4 +1,4 @@
-import { ThumbState } from "../hooks/useOverlayThumb.h";
+import { ThumbState } from "../../hooks/useOverlayThumb.h";
 
 /**
  * The overlay scrollbar: a vertical thumb hugging the right edge and a

@@ -244,13 +244,13 @@ export function isCliKind(kind: ProviderKind): boolean {
 export type ProviderStatus = "ready" | "disconnected" | "error" | "checking";
 
 /** Reasoning effort requested from the model, where the provider supports it. */
-export type Effort = "low" | "medium" | "high" | "xhigh" | "max" | "ultracode";
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "ultracode";
 
-export const EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max", "ultracode"];
+export const EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max", "ultra", "ultracode"];
 
 /**
  * Effort levels a model accepts, lowest first. The provider sets the range:
- * OpenAI (Codex) adds xHigh; Anthropic (Claude Code) adds Extra, Max and
+ * OpenAI (Codex) adds Extra High and Ultra; Anthropic (Claude Code) adds Extra, Max and
  * Ultracode; Google (Antigravity), Ollama and API endpoints stop at High.
  * A subscription model's meta can narrow it to what that model has
  * (`subscription;efforts=low,high`; an empty list = the model takes none).
@@ -258,7 +258,7 @@ export const EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max", "ultr
 export function effortsFor(kind?: ProviderKind, meta?: string): Effort[] {
   const range: Effort[] =
     kind === "openai-cli"
-      ? ["low", "medium", "high", "xhigh"]
+      ? ["low", "medium", "high", "xhigh", "ultra"]
       : kind === "anthropic-cli"
         ? ["low", "medium", "high", "xhigh", "max", "ultracode"]
         : ["low", "medium", "high"];

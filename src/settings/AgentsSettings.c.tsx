@@ -7,12 +7,7 @@
 import { useState } from "react";
 import { Bot, Plus, Trash2 } from "lucide-react";
 import * as db from "../core/db.r";
-import { SBUTTON, SINPUT } from "../ui/tokens.s";
-import { Switch } from "../ui/Switch.c";
-import { SettingRow, SettingsCard, Sep } from "./SettingsParts.c";
-
-const TEXTAREA =
-  "w-full resize-y rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 text-[12px] leading-relaxed text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
+import { Switch, SettingRow, SettingsCard, Sep, Button, Input, TextArea, IconButton } from "../components";
 
 export function AgentsSettings({
   subagents,
@@ -50,11 +45,10 @@ export function AgentsSettings({
           title="Max retry attempts"
           hint="When the API fails (502, 429, broken JSON, cut connection) the request is sent again every 5s, up to this many times. 0 = never retry."
         >
-          <input
+          <Input
             type="number"
             min={0}
-            max={20}
-            className={`${SINPUT} w-[90px]`}
+            max={20} className="w-[90px]"
             value={maxRetries}
             onChange={(e) => {
               const n = Math.min(20, Math.max(0, Math.floor(Number(e.target.value) || 0)));
@@ -67,11 +61,10 @@ export function AgentsSettings({
           title="Max agents at once"
           hint="How many agents may work in parallel (1–52). Above 1 a built-in “worker” helper is always available, and the agent splits work across helpers and runs independent tool calls side by side. They share the provider's rate limits — raise its Concurrency too."
         >
-          <input
+          <Input
             type="number"
             min={1}
-            max={52}
-            className={`${SINPUT} w-[90px]`}
+            max={52} className="w-[90px]"
             value={maxAgents}
             onChange={(e) => {
               const n = Math.min(52, Math.max(1, Math.floor(Number(e.target.value)) || 1));
@@ -89,13 +82,13 @@ export function AgentsSettings({
               Optional helpers. The agent reads each description and decides which task, if any, to give them.
             </div>
           </div>
-          <button className={SBUTTON} onClick={add}>
+          <Button onClick={add}>
             <Plus size={13} className="mr-1" /> Add subagent
-          </button>
+          </Button>
         </div>
 
         {subagents.length === 0 && (
-          <div className="rounded-lg border border-dashed border-[var(--border)] px-3 py-4 text-center text-[12px] text-[var(--text-dim)]">
+          <div className="rounded-xl border border-dashed border-[var(--border)] px-3 py-4 text-center text-[12px] text-[var(--text-dim)]">
             No subagents yet — the agent works alone.
           </div>
         )}
@@ -106,7 +99,7 @@ export function AgentsSettings({
             <div key={s.id} className="flex flex-col">
               {i > 0 && <Sep />}
               <div
-                className="group flex cursor-pointer items-center gap-2 rounded-lg px-1.5 py-2 transition-colors hover:bg-[var(--hover-bg)]"
+                className="group flex cursor-pointer items-center gap-2 rounded-xl px-1.5 py-2 transition-colors hover:bg-[var(--hover-bg)]"
                 onClick={() => setOpenId(open ? null : s.id)}
               >
                 <Bot size={14} className={s.enabled ? "text-[var(--accent)]" : "text-[var(--text-dim)]"} />
@@ -117,23 +110,21 @@ export function AgentsSettings({
                 <span onClick={(e) => e.stopPropagation()}>
                   <Switch on={s.enabled} onChange={(on) => update(s.id, { enabled: on })} ariaLabel="enable subagent" />
                 </span>
-                <button
-                  className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-dim)] opacity-0 transition-all hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)] group-hover:opacity-100"
-                  title="Delete subagent"
+                <IconButton
+                  label="Delete subagent" size="xs" tone="danger" reveal
                   onClick={(e) => {
                     e.stopPropagation();
                     onChange(subagents.filter((x) => x.id !== s.id));
                   }}
                 >
                   <Trash2 size={12} />
-                </button>
+                </IconButton>
               </div>
               {open && (
                 <div className="flex flex-col gap-2.5 px-1.5 pb-2 pt-1">
                   <label className="flex flex-col gap-1 text-[11px] text-[var(--text-dim)]">
                     Name
-                    <input
-                      className={`${SINPUT} w-full`}
+                    <Input
                       value={s.name}
                       placeholder="e.g. Tester"
                       onChange={(e) => update(s.id, { name: e.target.value.replace(/[^\p{L}\p{N} _-]/gu, "") })}
@@ -141,8 +132,7 @@ export function AgentsSettings({
                   </label>
                   <label className="flex flex-col gap-1 text-[11px] text-[var(--text-dim)]">
                     When to use it (shown to the main agent)
-                    <input
-                      className={`${SINPUT} w-full`}
+                    <Input
                       value={s.description}
                       placeholder="e.g. Writes and runs unit tests for changed code"
                       onChange={(e) => update(s.id, { description: e.target.value })}
@@ -150,8 +140,7 @@ export function AgentsSettings({
                   </label>
                   <label className="flex flex-col gap-1 text-[11px] text-[var(--text-dim)]">
                     Prompt (the subagent's own instructions)
-                    <textarea
-                      className={TEXTAREA}
+                    <TextArea
                       rows={6}
                       value={s.prompt}
                       placeholder="You are a testing specialist. Prefer small focused tests…"

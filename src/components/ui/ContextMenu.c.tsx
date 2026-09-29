@@ -69,7 +69,7 @@ export function ContextMenu({
         <motion.div
           ref={ref}
           style={{ position: "fixed", top: pos.top, left: pos.left }}
-          className="z-[600] flex min-w-[200px] flex-col gap-0.5 rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] p-1 shadow-[var(--shadow-popup)]"
+          className="z-[600] flex min-w-[200px] flex-col gap-0.5 rounded-2xl border border-[var(--border)] bg-[var(--bg-surface)] p-1.5 shadow-[var(--shadow-popup)]"
           initial={{ opacity: 0, scale: 0.97 }}
           animate={{ opacity: 1, scale: 1 }}
           exit={{ opacity: 0, scale: 0.97 }}
@@ -83,7 +83,7 @@ export function ContextMenu({
               <button
                 key={it.label}
                 disabled={it.disabled}
-                className={`flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-[12.5px] transition-colors hover:bg-[var(--hover-bg)] disabled:pointer-events-none disabled:opacity-40 ${
+                className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12.5px] transition-colors hover:bg-[var(--hover-bg)] disabled:pointer-events-none disabled:opacity-40 ${
                   it.danger ? "text-[var(--diff-del)]" : "text-[var(--text-main)]"
                 }`}
                 onClick={() => {

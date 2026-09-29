@@ -3,8 +3,7 @@ import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { MessageSquare, Folder, ChevronDown, Check } from "lucide-react";
 import { Project, NO_PROJECT } from "../core/types.i";
-import { POPOVER, POPOVER_LABEL, popoverItem, popMotion } from "../ui/tokens.s";
-import { ScrollBox } from "../ui/ScrollArea.c";
+import { POPOVER, POPOVER_LABEL, popoverItem, popMotion, ScrollBox } from "../components";
 
 export function ProjectPicker({
   projects,
@@ -39,7 +38,7 @@ export function ProjectPicker({
     <div className="relative" ref={ref}>
       {/* Breadcrumb: h 32px, folder 15, name 13 medium, chevron 12 */}
       <button
-        className="flex h-8 items-center gap-1.5 rounded-lg px-2 text-[13px] font-medium text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+        className="flex h-8 items-center gap-1.5 rounded-xl px-2 text-[13px] font-medium text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
         onClick={() => setOpen(!open)}
       >
         {project === NO_PROJECT ? (

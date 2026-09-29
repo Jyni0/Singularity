@@ -9,15 +9,9 @@
  * can be pasted in as-is.
  */
 import { useCallback, useEffect, useState } from "react";
-import { Plug, Plus, Trash2, Save, X, PlayCircle, LoaderCircle, ClipboardPaste, Eye, EyeOff, Check } from "lucide-react";
+import { Plug, Plus, Trash2, Save, X, PlayCircle, ClipboardPaste, Eye, EyeOff, Check } from "lucide-react";
 import * as db from "../core/db.r";
-import { SBUTTON, SINPUT } from "../ui/tokens.s";
-import { Switch } from "../ui/Switch.c";
-import { SettingsCard, Sep, Segmented } from "./SettingsParts.c";
-
-const TEXTAREA =
-  "w-full resize-y rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 font-mono text-[12px] leading-relaxed text-[var(--text-main)] outline-none focus:border-[var(--accent)]";
-const LABEL = "flex flex-col gap-1 text-[11px] text-[var(--text-dim)]";
+import { Switch, SettingsCard, Sep, Segmented, Button, Input, TextArea, Alert, ConfirmBar, Spinner, IconButton, Field } from "../components";
 
 /** Editor state: lists edited as plain text, one entry per line. */
 interface Draft {
@@ -170,18 +164,16 @@ export function McpSettings() {
     if (t.busy)
       return (
         <div className="flex items-center gap-2 px-1.5 pb-2 text-[12px] text-[var(--text-dim)]">
-          <LoaderCircle size={12} className="animate-spin" /> Starting the server and listing its tools… (the first start of an npx/uvx
+          <Spinner size={12} /> Starting the server and listing its tools… (the first start of an npx/uvx
           server can take a minute)
         </div>
       );
     if (t.error)
       return (
-        <div className="mx-1.5 mb-2 whitespace-pre-wrap rounded-md border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-3 py-2 font-mono text-[11.5px] text-[var(--diff-del)]">
-          {t.error}
-        </div>
+        <Alert className="mx-1.5 mb-2 whitespace-pre-wrap font-mono text-[11.5px]">{t.error}</Alert>
       );
     return (
-      <div className="mx-1.5 mb-2 rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2">
+      <div className="mx-1.5 mb-2 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2">
         <div className="mb-1 flex items-center gap-1.5 text-[12px] text-[var(--diff-add)]">
           <Check size={12} /> Connected — {t.tools?.length ?? 0} tools
         </div>
@@ -200,38 +192,36 @@ export function McpSettings() {
 
   const secretInput = (value: string, onChange: (v: string) => void, placeholder: string) => (
     <div className="relative">
-      <textarea
-        className={TEXTAREA + (showSecrets ? "" : " [-webkit-text-security:disc]")}
+      <TextArea
+        mono
+        className={showSecrets ? "" : "[-webkit-text-security:disc]"}
         rows={3}
         value={value}
         placeholder={placeholder}
-        spellCheck={false}
         onChange={(e) => onChange(e.target.value)}
       />
-      <button
-        type="button"
-        className="absolute right-2 top-2 text-[var(--text-dim)] hover:text-[var(--text-main)]"
-        title={showSecrets ? "Hide values" : "Show values"}
+      <IconButton
+        size="xs"
+        className="absolute right-1.5 top-1.5"
+        label={showSecrets ? "Hide values" : "Show values"}
         onClick={() => setShowSecrets((v) => !v)}
       >
         {showSecrets ? <EyeOff size={13} /> : <Eye size={13} />}
-      </button>
+      </IconButton>
     </div>
   );
 
   const editor = draft && (
     <div className="flex flex-col gap-2.5 px-1.5 pb-2 pt-1">
       <div className="grid grid-cols-[1fr_auto] items-end gap-2.5">
-        <label className={LABEL}>
-          Name (tools appear as mcp__name__tool)
-          <input
-            className={`${SINPUT} w-full`}
+        <Field label="Name (tools appear as mcp__name__tool)">
+          <Input
             value={draft.name}
             placeholder="github"
             onChange={(e) => setDraft({ ...draft, name: e.target.value })}
             autoFocus={draft.id === ""}
           />
-        </label>
+        </Field>
         <Segmented
           options={["stdio", "http"]}
           value={draft.transport}
@@ -241,54 +231,48 @@ export function McpSettings() {
       {draft.transport === "stdio" ? (
         <>
           <div className="grid grid-cols-[200px_1fr] gap-2.5">
-            <label className={LABEL}>
-              Command
-              <input className={`${SINPUT} w-full font-mono`} value={draft.command} placeholder="npx" onChange={(e) => setDraft({ ...draft, command: e.target.value })} />
-            </label>
-            <label className={LABEL}>
-              Arguments — one per line
-              <textarea
-                className={TEXTAREA}
+            <Field label="Command">
+              <Input className="font-mono" value={draft.command} placeholder="npx" onChange={(e) => setDraft({ ...draft, command: e.target.value })} />
+            </Field>
+            <Field label="Arguments — one per line">
+              <TextArea mono
                 rows={3}
                 value={draft.args}
                 placeholder={"-y\n@modelcontextprotocol/server-filesystem\nC:\\Users\\me\\notes"}
                 spellCheck={false}
                 onChange={(e) => setDraft({ ...draft, args: e.target.value })}
               />
-            </label>
+            </Field>
           </div>
-          <label className={LABEL}>
-            Environment — KEY=value per line (stored encrypted)
+          <Field label="Environment — KEY=value per line (stored encrypted)">
             {secretInput(draft.env, (env) => setDraft({ ...draft, env }), "GITHUB_PERSONAL_ACCESS_TOKEN=ghp_…")}
-          </label>
+          </Field>
         </>
       ) : (
         <>
-          <label className={LABEL}>
-            URL (Streamable HTTP endpoint)
-            <input className={`${SINPUT} w-full font-mono`} value={draft.url} placeholder="https://example.com/mcp" onChange={(e) => setDraft({ ...draft, url: e.target.value })} />
-          </label>
-          <label className={LABEL}>
-            Headers — Name: value per line (stored encrypted)
+          <Field label="URL (Streamable HTTP endpoint)">
+            <Input className="font-mono" value={draft.url} placeholder="https://example.com/mcp" onChange={(e) => setDraft({ ...draft, url: e.target.value })} />
+          </Field>
+          <Field label="Headers — Name: value per line (stored encrypted)">
             {secretInput(draft.headers, (headers) => setDraft({ ...draft, headers }), "Authorization: Bearer …")}
-          </label>
+          </Field>
         </>
       )}
       {testView("draft")}
       <div className="flex items-center gap-2">
-        <button className={SBUTTON} onClick={() => void test("draft", { ...fromDraft(draft), id: "" })}>
+        <Button onClick={() => void test("draft", { ...fromDraft(draft), id: "" })}>
           <PlayCircle size={13} className="mr-1" /> Test
-        </button>
+        </Button>
         <span className="flex-1" />
-        <button className={SBUTTON} onClick={close}>
+        <Button onClick={close}>
           <X size={13} className="mr-1" /> Cancel
-        </button>
-        <button
-          className="flex h-9 items-center rounded-md bg-[var(--accent)] px-3 text-[12px] text-white transition-colors hover:bg-[var(--accent-hover)]"
+        </Button>
+        <Button
+          variant="primary"
           onClick={() => void save()}
         >
-          <Save size={13} className="mr-1.5" /> Save server
-        </button>
+          <Save size={13} /> Save server
+        </Button>
       </div>
     </div>
   );
@@ -304,11 +288,10 @@ export function McpSettings() {
               asking.
             </div>
           </div>
-          <button className={SBUTTON} onClick={() => setPasting((v) => !v)} title="Paste an mcpServers JSON config">
+          <Button onClick={() => setPasting((v) => !v)} title="Paste an mcpServers JSON config">
             <ClipboardPaste size={13} className="mr-1" /> Paste JSON
-          </button>
-          <button
-            className={SBUTTON}
+          </Button>
+          <Button
             onClick={() => {
               setEditing("");
               setError(null);
@@ -317,45 +300,42 @@ export function McpSettings() {
             }}
           >
             <Plus size={13} className="mr-1" /> Add server
-          </button>
+          </Button>
         </div>
 
         {pasting && (
           <div className="flex flex-col gap-2">
-            <textarea
-              className={TEXTAREA}
+            <TextArea mono
               rows={8}
               value={paste}
               spellCheck={false}
               autoFocus
-              placeholder={`{\n  "mcpServers": {\n    "github": {\n      "command": "npx",\n      "args": ["-y", "@modelcontextprotocol/server-github"],\n      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "…" }\n    }\n  }\n}`}
+              placeholder={`{\n "mcpServers": {\n "github": {\n "command": "npx",\n "args": ["-y", "@modelcontextprotocol/server-github"],\n "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "…" }\n }\n }\n}`}
               onChange={(e) => setPaste(e.target.value)}
             />
             <div className="flex justify-end gap-2">
-              <button className={SBUTTON} onClick={() => setPasting(false)}>
+              <Button onClick={() => setPasting(false)}>
                 Cancel
-              </button>
-              <button
-                className="flex h-9 items-center rounded-md bg-[var(--accent)] px-3 text-[12px] text-white hover:bg-[var(--accent-hover)] disabled:opacity-50"
+              </Button>
+              <Button
+                variant="primary"
                 disabled={!paste.trim()}
                 onClick={() => void importPasted()}
               >
                 Import
-              </button>
+              </Button>
             </div>
           </div>
         )}
 
         {error && (
-          <div className="rounded-md border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-3 py-2 text-[12px] text-[var(--diff-del)]">
-            {error}
-          </div>
+          <Alert>{error}</Alert>
         )}
 
         {editing === "" && editor}
 
         {servers.length === 0 && editing !== "" && (
-          <div className="rounded-lg border border-dashed border-[var(--border)] px-3 py-4 text-center text-[12px] text-[var(--text-dim)]">
+          <div className="rounded-xl border border-dashed border-[var(--border)] px-3 py-4 text-center text-[12px] text-[var(--text-dim)]">
             No MCP servers yet — add one or paste a config.
           </div>
         )}
@@ -364,26 +344,20 @@ export function McpSettings() {
           <div key={s.id} className="flex flex-col">
             {i > 0 && <Sep />}
             {confirmDel === s.id ? (
-              <div className="flex items-center gap-2 rounded-lg border border-[var(--diff-del)]/40 bg-[var(--diff-del)]/10 px-2.5 py-1.5 text-[12.5px] text-[var(--text-main)]">
-                <span className="min-w-0 flex-1 truncate">Remove the MCP server “{s.name}”?</span>
-                <button
-                  className="shrink-0 rounded-md bg-[var(--diff-del)] px-2.5 py-1 text-[11px] font-medium text-white"
-                  onClick={async () => {
-                    await db.deleteMcpServer(s.id).catch((e) => setError(String(e)));
-                    setConfirmDel(null);
-                    if (editing === s.id) close();
-                    reload();
-                  }}
-                >
-                  Remove
-                </button>
-                <button className="shrink-0 rounded-md px-2 py-1 text-[11px] text-[var(--text-muted)] hover:bg-[var(--hover-bg)]" onClick={() => setConfirmDel(null)}>
-                  Cancel
-                </button>
-              </div>
+              <ConfirmBar
+                message={<>Remove the MCP server “{s.name}”?</>}
+                confirmLabel="Remove"
+                onConfirm={async () => {
+                  await db.deleteMcpServer(s.id).catch((e) => setError(String(e)));
+                  setConfirmDel(null);
+                  if (editing === s.id) close();
+                  reload();
+                }}
+                onCancel={() => setConfirmDel(null)}
+              />
             ) : (
               <div
-                className="group flex cursor-pointer items-center gap-2 rounded-lg px-1.5 py-2 transition-colors hover:bg-[var(--hover-bg)]"
+                className="group flex cursor-pointer items-center gap-2 rounded-xl px-1.5 py-2 transition-colors hover:bg-[var(--hover-bg)]"
                 onClick={() => {
                   if (editing === s.id) return close();
                   setError(null);
@@ -394,33 +368,35 @@ export function McpSettings() {
               >
                 <Plug size={14} className={s.enabled ? "shrink-0 text-[var(--accent)]" : "shrink-0 text-[var(--text-dim)]"} />
                 <span className="shrink-0 text-[13px] font-medium text-[var(--text-main)]">{s.name}</span>
-                <span className="shrink-0 rounded border border-[var(--border)] px-1.5 text-[10px] uppercase text-[var(--text-dim)]">{s.transport}</span>
+                <span className="shrink-0 rounded-md border border-[var(--border)] px-1.5 text-[10px] uppercase text-[var(--text-dim)]">{s.transport}</span>
                 <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-[var(--text-dim)]">
                   {s.transport === "http" ? s.url : [s.command, ...s.args].join(" ")}
                 </span>
-                <button
-                  className="flex h-6 items-center gap-1 rounded-md px-1.5 text-[11px] text-[var(--text-dim)] opacity-0 transition-all hover:bg-[var(--bg-input)] hover:text-[var(--text-main)] group-hover:opacity-100"
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  icon={<PlayCircle size={12} />}
+                  className="opacity-0 group-hover:opacity-100"
                   title="Start the server and list its tools"
                   onClick={(e) => {
                     e.stopPropagation();
                     void test(s.id, s);
                   }}
                 >
-                  <PlayCircle size={12} /> Test
-                </button>
+                  Test
+                </Button>
                 <span onClick={(e) => e.stopPropagation()}>
                   <Switch on={s.enabled} onChange={(on) => void toggle(s, on)} ariaLabel="enable MCP server" />
                 </span>
-                <button
-                  className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-dim)] opacity-0 transition-all hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)] group-hover:opacity-100"
-                  title="Remove server"
+                <IconButton
+                  label="Remove server" size="xs" tone="danger" reveal
                   onClick={(e) => {
                     e.stopPropagation();
                     setConfirmDel(s.id);
                   }}
                 >
                   <Trash2 size={12} />
-                </button>
+                </IconButton>
               </div>
             )}
             {testView(s.id)}

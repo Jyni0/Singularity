@@ -6,8 +6,7 @@ import type { AppMode, Effort, Model, ScheduledTask, Project, Provider, SshConn,
 import { NO_PROJECT, THEMES } from "../core/types.i";
 import { toGateways } from "../utils/gateways.u";
 import { useBlockContextMenu } from "../hooks/useBlockContextMenu.h";
-import { ScrollArea } from "../ui/ScrollArea.c";
-import { GenerationGlow, type GenAnimation } from "../ui/GenerationGlow.c";
+import { GenerationGlow, type GenAnimation } from "../components/effects/GenerationGlow.c";
 
 import type { PanelState, PanelTabSpec } from "../chat/message.i";
 import { storedToMsg, fileLabel, toolLabel } from "../chat/message.u";
@@ -34,6 +33,7 @@ import { NewProjectModal } from "../settings/NewProjectModal.c";
 import { ScheduleModal } from "../settings/ScheduleModal.c";
 import { SettingsModal } from "../settings/SettingsModal.c";
 import type { SettingsSection } from "../settings/SettingsModal.c";
+import { ScrollArea, Button, cx } from "../components";
 
 /** Loose chats (no folder). Kept as a real entry so every row action just works. */
 const NO_PROJECT_ENTRY: Project = {
@@ -41,7 +41,6 @@ const NO_PROJECT_ENTRY: Project = {
   path: "",
   conversations: [],
 };
-
 
 /* ---------- Custom title bar ---------- */
 
@@ -251,7 +250,6 @@ export default function App() {
   const confirmReq = streaming ? confirmReqs[activeRuns[activeConv!.id]] ?? null : null;
   /** Ids of conversations with a live run — drives the sidebar pulse. */
   const runningConvIds = Object.keys(activeRuns);
-
 
   // Adaptive re-clamp: shrinking the window (or growing the sidebar) must
   // never leave the SSH panel wider than the space that remains — otherwise
@@ -607,8 +605,6 @@ export default function App() {
       cancelled = true;
     };
   }, []);
-
-
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -994,7 +990,7 @@ export default function App() {
       />
       {/* overflow-hidden: the row must never scroll — a focus jump into the
           right-hand panel used to shift the whole page sideways. */}
-      <div className="flex min-h-0 flex-1 overflow-hidden">
+      <div className="flex min-h-0 flex-1 overflow-hidden bg-[var(--bg-sidebar)]">
         {sidebarHidden ? null : mode === "ssh" ? (
           /* SSH Client mode: Units / Logs nav + the server list, laid out
              exactly like the Agent sidebar's conversations. */
@@ -1069,7 +1065,14 @@ export default function App() {
           />
         )}
 
-        <div className="flex min-w-0 flex-1 flex-col bg-[var(--bg-app)]">
+        <div
+          className={cx(
+            "flex min-w-0 flex-1 flex-col overflow-hidden bg-[var(--bg-app)]",
+            // The page sits in the corner between the sidebar and the title
+            // bar like a sheet: rounded top-left, a hairline along both edges.
+            !sidebarHidden && "rounded-tl-2xl border-l border-t border-[var(--border-soft)]",
+          )}
+        >
           {/* No navbar in SSH Client mode at all: every page there carries its
               own heading (Units / Logs / the unit's settings), and the terminal
               and files pages are full-window. The agent views keep the title. */}
@@ -1347,7 +1350,7 @@ export default function App() {
                   >
                     <div
                       className={
-                        "mx-auto flex w-full max-w-[760px] items-center gap-3 rounded-xl border bg-[var(--bg-surface)] px-3.5 py-2.5 shadow-[var(--shadow-popup)] " +
+                        "mx-auto flex w-full max-w-[760px] items-center gap-3 rounded-2xl border bg-[var(--bg-surface)] px-3.5 py-2.5 shadow-[var(--shadow-popup)] " +
                         (confirmReq.reason ? "border-[var(--diff-del)]/60" : "border-[var(--accent)]/50")
                       }
                     >
@@ -1375,18 +1378,18 @@ export default function App() {
                           <span className="block truncate text-[10.5px] text-[var(--text-dim)]">{confirmReq.cwd}</span>
                         )}
                       </div>
-                      <button
-                        className="shrink-0 rounded-lg bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-white transition-opacity hover:opacity-90"
+                      <Button
+                        variant="primary" size="sm"
                         onClick={() => chat.confirm(confirmReq.run_id, true)}
                       >
                         Allow
-                      </button>
-                      <button
-                        className="shrink-0 rounded-lg border border-[var(--border)] px-3 py-1.5 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)]"
+                      </Button>
+                      <Button
+                        variant="secondary" size="sm"
                         onClick={() => chat.confirm(confirmReq.run_id, false)}
                       >
                         Deny
-                      </button>
+                      </Button>
                     </div>
                   </motion.div>
                 )}
@@ -1561,13 +1564,13 @@ export default function App() {
 function SshGone({ onBack }: { onBack: () => void }) {
   return (
     <div className="flex flex-1 items-center justify-center p-10">
-      <div className="max-w-sm rounded-xl border border-dashed border-[var(--border)] p-8 text-center">
+      <div className="max-w-sm rounded-2xl border border-dashed border-[var(--border)] p-8 text-center">
         <div className="text-[14px] font-medium text-[var(--text-main)]">Server not found</div>
         <div className="mt-1 text-[12.5px] text-[var(--text-muted)]">
           This unit is no longer saved — it may have been deleted.
         </div>
         <button
-          className="mt-4 h-8 rounded-md border border-[var(--border)] px-3 text-[12px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+          className="mt-4 h-8 rounded-lg border border-[var(--border)] px-3 text-[12px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
           onClick={onBack}
         >
           Back to Units

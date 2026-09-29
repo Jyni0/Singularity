@@ -3,9 +3,7 @@ import { motion, AnimatePresence } from "motion/react";
 import { Plus, Folder, FolderOpen, History, Timer, ListFilter, FolderPlus, ChevronRight, Settings, Copy, MoreHorizontal, Pin, Pencil, Trash2, FolderCog, CopyPlus, ChevronLast, LoaderCircle } from "lucide-react";
 import { Conversation, Project, ViewKind, CONV_LIMIT, NO_PROJECT, ageLabel } from "../core/types.i";
 import { useNow } from "../hooks/useNow.h";
-import { ROW, ROW_TEXT, ROW_HOVER, ROW_ACTIVE, SINPUT, ROW_ICON } from "../ui/tokens.s";
-import { ScrollArea } from "../ui/ScrollArea.c";
-import { RowMenu } from "../ui/RowMenu.c";
+import { ROW_ICON, ScrollArea, RowMenu, Input, Button, NavItem, RowActions } from "../components";
 
 export function Sidebar({
   width,
@@ -109,9 +107,8 @@ export function Sidebar({
         onMouseLeave={() => setHoveredConv(null)}
       >
         {isRenaming ? (
-          <input
-            autoFocus
-            className={`${SINPUT} h-8 w-full text-[13px]`}
+          <Input
+            autoFocus className="h-8 text-[13px]"
             value={renameValue}
             onChange={(e) => setRenameValue(e.target.value)}
             onBlur={() => {
@@ -125,16 +122,10 @@ export function Sidebar({
             }}
           />
         ) : (
-          <button
-            className={`${ROW} w-full ${
-              topLevel ? "" : "pl-8"
-            } ${
-              active
-                ? ROW_ACTIVE
-                : convActive
-                  ? "bg-[var(--row-solid-hover)] text-[var(--text-main)]"
-                  : ROW_HOVER
-            }`}
+          <NavItem
+            active={active}
+            hovered={convActive}
+            className={topLevel ? "" : "pl-8"}
             onClick={() => onSelectConversation(projectName, c.id)}
           >
             {/* No icon — plain text, same as nested conversation rows */}
@@ -159,15 +150,11 @@ export function Sidebar({
             <span className="ml-auto shrink-0 font-mono text-[11px] text-[var(--text-dim)]">
               {ageLabel(c.updatedAt, now)}
             </span>
-          </button>
+          </NavItem>
         )}
 
         {!isRenaming && (
-          <div
-            className={`absolute right-0.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5 bg-gradient-to-l from-[var(--row-solid-gradient)] via-[var(--row-solid-gradient)] to-transparent pl-4 transition-opacity duration-100 ${
-              convActive ? "opacity-100" : "pointer-events-none opacity-0"
-            }`}
-          >
+          <RowActions show={convActive}>
             <button
               className={ROW_ICON}
               title={c.pinned ? "Unpin chat" : "Pin chat"}
@@ -189,7 +176,7 @@ export function Sidebar({
             >
               <MoreHorizontal size={14} strokeWidth={1.5} />
             </button>
-          </div>
+          </RowActions>
         )}
 
         <RowMenu
@@ -221,7 +208,7 @@ export function Sidebar({
     hidden > 0 ? (
       <button
         key={`see-all-${key}`}
-        className={`flex h-7 items-center gap-1.5 rounded-md pr-2 text-[12px] text-[var(--accent)] transition-colors hover:bg-[var(--hover-bg)] ${
+        className={`flex h-7 items-center gap-1.5 rounded-lg pr-2 text-[12px] text-[var(--accent)] transition-colors hover:bg-[var(--hover-bg)] ${
           key === NO_PROJECT ? "pl-2" : "pl-6"
         }`}
         onClick={() => setShowAll((s) => ({ ...s, [key]: true }))}
@@ -235,7 +222,7 @@ export function Sidebar({
     showAll[key] && total > CONV_LIMIT ? (
       <button
         key={`show-less-${key}`}
-        className={`flex h-7 items-center gap-1.5 rounded-md pr-2 text-[12px] text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)] ${
+        className={`flex h-7 items-center gap-1.5 rounded-lg pr-2 text-[12px] text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)] ${
           key === NO_PROJECT ? "pl-2" : "pl-6"
         }`}
         onClick={() => setShowAll((s) => ({ ...s, [key]: false }))}
@@ -252,29 +239,30 @@ export function Sidebar({
     >
       {/* Header block (fixed — scrollbar never overlaps it) */}
       <div className="px-2.5 pt-3">
-        <button
-          className="mb-2 flex h-8 w-full items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] px-3 text-left text-[13px] font-medium text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
+        <Button
+          size="sm"
+          className="mb-2 h-8 w-full justify-start text-[13px] font-medium"
+          icon={<Plus size={14} strokeWidth={1.5} />}
           onClick={onNewConversation}
         >
-          <Plus size={14} strokeWidth={1.5} className="shrink-0" />
-          <span>New Conversation</span>
-        </button>
+          New Conversation
+        </Button>
 
         <nav className="flex flex-col gap-2">
-          <button
-            className={`${ROW} ${view === "history" ? ROW_ACTIVE : ROW_HOVER}`}
+          <NavItem
+            active={view === "history"}
+            icon={<History size={16} strokeWidth={1.5} className="shrink-0" />}
             onClick={() => onShowView("history")}
           >
-            <History size={16} strokeWidth={1.5} className="shrink-0" />
             <span>Conversation History</span>
-          </button>
-          <button
-            className={`${ROW} ${view === "tasks" ? ROW_ACTIVE : ROW_HOVER}`}
+          </NavItem>
+          <NavItem
+            active={view === "tasks"}
+            icon={<Timer size={16} strokeWidth={1.5} className="shrink-0" />}
             onClick={() => onShowView("tasks")}
           >
-            <Timer size={16} strokeWidth={1.5} className="shrink-0" />
             <span>Scheduled Tasks</span>
-          </button>
+          </NavItem>
         </nav>
       </div>
 
@@ -288,7 +276,7 @@ export function Sidebar({
               appears while the row is hovered. */}
           <div className="group mb-1 mt-3 flex h-6 shrink-0 items-center pl-1 pr-0.5">
             <button
-              className="flex h-6 items-center gap-1 rounded text-[12px] font-medium text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
+              className="flex h-6 items-center gap-1 rounded-md text-[12px] font-medium text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
               onClick={() => setProjectsOpen(!projectsOpen)}
               title={projectsOpen ? "Collapse projects" : "Expand projects"}
             >
@@ -303,7 +291,7 @@ export function Sidebar({
             </button>
             <span className="ml-auto flex items-center gap-2">
               <button
-                className={`flex items-center justify-center rounded p-0.5 opacity-60 transition-all hover:opacity-100 ${
+                className={`flex items-center justify-center rounded-md p-0.5 opacity-60 transition-all hover:opacity-100 ${
                   sortAZ ? "text-[var(--accent)]" : "text-[var(--text-muted)]"
                 }`}
                 onClick={() => setSortAZ(!sortAZ)}
@@ -312,7 +300,7 @@ export function Sidebar({
                 <ListFilter size={14} strokeWidth={1.5} />
               </button>
               <button
-                className="flex items-center justify-center rounded p-0.5 text-[var(--text-muted)] opacity-60 transition-all hover:opacity-100"
+                className="flex items-center justify-center rounded-md p-0.5 text-[var(--text-muted)] opacity-60 transition-all hover:opacity-100"
                 onClick={onNewProject}
                 title="New project"
               >
@@ -351,23 +339,16 @@ export function Sidebar({
                   >
                     {/* Level 1 — project row; actions float above the text */}
                     <div className="group relative">
-                      <button
-                        className={`${ROW} w-full ${ROW_TEXT}`}
-                        onClick={() => toggle(p.name)}
-                      >
+                      <NavItem quiet onClick={() => toggle(p.name)}>
                         {isOpen ? (
                           <FolderOpen size={15} strokeWidth={1.5} className="shrink-0" />
                         ) : (
                           <Folder size={15} strokeWidth={1.5} className="shrink-0" />
                         )}
                         <span className="truncate">{p.name}</span>
-                      </button>
+                      </NavItem>
 
-                      <div
-                        className={`absolute right-0.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5 rounded-md transition-opacity duration-100 ${
-                          projectActive ? "opacity-100" : "pointer-events-none opacity-0"
-                        }`}
-                      >
+                      <RowActions show={projectActive} fade={false}>
                         <button
                           className={`${ROW_ICON} bg-[var(--row-solid)]`}
                           title="New chat in this project"
@@ -389,7 +370,7 @@ export function Sidebar({
                         >
                           <MoreHorizontal size={14} strokeWidth={1.5} />
                         </button>
-                      </div>
+                      </RowActions>
 
                       <RowMenu
                         open={projectMenu === p.name}
@@ -442,7 +423,7 @@ export function Sidebar({
           {/* Conversations header — loose chats, mirroring the Projects section */}
           <div className="group mb-1 mt-3 flex h-6 shrink-0 items-center pl-1 pr-0.5">
             <button
-              className="flex h-6 items-center gap-1 rounded text-[12px] font-medium text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
+              className="flex h-6 items-center gap-1 rounded-md text-[12px] font-medium text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
               onClick={() => setConvsOpen(!convsOpen)}
               title={convsOpen ? "Collapse conversations" : "Expand conversations"}
             >
@@ -457,7 +438,7 @@ export function Sidebar({
             </button>
             <span className="ml-auto flex items-center gap-2">
               <button
-                className="flex items-center justify-center rounded p-0.5 text-[var(--text-muted)] opacity-60 transition-all hover:opacity-100"
+                className="flex items-center justify-center rounded-md p-0.5 text-[var(--text-muted)] opacity-60 transition-all hover:opacity-100"
                 onClick={() => onNewConversationInProject(NO_PROJECT)}
                 title="New chat without a project"
               >
@@ -490,10 +471,9 @@ export function Sidebar({
 
       {/* Footer: Settings — always pinned to the very bottom of the sidebar */}
       <div className="mt-auto shrink-0 px-2.5 pb-3 pt-1">
-        <button className={`${ROW} w-full ${ROW_HOVER}`} onClick={onOpenSettings}>
-          <Settings size={16} strokeWidth={1.5} className="shrink-0" />
+        <NavItem icon={<Settings size={16} strokeWidth={1.5} className="shrink-0" />} onClick={onOpenSettings}>
           <span>Settings</span>
-        </button>
+        </NavItem>
       </div>
 
       <div className="sidebar-resizer" onMouseDown={startResize} />

@@ -13,8 +13,7 @@ import { Activity, Square, X } from "lucide-react";
 import * as db from "../core/db.r";
 import { inTauri } from "../utils/env.u";
 import { formatDuration } from "../utils/format.u";
-import { LIP_CHIP, POPOVER, POPOVER_LABEL, popoverItem, popMotion } from "../ui/tokens.s";
-import { OverlayScroll, ScrollBox } from "../ui/ScrollArea.c";
+import { LIP_CHIP, POPOVER, POPOVER_LABEL, popoverItem, popMotion, OverlayScroll, ScrollBox, IconButton } from "../components";
 
 const POLL_MS = 2000;
 
@@ -102,16 +101,15 @@ export function BgTasksChip({ onOpen }: { onOpen?: (task: db.BgTask) => void }) 
                     <span className="shrink-0 text-[10.5px]" style={{ color: st.color }}>
                       {st.text}
                     </span>
-                    <button
-                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] opacity-0 transition-all hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)] group-hover:opacity-100"
-                      title={t.running ? "Stop this task" : "Clear from the list"}
+                    <IconButton
+                      label={t.running ? "Stop this task" : "Clear from the list"} size="xs" tone="danger" reveal
                       onClick={(e) => {
                         e.stopPropagation();
                         void (t.running ? db.bgStop(t.id) : db.bgRemove(t.id)).then(refresh).catch(() => {});
                       }}
                     >
                       {t.running ? <Square size={10} /> : <X size={12} />}
-                    </button>
+                    </IconButton>
                   </div>
                 );
               })}
@@ -180,7 +178,7 @@ export function BgTaskView({ id }: { id: number }) {
         )}
         {task && (
           <button
-            className="flex h-6 shrink-0 items-center gap-1 rounded-md px-2 text-[11px] text-[var(--text-muted)] transition-colors hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)]"
+            className="flex h-6 shrink-0 items-center gap-1 rounded-lg px-2 text-[11px] text-[var(--text-muted)] transition-colors hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)]"
             title={task.running ? "Stop this task (and everything it started)" : "Clear from the list"}
             onClick={() => void (task.running ? db.bgStop(id) : db.bgRemove(id)).catch(() => {})}
           >

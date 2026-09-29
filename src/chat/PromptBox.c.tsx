@@ -2,12 +2,13 @@ import { useState, useEffect, useRef, useMemo } from "react";
 import type { ReactNode } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
-  Send, X, Square, Mic, Loader2, Paperclip, FileText, Folder, GitBranch, SquarePen, Zap, Rabbit, Scale, Brain,
+  Send, Plus, X, Square, Mic, Loader2, Paperclip, FileText, Folder, GitBranch, SquarePen, Zap, Rabbit, Scale, Brain,
   Sparkles, Plug, ListChecks, SearchCode, BookOpen, Wrench, FlaskConical, GitCommitHorizontal,
   ListPlus, Pencil, Play, CornerDownRight, Minimize2,
 } from "lucide-react";
 import * as db from "../core/db.r";
 import type { Project, Gateway, Attachment, Effort } from "../core/types.i";
+import { clampEffort, effortsFor } from "../core/types.i";
 import type { ChatSelection, QueuedPrompt } from "../hooks/useChat.h";
 import { toAttachments, formatSize } from "../utils/attachments.u";
 import { useDictation } from "../hooks/useDictation.h";
@@ -15,9 +16,10 @@ import { BackgroundTasks } from "./BackgroundTasks.c";
 import { useOverlayThumb } from "../hooks/useOverlayThumb.h";
 import { Thumb } from "../ui/Thumb.c";
 
+import { EffortChip } from "./EffortChip.c";
 import { ModelSelector } from "./ModelSelector.c";
 import { ProjectPicker } from "./ProjectPicker.c";
-import { EffortChip } from "./EffortChip.c";
+
 import { ComposerMenu, type ComposerItem } from "./ComposerMenu.c";
 import { detectTrigger, mentionText, rankFiles, replaceToken, splitPath } from "./composer.u";
 
@@ -356,7 +358,13 @@ export function PromptBox({
   /** Accepts picked or dropped files as attachments. */
   const acceptFiles = async (files: File[]) => {
     if (files.length === 0) return;
-    const { attachments: added, rejected } = await toAttachments(files);
+    const { attachments: picked, rejected } = await toAttachments(files);
+    // API models accept only what their settings allow.
+    const added = picked.filter((a) => {
+      const allowed = a.kind === "image" ? caps?.vision !== false : caps?.files !== false;
+      if (!allowed) rejected.push(`${a.name}: this model does not take ${a.kind === "image" ? "images" : "files"} (Settings → Models)`);
+      return allowed;
+    });
     if (added.length > 0) setAttachments((prev) => [...prev, ...added]);
     setNotice(rejected.length > 0 ? rejected.join(" · ") : null);
   };
@@ -397,6 +405,33 @@ export function PromptBox({
   const removeAttachment = (id: string) =>
     setAttachments((prev) => prev.filter((a) => a.id !== id));
 
+  /** Kind of the selected provider — decides which effort levels exist. */
+  const gateway = gateways.find((g) => g.id === gatewayId);
+  const providerKind = gateway?.kind;
+  /** The selected model's meta — may list the effort levels it has. */
+  const modelMeta = gateway?.models.find((m) => m.id === modelId)?.meta;
+
+  /** Hand-set abilities of an API model (images / files); null = automatic. */
+  const [caps, setCaps] = useState<db.ModelCapsOverride | null>(null);
+  useEffect(() => {
+    const rowId = `${gatewayId}:${modelId}`;
+    let alive = true;
+    const load = () =>
+      void (providerKind && db.isApiKind(providerKind) ? db.loadModelCaps(rowId) : Promise.resolve(null)).then(
+        (c) => alive && setCaps(c)
+      );
+    load();
+    const off = db.onModelCapsChanged((id) => id === rowId && load());
+    return () => {
+      alive = false;
+      off();
+    };
+  }, [gatewayId, modelId, providerKind]);
+
+  /** The model takes an effort (not an API model with reasoning off, not a fixed-effort model). */
+  const takesEffort =
+    modelMeta !== undefined && caps?.reasoning !== false && effortsFor(providerKind, modelMeta).length > 0;
+
   const pickEffort = (next: Effort) => {
     setEffort(next);
     localStorage.setItem("effort", next);
@@ -422,7 +457,7 @@ export function PromptBox({
     }
     // Sending cancels an in-flight recording instead of transcribing it.
     speech.cancel();
-    onSend(text.trim(), { gatewayId, modelId, effort }, attachments);
+    onSend(text.trim(), { gatewayId, modelId, effort: clampEffort(effort, providerKind, modelMeta) }, attachments);
     setText("");
     setAttachments([]);
     setNotice(null);
@@ -438,9 +473,12 @@ export function PromptBox({
             <ProjectPicker projects={projects} project={project} onSelect={onSelectProject} />
           </div>
         )}
+        {/* The lip: a tray behind the prompt box, with the model + effort */}
+        {/* picker along its bottom edge. */}
+        <div className="prompt-lip flex w-full flex-col rounded-[18px]">
         {/* Glassmorphism container: the chat-column aurora glows through the blur. */}
         <div
-          className={`prompt-glass relative flex min-h-[108px] w-full flex-col justify-between rounded-2xl transition-colors ${
+          className={`prompt-glass relative flex w-full flex-col rounded-2xl transition-colors ${
             dragging ? "border-[var(--accent)]" : ""
           }`}
           onDragOver={(e) => {
@@ -574,12 +612,15 @@ export function PromptBox({
             </div>
           )}
 
+          {/* Text and Send share one row: the button sits at the bottom right */}
+          {/* next to the text instead of adding a strip (a chin) under it. */}
+          <div className="flex items-end">
           {/* Textarea keeps the custom overlay bar too (native bar is hidden) */}
-          <div className="relative">
+          <div className="relative min-w-0 flex-1">
             <textarea
               ref={ref}
               rows={1}
-              className="no-native-scrollbar max-h-[200px] min-h-[44px] w-full resize-none border-none bg-transparent px-4 pb-2 pt-3.5 text-[14px] leading-normal text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
+              className="no-native-scrollbar max-h-[200px] min-h-[64px] w-full resize-none border-none bg-transparent py-3.5 pl-4 pr-2 text-[14px] leading-normal text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
               placeholder={
                 busy
                   ? "Agent is working — write a follow-up, it runs when the current task ends…"
@@ -608,82 +649,8 @@ export function PromptBox({
             />
             <Thumb thumb={promptThumb} />
           </div>
-          {/* Toolbar: 6px 12px 10px, space-between */}
-          <div className="flex items-center justify-between gap-1.5 px-3 pb-2.5 pt-1.5">
-            <div className="flex min-w-0 items-center gap-1">
-              <ModelSelector
-                gateways={gateways}
-                gatewayId={gatewayId}
-                modelId={modelId}
-                openSignal={modelSignal}
-                onSelect={(g, m) => {
-                  setGatewayId(g);
-                  setModelId(m);
-                  // Remember the choice so the next launch restores it.
-                  onPickModel?.({ gatewayId: g, modelId: m });
-                }}
-              />
-              {/* Reasoning effort — low is fast, high thinks harder. */}
-              <EffortChip effort={effort} onPick={pickEffort} />
-            </div>
-
-            <div className="flex shrink-0 items-center gap-1">
-              {contextMeter}
-              {/* Hidden file input driven by the paperclip button */}
-              <input
-                ref={fileInput}
-                type="file"
-                multiple
-                className="hidden"
-                onChange={(e) => {
-                  void acceptFiles(Array.from(e.target.files ?? []));
-                  e.target.value = "";
-                }}
-              />
-              <button
-                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-                onClick={() => fileInput.current?.click()}
-                title="Attach files or images (or drag them onto the prompt)"
-              >
-                <Paperclip size={14} strokeWidth={1.5} />
-              </button>
-              {/* Mic: records audio, then transcribes it fully on-device
-                  (Whisper.cpp in Rust) — no provider, no network. */}
-              <button
-                className={`relative flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
-                  speech.listening
-                    ? "bg-[var(--diff-del)]/15 text-[var(--diff-del)]"
-                    : speech.transcribing
-                      ? "bg-[var(--accent)]/15 text-[var(--accent)]"
-                      : "text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-                } ${speech.supported ? "" : "cursor-not-allowed opacity-40"}`}
-                onClick={toggleMic}
-                disabled={!speech.supported || speech.transcribing}
-                title={
-                  !speech.supported
-                    ? "Microphone is unavailable"
-                    : modelProgress !== null
-                      ? "Preparing local voice model… " + modelProgress + "%"
-                      : speech.transcribing
-                        ? "Transcribing on-device…"
-                        : speech.listening
-                          ? "Stop recording"
-                          : "Dictate with microphone (local, offline)"
-                }
-              >
-                {speech.transcribing ? (
-                  <Loader2 size={15} strokeWidth={1.5} className="animate-spin" />
-                ) : (
-                  <Mic size={15} strokeWidth={1.5} />
-                )}
-                {speech.listening && (
-                  <motion.span
-                    className="absolute inset-0 rounded-md border border-[var(--diff-del)]"
-                    animate={{ opacity: [0.9, 0.25, 0.9] }}
-                    transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
-                  />
-                )}
-              </button>
+            {/* Send / Stop sit in the box; everything else is in the lip. */}
+            <div className="flex shrink-0 items-center gap-1 pb-2.5 pr-2.5">
               {/* While the agent works, Send queues a follow-up next to Stop. */}
               {busy && (text.trim() || attachments.length > 0) && (
                 <button
@@ -717,6 +684,86 @@ export function PromptBox({
               )}
             </div>
           </div>
+        </div>
+        {/* The lip: attach + mic on the left; context, model and effort on the right. */}
+        <div className="prompt-lip-strip flex min-w-0 items-center justify-between gap-2 px-2 py-1">
+          <div className="flex shrink-0 items-center gap-0.5">
+            {/* Hidden file input driven by the + button */}
+            <input
+              ref={fileInput}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                void acceptFiles(Array.from(e.target.files ?? []));
+                e.target.value = "";
+              }}
+            />
+            <button
+              className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+              onClick={() => fileInput.current?.click()}
+              title="Attach files or images (or drag them onto the prompt)"
+            >
+              <Plus size={16} strokeWidth={1.6} />
+            </button>
+            {/* Mic: records audio, then transcribes it fully on-device
+                (Whisper.cpp in Rust) — no provider, no network. */}
+            <button
+              className={`relative flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+                speech.listening
+                  ? "bg-[var(--diff-del)]/15 text-[var(--diff-del)]"
+                  : speech.transcribing
+                    ? "bg-[var(--accent)]/15 text-[var(--accent)]"
+                    : "text-[var(--text-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+              } ${speech.supported ? "" : "cursor-not-allowed opacity-40"}`}
+              onClick={toggleMic}
+              disabled={!speech.supported || speech.transcribing}
+              title={
+                !speech.supported
+                  ? "Microphone is unavailable"
+                  : modelProgress !== null
+                    ? "Preparing local voice model… " + modelProgress + "%"
+                    : speech.transcribing
+                      ? "Transcribing on-device…"
+                      : speech.listening
+                        ? "Stop recording"
+                        : "Dictate with microphone (local, offline)"
+              }
+            >
+              {speech.transcribing ? (
+                <Loader2 size={15} strokeWidth={1.5} className="animate-spin" />
+              ) : (
+                <Mic size={15} strokeWidth={1.5} />
+              )}
+              {speech.listening && (
+                <motion.span
+                  className="absolute inset-0 rounded-md border border-[var(--diff-del)]"
+                  animate={{ opacity: [0.9, 0.25, 0.9] }}
+                  transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
+                />
+              )}
+            </button>
+          </div>
+          <div className="flex min-w-0 items-center gap-0.5">
+            <ModelSelector
+              gateways={gateways}
+              gatewayId={gatewayId}
+              modelId={modelId}
+              openSignal={modelSignal}
+              onSelect={(g, m) => {
+                setGatewayId(g);
+                setModelId(m);
+                // Remember the choice so the next launch restores it.
+                onPickModel?.({ gatewayId: g, modelId: m });
+              }}
+            />
+            {/* Levels follow the selected provider and model; hidden when it takes none. */}
+            {takesEffort && (
+              <EffortChip effort={clampEffort(effort, providerKind, modelMeta)} kind={providerKind} meta={modelMeta} onPick={pickEffort} />
+            )}
+            {contextMeter}
+          </div>
+        </div>
         </div>
       </div>
     </div>

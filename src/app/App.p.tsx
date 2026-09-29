@@ -1412,11 +1412,6 @@ export default function App() {
                       }
                       refreshKey={`${activeConv?.id ?? ""}|${draftMsgs.length}|${pickedModel.gatewayId}|${pickedModel.modelId}|${maxAgents}`}
                       busy={streaming}
-                      onCompact={
-                        activeConv
-                          ? () => chat.compact(activeConv.id)
-                          : undefined
-                      }
                     />
                   )
                 }

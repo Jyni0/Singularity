@@ -130,10 +130,12 @@ fn norm(id: &str) -> String {
 
 fn vendor_for(kind: &str, base_url: &str) -> Option<&'static str> {
     let b = base_url.to_lowercase();
-    if kind == "anthropic-messages" || b.contains("anthropic") {
+    if kind == "anthropic-messages" || kind == "anthropic-cli" || b.contains("anthropic") {
         Some("anthropic/")
-    } else if kind == "google" || b.contains("generativelanguage") {
+    } else if kind == "google" || kind == "google-cli" || b.contains("generativelanguage") {
         Some("google/")
+    } else if kind == "openai-cli" {
+        Some("openai/")
     } else if b.contains("deepseek") {
         Some("deepseek/")
     } else if b.contains("api.openai.com") {

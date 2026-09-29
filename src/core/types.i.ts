@@ -228,14 +228,57 @@ export type ProviderKind =
   | "ollama"
   | "openai-completions"
   | "openai-responses"
-  | "anthropic-messages";
+  | "anthropic-messages"
+  /* Subscription sign-in through the vendor's CLI, run headless by Rust. */
+  | "openai-cli"
+  | "anthropic-cli"
+  | "google-cli";
+
+/** Provider kinds that authenticate through a vendor CLI (Codex, Claude Code, Antigravity CLI). */
+export const CLI_KINDS: ProviderKind[] = ["openai-cli", "anthropic-cli", "google-cli"];
+
+export function isCliKind(kind: ProviderKind): boolean {
+  return CLI_KINDS.includes(kind);
+}
 
 export type ProviderStatus = "ready" | "disconnected" | "error" | "checking";
 
 /** Reasoning effort requested from the model, where the provider supports it. */
-export type Effort = "low" | "medium" | "high";
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max" | "ultracode";
 
-export const EFFORTS: Effort[] = ["low", "medium", "high"];
+export const EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max", "ultracode"];
+
+/**
+ * Effort levels a model accepts, lowest first. The provider sets the range:
+ * OpenAI (Codex) adds xHigh; Anthropic (Claude Code) adds Extra, Max and
+ * Ultracode; Google (Antigravity), Ollama and API endpoints stop at High.
+ * A subscription model's meta can narrow it to what that model has
+ * (`subscription;efforts=low,high`; an empty list = the model takes none).
+ */
+export function effortsFor(kind?: ProviderKind, meta?: string): Effort[] {
+  const range: Effort[] =
+    kind === "openai-cli"
+      ? ["low", "medium", "high", "xhigh"]
+      : kind === "anthropic-cli"
+        ? ["low", "medium", "high", "xhigh", "max", "ultracode"]
+        : ["low", "medium", "high"];
+  const listed = /(?:^|;)efforts=([^;]*)/.exec(meta ?? "");
+  if (!listed) return range;
+  const own = listed[1].split(",");
+  return range.filter((l) => own.includes(l));
+}
+
+/**
+ * The user's pick for this model: kept when the model has it, else the
+ * nearest level it has (ties go up). A model with no levels keeps the pick.
+ */
+export function clampEffort(effort: Effort, kind?: ProviderKind, meta?: string): Effort {
+  const levels = effortsFor(kind, meta);
+  if (levels.length === 0 || levels.includes(effort)) return effort;
+  const rank = (l: Effort) => EFFORTS.indexOf(l);
+  const dist = (l: Effort) => Math.abs(rank(l) - rank(effort));
+  return levels.reduce((best, l) => (dist(l) < dist(best) || (dist(l) === dist(best) && rank(l) > rank(best)) ? l : best));
+}
 
 /** A file or image the user attached to a prompt. */
 export interface Attachment {
@@ -299,6 +342,67 @@ export interface Model {
  * `Gpt 4 1`. Ids that already look human (they contain a space) pass through
  * untouched, so a user's custom display name survives.
  */
+/**
+ * Stable model order for every list: grouped by family (the first word),
+ * Gemini → Claude → GPT → the rest; inside a family by line (all Opus, then
+ * all Sonnet…; plain GPT, then Codex, then mini), the newest version first
+ * inside a line (Opus 5.5 above Opus 5), then by name. Catalogs arrive in whatever order
+ * the provider or CLI prints them; this keeps lists from reshuffling.
+ */
+/** Family order: Gemini, then Claude (incl. Claude Code's Opus / Sonnet /
+ *  Haiku aliases), then GPT, then everything else alphabetically. */
+function familyRank(family: string): number {
+  if (family === "gemini") return 0;
+  if (["claude", "opus", "sonnet", "haiku", "fable"].includes(family)) return 1;
+  if (family === "gpt" || /^(o\d|chatgpt|codex)/.test(family)) return 2;
+  return 3;
+}
+
+/** Model lines inside a family, top tier first: all Opus above all Sonnet,
+ *  plain GPT above Codex above mini… Unknown lines follow, alphabetically. */
+const LINE_ORDER = ["", "opus", "pro", "sonnet", "codex", "fable", "flash", "haiku", "flash lite", "mini", "nano"];
+
+function lineRank(line: string): number {
+  const i = LINE_ORDER.indexOf(line);
+  return i < 0 ? LINE_ORDER.length : i;
+}
+
+export function compareModels(a: string, b: string): number {
+  const parse = (name: string) => {
+    const n = name.toLowerCase().trim();
+    const words = n.replace(/\(.*?\)/g, " ").split(/[\s\-_/:]+/).filter(Boolean);
+    const family = words[0] ?? "";
+    // First standalone version number: "gpt-5.6-sol" → 5.6, "gpt-oss-120b" → none.
+    const v = /(?:^|[\s\-_])v?(\d+(?:\.\d+)*)(?=$|[\s\-_])/.exec(n);
+    // The line: the words left without family, version and dates —
+    // "Claude Opus 5.5" → "opus", "gpt-5.5-codex" → "codex", "GPT-6" → "".
+    // Claude Code's bare aliases ("Opus (latest)") are their own line.
+    const line = ["opus", "sonnet", "haiku", "fable"].includes(family)
+      ? family
+      : words.slice(1).filter((w) => !/^v?\d+(\.\d+)*$/.test(w)).join(" ");
+    return { n, family, line, version: v ? v[1].split(".").map(Number) : null };
+  };
+  const x = parse(a);
+  const y = parse(b);
+  const rx = familyRank(x.family);
+  const ry = familyRank(y.family);
+  if (rx !== ry) return rx - ry;
+  if (x.family !== y.family && !(rx === 1 && ry === 1)) return x.family.localeCompare(y.family);
+  const lx = lineRank(x.line);
+  const ly = lineRank(y.line);
+  if (lx !== ly) return lx - ly;
+  if (x.line !== y.line) return x.line.localeCompare(y.line);
+  if (x.version && y.version) {
+    for (let i = 0; i < Math.max(x.version.length, y.version.length); i++) {
+      const d = (y.version[i] ?? 0) - (x.version[i] ?? 0);
+      if (d !== 0) return d;
+    }
+  } else if (x.version || y.version) {
+    return x.version ? -1 : 1;
+  }
+  return x.n.localeCompare(y.n, undefined, { numeric: true });
+}
+
 export function prettyModelName(id: string): string {
   if (!id) return id;
   if (id.includes(" ")) return id;
@@ -366,6 +470,27 @@ export interface ProviderTemplate {
 }
 
 export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
+  {
+    kind: "openai-cli",
+    label: "OpenAI",
+    base_url: "",
+    hint: "Sign in with your ChatGPT account. Runs through the Codex CLI in the background — downloaded automatically.",
+    needsKey: false,
+  },
+  {
+    kind: "anthropic-cli",
+    label: "Anthropic",
+    base_url: "",
+    hint: "Sign in with your Claude account. Runs through Claude Code in the background — downloaded automatically.",
+    needsKey: false,
+  },
+  {
+    kind: "google-cli",
+    label: "Google",
+    base_url: "",
+    hint: "Sign in with your Google account. Runs through the Antigravity CLI in the background — downloaded automatically.",
+    needsKey: false,
+  },
   {
     kind: "google",
     label: "Google Antigravity",

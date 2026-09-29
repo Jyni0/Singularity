@@ -387,7 +387,7 @@ export function useChat(options: UseChatOptions) {
     const request = agentRequest(provider, cred, modelRow.model_id, selection, projectName, workspaceOf(projectName));
     const [parts, info] = await Promise.all([
       db.agentContext(request, modelTurns(history)).catch(() => [] as db.ContextPart[]),
-      db.modelInfo(provider.kind, provider.base_url, modelRow.model_id),
+      db.effectiveModelInfo(provider.kind, provider.base_url, modelRow.model_id, modelRow.id),
     ]);
     const spent = { prompt: 0, completion: 0, cached: 0, runs: 0 };
     let calibration: number | null = null;
@@ -539,6 +539,15 @@ export function useChat(options: UseChatOptions) {
       return;
     }
 
+    // API models: what the user set for this model (tools, images, reasoning,
+    // answer length). Every other provider is automatic.
+    const caps = db.isApiKind(provider.kind) ? await db.loadModelCaps(modelRow.id) : null;
+    const useAgent = o.agentMode && caps?.tools !== false;
+    const runImages = caps && !caps.vision ? [] : images;
+    // "none" = send no reasoning setting at all.
+    const runEffort: Effort | "none" = caps && !caps.reasoning ? "none" : selection.effort;
+    const maxTokens = caps?.maxOutput ?? undefined;
+
     const runId = `req-${Date.now()}`;
     const startedAt = Date.now();
     // A background (scheduled) run must not become the chat the next launch opens.
@@ -561,10 +570,10 @@ export function useChat(options: UseChatOptions) {
     const turns = modelTurns(history);
 
     try {
-      const answer = o.agentMode
+      const answer = useAgent
         ? await db.runAgent(
             runId,
-            agentRequest(provider, cred, modelRow.model_id, selection, projectName, runWorkspace, images),
+            { ...agentRequest(provider, cred, modelRow.model_id, selection, projectName, runWorkspace, runImages), effort: runEffort, max_tokens: maxTokens },
             turns,
             {
               onText,
@@ -582,8 +591,9 @@ export function useChat(options: UseChatOptions) {
               api_key: cred.apiKey,
               auth: cred.auth,
               model: modelRow.model_id,
-              effort: selection.effort,
-              images,
+              effort: runEffort,
+              images: runImages,
+              max_tokens: maxTokens,
               provider_id: provider.id,
               rate_limit_rpm: provider.rate_limit_rpm ?? 0,
               concurrency: provider.concurrency ?? 0,

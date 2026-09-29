@@ -3,6 +3,7 @@
 mod agent;
 mod cancel;
 mod chat;
+mod cli;
 mod limiter;
 mod mcp;
 mod db;
@@ -190,6 +191,16 @@ fn agent_snapshot(run_id: String) -> Option<Vec<runs::RunEvent>> {
     runs::events(&run_id)
 }
 
+/// True while a terminal has keyboard focus — only then does Ctrl+Shift+C
+/// belong to the page (terminal copy) instead of the browser.
+static TERMINAL_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The frontend reports terminal focus changes (see TerminalView).
+#[tauri::command]
+fn terminal_focus(focused: bool) {
+    TERMINAL_FOCUSED.store(focused, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// All currently live run ids — the frontend polls this once on boot to find
 /// runs that survived a reload.
 #[tauri::command]
@@ -273,6 +284,8 @@ pub fn run() {
             // The tray keeps the app alive after the window closes: runs keep
             // streaming, and the menu shows them plus version and Quit.
             tray::init(app.handle())?;
+            // Where downloaded vendor CLIs live; progress events go to the UI.
+            cli::init(app.handle());
             // Warm up local dictation in the background (download + load the
             // Whisper model) so the first mic press is instant. Never blocks
             // startup and swallows its own errors — dictation just retries on use.
@@ -306,10 +319,16 @@ pub fn run() {
             google_sign_in,
             google_refresh,
             discovery::list_provider_models,
+            cli::cli_status,
+            cli::cli_install,
+            cli::cli_login,
+            cli::cli_logout,
+            cli::cli_usage,
             agent_run,
             agent_confirm,
             agent_snapshot,
             agent_live_runs,
+            terminal_focus,
             stop_generation,
             transcribe_audio,
             tray::tray_state,
@@ -410,10 +429,12 @@ fn keep_find_keys_for_the_page(window: &tauri::WebviewWindow) {
             args.VirtualKey(&mut key)?;
             // The event only fires for accelerators (Ctrl/Alt combos and
             // function keys), so a bare F/G typed into a field never lands here.
-            // Ctrl+Shift+C is DevTools' "inspect element" — the terminal
-            // copies with it, so the browser must not take it first.
+            // Ctrl+Shift+C is DevTools' "inspect element" — a focused
+            // terminal copies with it, so there the browser must not take it
+            // first. Everywhere else it keeps its usual meaning.
             let shift = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) < 0;
-            if matches!(key, VK_F | VK_G | VK_F3) || (key == VK_C && shift) {
+            let terminal = TERMINAL_FOCUSED.load(std::sync::atomic::Ordering::Relaxed);
+            if matches!(key, VK_F | VK_G | VK_F3) || (key == VK_C && shift && terminal) {
                 if let Ok(args2) = args.cast::<ICoreWebView2AcceleratorKeyPressedEventArgs2>() {
                     args2.SetIsBrowserAcceleratorKeyEnabled(false)?;
                 }

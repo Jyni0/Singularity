@@ -1,17 +1,19 @@
 /**
  * Settings → Models.
  *
- * Two ways to connect a provider:
+ * Adding a provider is two choices: the provider (OpenAI, Anthropic, Google,
+ * Ollama or API) and, for API, the endpoint format (OpenAI Responses, OpenAI
+ * Completions, Anthropic Messages).
  *
- *  * **Sign in with Google** — OAuth 2.0 + PKCE. The browser opens Google's
- *    consent screen, the user picks an account, and a refresh token is stored
- *    locally so the connection survives restarts.
- *  * **API key** — paste a key (Google AI Studio, OpenAI, any compatible host).
+ *  * **OpenAI / Anthropic / Google** — account sign-in through the vendor CLI
+ *    (Codex, Claude Code, Antigravity CLI), downloaded and run headless by Rust.
+ *  * **Ollama / API** — Rig's built-in providers with a base URL and key.
+ *  * Legacy Google cards keep their OAuth / AI Studio key flow.
  *
  * Either way, "Refresh" pulls the provider's live model list into SQLite so the
  * picker in the prompt box updates immediately.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Plus,
@@ -30,15 +32,17 @@ import {
   ChevronDown,
   Gauge,
   Pencil,
+  Download,
+  LogIn,
+  SlidersHorizontal,
 } from "lucide-react";
 import type { Model, OAuthTokens, Provider, ProviderKind } from "../core/types.i";
-import {
-  PROVIDER_TEMPLATES,
-} from "../core/types.i";
+import { PROVIDER_TEMPLATES, isCliKind, compareModels } from "../core/types.i";
 import * as db from "../core/db.r";
 import { Switch } from "../ui/Switch.c";
 import { ScrollBox } from "../ui/ScrollArea.c";
 import { ModelCaps } from "./ModelCaps.c";
+import { ModelCapsEditor } from "./ModelCapsEditor.c";
 
 const SBUTTON =
   "flex h-[30px] shrink-0 items-center justify-center gap-1.5 rounded-md bg-[var(--bg-elevated)] px-3 text-[12px] text-[var(--text-main)] transition-colors hover:bg-[var(--bg-input)] disabled:cursor-not-allowed disabled:opacity-50";
@@ -342,6 +346,58 @@ function GoogleAuth({
 
 /* ---------- Add-provider form ---------- */
 
+/** Step 1: who the models come from. OpenAI / Anthropic / Google sign in */
+/** through the vendor CLI; API is any endpoint in one of three formats. */
+type AuthChoice = "openai" | "anthropic" | "google" | "ollama" | "api";
+
+const AUTH_CHOICES: { id: AuthChoice; label: string; kind?: ProviderKind }[] = [
+  { id: "openai", label: "OpenAI", kind: "openai-cli" },
+  { id: "anthropic", label: "Anthropic", kind: "anthropic-cli" },
+  { id: "google", label: "Google", kind: "google-cli" },
+  { id: "ollama", label: "Ollama", kind: "ollama" },
+  { id: "api", label: "API" },
+];
+
+/** Step 2 (API only): the wire format of the endpoint. */
+const API_FORMATS: { kind: ProviderKind; label: string }[] = [
+  { kind: "openai-responses", label: "OpenAI Responses" },
+  { kind: "openai-completions", label: "OpenAI Completions" },
+  { kind: "anthropic-messages", label: "Anthropic Messages" },
+];
+
+function ChoiceRow<T extends string>({
+  label,
+  options,
+  value,
+  onPick,
+}: {
+  label: string;
+  options: { id: T; label: string }[];
+  value: T;
+  onPick: (id: T) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <label className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">{label}</label>
+      <div className="flex flex-wrap gap-1.5">
+        {options.map((o) => (
+          <button
+            key={o.id}
+            className={`flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-[12px] transition-colors ${
+              value === o.id
+                ? "border-[var(--accent)] bg-[var(--hover-bg)] text-[var(--text-main)]"
+                : "border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
+            }`}
+            onClick={() => onPick(o.id)}
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function AddProvider({
   onCreate,
   onCancel,
@@ -349,18 +405,30 @@ function AddProvider({
   onCreate: (p: Provider) => Promise<void>;
   onCancel: () => void;
 }) {
-  const [template, setTemplate] = useState(PROVIDER_TEMPLATES[0]);
-  const [name, setName] = useState(PROVIDER_TEMPLATES[0].label);
-  const [baseUrl, setBaseUrl] = useState(PROVIDER_TEMPLATES[0].base_url);
+  const [choice, setChoice] = useState<AuthChoice>("openai");
+  const [apiKind, setApiKind] = useState<ProviderKind>("openai-responses");
+  const kindOf = (c: AuthChoice, api: ProviderKind) =>
+    AUTH_CHOICES.find((x) => x.id === c)?.kind ?? api;
+  const templateOf = (kind: ProviderKind) => PROVIDER_TEMPLATES.find((x) => x.kind === kind)!;
+  /** API formats are named by format, subscriptions by vendor. */
+  const defaultName = (c: AuthChoice, kind: ProviderKind) =>
+    c === "api" ? API_FORMATS.find((f) => f.kind === kind)!.label : templateOf(kind).label;
+
+  const kind = kindOf(choice, apiKind);
+  const template = templateOf(kind);
+  const cli = isCliKind(kind);
+  const [name, setName] = useState(defaultName("openai", "openai-cli"));
+  const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
   const [busy, setBusy] = useState(false);
 
-  const pick = (kind: ProviderKind) => {
-    const t = PROVIDER_TEMPLATES.find((x) => x.kind === kind)!;
-    setTemplate(t);
-    setName(t.label);
-    setBaseUrl(t.base_url);
+  const pick = (c: AuthChoice, api: ProviderKind) => {
+    const k = kindOf(c, api);
+    setChoice(c);
+    setApiKind(api);
+    setName(defaultName(c, k));
+    setBaseUrl(templateOf(k).base_url);
     setApiKey("");
   };
 
@@ -370,9 +438,9 @@ function AddProvider({
     await onCreate({
       id: `p-${Date.now().toString(36)}`,
       name: name.trim(),
-      kind: template.kind,
-      base_url: baseUrl.trim(),
-      api_key: apiKey.trim(),
+      kind,
+      base_url: cli ? "" : baseUrl.trim(),
+      api_key: cli ? "" : apiKey.trim(),
       enabled: true,
       status: "disconnected",
       last_sync: null,
@@ -381,11 +449,10 @@ function AddProvider({
       rate_limit_rpm: 0,
       concurrency: 0,
     });
+    // The CLI starts downloading right away, before the card is opened.
+    if (cli) void db.cliInstall(kind).catch(() => {});
     setBusy(false);
   };
-
-  // Google is connected by signing in, not by pasting a key up front.
-  const keyOptional = template.kind === "google";
 
   return (
     <motion.div
@@ -405,25 +472,28 @@ function AddProvider({
         </button>
       </div>
 
-      <div className="flex flex-col gap-1.5">
-        <label className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">Type</label>
-        <div className="flex flex-wrap gap-1.5">
-          {PROVIDER_TEMPLATES.map((t) => (
-            <button
-              key={t.kind}
-              className={`flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-[12px] transition-colors ${
-                template.kind === t.kind
-                  ? "border-[var(--accent)] bg-[var(--hover-bg)] text-[var(--text-main)]"
-                  : "border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
-              }`}
-              onClick={() => pick(t.kind)}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
-        <div className="text-[12px] text-[var(--text-dim)]">{template.hint}</div>
-      </div>
+      <ChoiceRow label="Provider" options={AUTH_CHOICES} value={choice} onPick={(c) => pick(c, apiKind)} />
+
+      <AnimatePresence initial={false}>
+        {choice === "api" && (
+          <motion.div
+            className="overflow-hidden"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.15, ease: "easeOut" }}
+          >
+            <ChoiceRow
+              label="Endpoint format"
+              options={API_FORMATS.map((f) => ({ id: f.kind, label: f.label }))}
+              value={apiKind}
+              onPick={(k) => pick("api", k)}
+            />
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <div className="text-[12px] text-[var(--text-dim)]">{template.hint}</div>
 
       <div className="flex flex-col gap-1.5">
         <label className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
@@ -432,19 +502,21 @@ function AddProvider({
         <input className={SINPUT} value={name} onChange={(e) => setName(e.target.value)} />
       </div>
 
-      <div className="flex flex-col gap-1.5">
-        <label className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
-          {template.local ? "Endpoint" : "Base URL"}
-        </label>
-        <input
-          className={`${SINPUT} font-mono`}
-          value={baseUrl}
-          placeholder="https://…"
-          onChange={(e) => setBaseUrl(e.target.value)}
-        />
-      </div>
+      {!cli && (
+        <div className="flex flex-col gap-1.5">
+          <label className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
+            {template.local ? "Endpoint" : "Base URL"}
+          </label>
+          <input
+            className={`${SINPUT} font-mono`}
+            value={baseUrl}
+            placeholder="https://…"
+            onChange={(e) => setBaseUrl(e.target.value)}
+          />
+        </div>
+      )}
 
-      {template.needsKey && !keyOptional && (
+      {template.needsKey && (
         <div className="flex flex-col gap-1.5">
           <label className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
             <KeyRound size={11} /> API key
@@ -465,18 +537,16 @@ function AddProvider({
               {showKey ? <EyeOff size={13} /> : <Eye size={13} />}
             </button>
           </div>
+          <div className="text-[11px] text-[var(--text-dim)]">
+            Stored locally in the app database and sent only to this provider.
+          </div>
         </div>
       )}
 
-      {keyOptional && (
+      {cli && (
         <div className="rounded-lg bg-[var(--bg-input)] px-3 py-2 text-[12px] text-[var(--text-muted)]">
-          After adding, open the card and press <b>Sign in with Google</b> — no API key required.
-        </div>
-      )}
-
-      {template.kind !== "google" && template.needsKey && (
-        <div className="text-[11px] text-[var(--text-dim)]">
-          Stored locally in the app database and sent only to this provider.
+          No API key. After adding, the CLI downloads in the background — open the card and press{" "}
+          <b>Sign in</b> to connect your account.
         </div>
       )}
 
@@ -487,13 +557,198 @@ function AddProvider({
         <button
           className={PRIMARY_BUTTON}
           onClick={submit}
-          disabled={busy || !name.trim() || (template.needsKey && !keyOptional && !db.isLocalUrl(baseUrl) && !apiKey.trim())}
+          disabled={busy || !name.trim() || (template.needsKey && !db.isLocalUrl(baseUrl) && !apiKey.trim())}
         >
           {busy ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
           Add provider
         </button>
       </div>
     </motion.div>
+  );
+}
+
+/* ---------- Subscription CLI block ---------- */
+
+const CLI_NAME: Record<string, string> = {
+  "openai-cli": "Codex CLI",
+  "anthropic-cli": "Claude Code",
+  "google-cli": "Antigravity CLI",
+};
+
+const CLI_ACCOUNT: Record<string, string> = {
+  "openai-cli": "ChatGPT",
+  "anthropic-cli": "Claude",
+  "google-cli": "Google",
+};
+
+/**
+ * Install + sign-in state of a CLI provider. The binary downloads in the
+ * background as soon as the card mounts; "Sign in" runs the CLI's own browser
+ * login hidden and resolves when the account is connected.
+ */
+function CliAuth({
+  provider,
+  hasModels,
+  onSignedIn,
+}: {
+  provider: Provider;
+  /** The provider already has models in the picker. */
+  hasModels: boolean;
+  /** Pulls the model list (after sign-in, or once the CLI is ready). */
+  onSignedIn: () => void;
+}) {
+  const [status, setStatus] = useState<db.CliStatus | null>(null);
+  const [progress, setProgress] = useState<db.CliProgress | null>(null);
+  const [busy, setBusy] = useState<"login" | "logout" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const tool = CLI_NAME[provider.kind];
+  const account = CLI_ACCOUNT[provider.kind];
+  /** Antigravity signs in only in its own interactive window (no hidden login). */
+  const ownWindowLogin = provider.kind === "google-cli";
+
+  const load = async (install: boolean) => {
+    try {
+      const st = await (install ? db.cliInstall(provider.kind) : db.cliStatus(provider.kind));
+      setStatus(st);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  useEffect(() => {
+    void load(true);
+    let off = () => {};
+    void db
+      .onCliProgress((p) => {
+        if (p.cli !== db.cliIdOf(provider.kind)) return;
+        setProgress(p);
+        if (p.stage === "error") setError(p.message);
+        if (p.stage === "done") {
+          setError(null);
+          void load(false);
+        }
+      })
+      .then((fn) => (off = fn));
+    return () => off();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider.kind]);
+
+  // Models arrive by themselves: as soon as the CLI is installed (and, for
+  // Antigravity, whose list depends on the account, signed in), once.
+  const autoPulled = useRef(false);
+  useEffect(() => {
+    if (!status?.installed || hasModels || autoPulled.current) return;
+    if (ownWindowLogin && status.signed_in !== true) return;
+    autoPulled.current = true;
+    onSignedIn();
+  }, [status, hasModels, ownWindowLogin, onSignedIn]);
+
+  const signIn = async () => {
+    setBusy("login");
+    setError(null);
+    try {
+      setStatus(await db.cliLogin(provider.kind));
+      onSignedIn();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+    setBusy(null);
+  };
+
+  const signOut = async () => {
+    setBusy("logout");
+    try {
+      setStatus(await db.cliLogout(provider.kind));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+    setBusy(null);
+  };
+
+  const installing = !status?.installed && (status?.installing || (progress && progress.stage !== "error"));
+  const signedIn = status?.signed_in === true;
+
+  return (
+    <div className="flex flex-col gap-3 border-t border-[var(--border)] px-4 py-3">
+      {!status ? (
+        <div className="flex items-center gap-2 text-[12px] text-[var(--text-dim)]">
+          <Loader2 size={13} className="animate-spin" /> Checking {tool}…
+        </div>
+      ) : !status.installed ? (
+        installing ? (
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center justify-between text-[12px] text-[var(--text-muted)]">
+              <span className="flex items-center gap-2">
+                <Download size={13} className="text-[var(--accent)]" />
+                {progress?.stage === "extract" ? `Unpacking ${tool}…` : `Downloading ${tool}…`}
+              </span>
+              <span className="font-mono text-[11px] text-[var(--text-dim)]">{progress && progress.stage !== "extract" ? `${progress.percent}%` : ""}</span>
+            </div>
+            <div className="h-1 overflow-hidden rounded-full bg-[var(--bg-input)]">
+              <div
+                className="h-full rounded-full bg-[var(--accent)] transition-[width] duration-300"
+                style={{ width: `${progress?.stage === "extract" ? 100 : (progress?.percent ?? 2)}%` }}
+              />
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <span className="min-w-0 flex-1 text-[12px] text-[var(--text-muted)]">
+              {tool} is not installed yet.
+            </span>
+            <button className={SBUTTON} onClick={() => void load(true)}>
+              <Download size={13} /> Download
+            </button>
+          </div>
+        )
+      ) : signedIn ? (
+        <div className="flex items-center gap-2">
+          <CircleCheck size={14} className="shrink-0 text-[var(--accent)]" />
+          <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text-main)]">
+            Signed in{status.account ? <> as <span className="font-mono">{status.account}</span></> : ` with ${account}`}
+          </span>
+          {busy === "logout" && ownWindowLogin && (
+            <span className="shrink-0 text-[11px] text-[var(--text-dim)]">If an agy window opens, type /logout there</span>
+          )}
+          <button
+            className="flex h-[30px] shrink-0 items-center gap-1.5 rounded-md px-2 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--diff-del)] disabled:opacity-50"
+            onClick={signOut}
+            disabled={busy !== null}
+            title="Sign out — then Sign in with another account"
+          >
+            {busy === "logout" ? <Loader2 size={14} className="animate-spin" /> : <LogOut size={14} />}
+            Sign out
+          </button>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2">
+          <span className="min-w-0 flex-1 text-[12px] text-[var(--text-muted)]">
+            {busy === "login"
+              ? ownWindowLogin
+                ? `Sign in in the ${tool} window that opened, then close it…`
+                : "Finish signing in in your browser…"
+              : `Connect your ${account} account — requests then run on its subscription.`}
+          </span>
+          <button className={PRIMARY_BUTTON} onClick={signIn} disabled={busy !== null}>
+            {busy === "login" ? <Loader2 size={13} className="animate-spin" /> : <LogIn size={13} />}
+            {busy === "login" ? "Waiting for sign-in…" : "Sign in"}
+          </button>
+        </div>
+      )}
+
+      {status?.installed && (
+        <div className="truncate font-mono text-[10.5px] text-[var(--text-dim)]" title={status.path}>
+          {tool} · {status.source === "path" ? "your install" : "managed by Singularity"} · {status.path}
+        </div>
+      )}
+
+      {error && (
+        <div className="flex items-start gap-2 rounded-lg px-2.5 py-2 text-[12px] text-[var(--diff-del)]">
+          <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+          <span className="min-w-0 whitespace-pre-wrap break-words">{error}</span>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -507,16 +762,19 @@ function ProviderCard({
   onModelsChanged,
   onTokens,
   onRemoved,
+  initiallyExpanded = false,
 }: {
   provider: Provider;
   models: Model[];
+  /** Open from the start — a card that was just added. */
+  initiallyExpanded?: boolean;
   tokens: OAuthTokens | null;
   onChanged: (p: Provider) => void;
   onModelsChanged: (next: Model[]) => void;
   onTokens: (t: OAuthTokens | null) => void;
   onRemoved: (id: string) => void;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(initiallyExpanded);
   const [key, setKey] = useState(provider.api_key);
   const [showKey, setShowKey] = useState(false);
   const [url, setUrl] = useState(provider.base_url);
@@ -542,8 +800,14 @@ function ProviderCard({
   };
 
   const template = PROVIDER_TEMPLATES.find((t) => t.kind === provider.kind);
-  const mine = models.filter((m) => m.provider_id === provider.id);
+  const mine = models
+    .filter((m) => m.provider_id === provider.id)
+    .sort((a, b) => compareModels(a.name || a.model_id, b.name || b.model_id));
   const isGoogle = provider.kind === "google";
+  const isCli = isCliKind(provider.kind);
+  /** API endpoints: each model's limits and abilities are set by hand. */
+  const isApi = db.isApiKind(provider.kind);
+  const [capsOpen, setCapsOpen] = useState<string | null>(null);
 
   /** Adds a model row by hand and marks the provider usable. */
   const addModelRow = async () => {
@@ -735,6 +999,11 @@ function ProviderCard({
         />
       )}
 
+      {/* Subscription CLIs: download + account sign-in, then the model list. */}
+      {isCli && expanded && (
+        <CliAuth provider={provider} hasModels={mine.length > 0} onSignedIn={() => void refresh()} />
+      )}
+
       <AnimatePresence initial={false}>
         {expanded && (
           <motion.div
@@ -745,20 +1014,22 @@ function ProviderCard({
             transition={{ duration: 0.18, ease: "easeOut" }}
           >
             <div className="flex flex-col gap-3 border-t border-[var(--border)] px-4 py-3">
-              <div className="flex flex-col gap-1.5">
-                <label className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
-                  Base URL
-                </label>
-                <input
-                  className={`${SINPUT} font-mono`}
-                  value={url}
-                  onChange={(e) => setUrl(e.target.value)}
-                  onBlur={() => persist({})}
-                />
-              </div>
+              {!isCli && (
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
+                    Base URL
+                  </label>
+                  <input
+                    className={`${SINPUT} font-mono`}
+                    value={url}
+                    onChange={(e) => setUrl(e.target.value)}
+                    onBlur={() => persist({})}
+                  />
+                </div>
+              )}
 
               {/* API key is an alternative to signing in for Google. */}
-              {(!isGoogle || provider.auth !== "bearer") && template?.needsKey !== false && (
+              {!isCli && (!isGoogle || provider.auth !== "bearer") && template?.needsKey !== false && (
                 <div className="flex flex-col gap-1.5">
                   <label className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-[var(--text-dim)]">
                     <KeyRound size={11} />
@@ -784,66 +1055,72 @@ function ProviderCard({
                 </div>
               )}
 
-              <div className="flex items-center justify-between rounded-lg bg-[var(--bg-input)] px-3 py-2">
-                <span className="flex items-center gap-2 text-[12px] text-[var(--text-muted)]">
-                  <Plug size={13} />
-                  Enabled for the model picker
-                </span>
-                <Switch
-                  on={provider.enabled}
-                  onChange={(next) => persist({ enabled: next })}
-                  ariaLabel="toggle provider"
-                />
-              </div>
+              {/* Subscriptions (CLIs) are automatic: always on, the vendor */}
+              {/* meters them, and the model list comes from the CLI. */}
+              {!isCli && (
+                <>
+                  <div className="flex items-center justify-between rounded-lg bg-[var(--bg-input)] px-3 py-2">
+                    <span className="flex items-center gap-2 text-[12px] text-[var(--text-muted)]">
+                      <Plug size={13} />
+                      Enabled for the model picker
+                    </span>
+                    <Switch
+                      on={provider.enabled}
+                      onChange={(next) => persist({ enabled: next })}
+                      ariaLabel="toggle provider"
+                    />
+                  </div>
 
-              {/* Rate limits — enforced in Rust (limiter.rs) before every */}
-              {/* provider call: chat streams, the agent loop and parallel */}
-              {/* decomposed subtasks all share this budget. */}
-              <div className="flex flex-col gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2.5">
-                <div className="flex items-center justify-between">
-                  <span className="flex items-center gap-2 text-[12px] font-medium text-[var(--text-main)]">
-                    <Gauge size={13} className="text-[var(--text-muted)]" />
-                    No limits
-                  </span>
-                  <Switch
-                    on={noLimits}
-                    onChange={(next) => {
-                      setRpmDraft(next ? "0" : String(rpmDraft === "0" ? 60 : rpmDraft));
-                      setConcDraft(next ? "0" : String(concDraft === "0" ? 3 : concDraft));
-                      persist(next ? { rate_limit_rpm: 0, concurrency: 0 } : { rate_limit_rpm: 60, concurrency: 3 });
-                    }}
-                    ariaLabel="toggle provider limits"
-                  />
-                </div>
-                <div className={"flex items-end gap-3 " + (noLimits ? "pointer-events-none opacity-40" : "")}>
-                  <label className="flex flex-1 flex-col gap-1">
-                    <span className="text-[11px] text-[var(--text-dim)]">Rate limit — requests / min</span>
-                    <input
-                      className={SINPUT + " !w-full"}
-                      type="number"
-                      min={0}
-                      value={rpmDraft}
-                      onChange={(e) => setRpmDraft(e.target.value)}
-                      onBlur={() => persist({ rate_limit_rpm: clampLimit(rpmDraft) })}
-                    />
-                  </label>
-                  <label className="flex flex-1 flex-col gap-1">
-                    <span className="text-[11px] text-[var(--text-dim)]">Concurrency — parallel requests</span>
-                    <input
-                      className={SINPUT + " !w-full"}
-                      type="number"
-                      min={0}
-                      value={concDraft}
-                      onChange={(e) => setConcDraft(e.target.value)}
-                      onBlur={() => persist({ concurrency: clampLimit(concDraft) })}
-                    />
-                  </label>
-                </div>
-                <span className="text-[10.5px] leading-[1.5] text-[var(--text-dim)]">
-                  Requests beyond the limit wait instead of failing; concurrency
-                  also caps how many decomposed subtasks run at once. 0 = unlimited.
-                </span>
-              </div>
+                  {/* Rate limits — enforced in Rust (limiter.rs) before every */}
+                  {/* provider call: chat streams, the agent loop and parallel */}
+                  {/* decomposed subtasks all share this budget. */}
+                  <div className="flex flex-col gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="flex items-center gap-2 text-[12px] font-medium text-[var(--text-main)]">
+                        <Gauge size={13} className="text-[var(--text-muted)]" />
+                        No limits
+                      </span>
+                      <Switch
+                        on={noLimits}
+                        onChange={(next) => {
+                          setRpmDraft(next ? "0" : String(rpmDraft === "0" ? 60 : rpmDraft));
+                          setConcDraft(next ? "0" : String(concDraft === "0" ? 3 : concDraft));
+                          persist(next ? { rate_limit_rpm: 0, concurrency: 0 } : { rate_limit_rpm: 60, concurrency: 3 });
+                        }}
+                        ariaLabel="toggle provider limits"
+                      />
+                    </div>
+                    <div className={"flex items-end gap-3 " + (noLimits ? "pointer-events-none opacity-40" : "")}>
+                      <label className="flex flex-1 flex-col gap-1">
+                        <span className="text-[11px] text-[var(--text-dim)]">Rate limit — requests / min</span>
+                        <input
+                          className={SINPUT + " !w-full"}
+                          type="number"
+                          min={0}
+                          value={rpmDraft}
+                          onChange={(e) => setRpmDraft(e.target.value)}
+                          onBlur={() => persist({ rate_limit_rpm: clampLimit(rpmDraft) })}
+                        />
+                      </label>
+                      <label className="flex flex-1 flex-col gap-1">
+                        <span className="text-[11px] text-[var(--text-dim)]">Concurrency — parallel requests</span>
+                        <input
+                          className={SINPUT + " !w-full"}
+                          type="number"
+                          min={0}
+                          value={concDraft}
+                          onChange={(e) => setConcDraft(e.target.value)}
+                          onBlur={() => persist({ concurrency: clampLimit(concDraft) })}
+                        />
+                      </label>
+                    </div>
+                    <span className="text-[10.5px] leading-[1.5] text-[var(--text-dim)]">
+                      Requests beyond the limit wait instead of failing; concurrency
+                      also caps how many decomposed subtasks run at once. 0 = unlimited.
+                    </span>
+                  </div>
+                </>
+              )}
 
 
               {mine.length > 0 && (
@@ -853,19 +1130,33 @@ function ProviderCard({
                   </span>
                   <ScrollBox className="flex max-h-[320px] flex-col gap-0.5 pr-1">
                     {mine.map((m) => (
-                      <div
-                        key={m.id}
-                        className="group flex items-center gap-2 rounded-md px-2 py-1 text-[12px] text-[var(--text-main)] hover:bg-[var(--hover-bg)]"
-                      >
-                        <span className="min-w-0 flex-1 truncate font-mono" title={m.model_id}>{m.name}</span>
-                        <ModelCaps kind={provider.kind} baseUrl={provider.base_url} modelId={m.model_id} />
-                        <button
-                          className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-[var(--text-dim)] opacity-0 transition-opacity hover:text-[var(--diff-del)] group-hover:opacity-100"
-                          onClick={() => removeModelRow(m.id)}
-                          title="Remove model"
-                        >
-                          <Trash2 size={11} />
-                        </button>
+                      <div key={m.id} className="flex flex-col">
+                        <div className="group flex items-center gap-2 rounded-md px-2 py-1 text-[12px] text-[var(--text-main)] hover:bg-[var(--hover-bg)]">
+                          <span className="min-w-0 flex-1 truncate font-mono" title={m.model_id}>{m.name}</span>
+                          <ModelCaps kind={provider.kind} baseUrl={provider.base_url} modelId={m.model_id} rowId={m.id} />
+                          {/* API models: context, answer length and abilities are set by hand. */}
+                          {isApi && (
+                            <button
+                              className={`flex h-5 w-5 shrink-0 items-center justify-center rounded transition-opacity hover:text-[var(--text-main)] ${
+                                capsOpen === m.id ? "text-[var(--accent)]" : "text-[var(--text-dim)] opacity-0 group-hover:opacity-100"
+                              }`}
+                              onClick={() => setCapsOpen(capsOpen === m.id ? null : m.id)}
+                              title="Context, images, files, tools…"
+                            >
+                              <SlidersHorizontal size={11} />
+                            </button>
+                          )}
+                          <button
+                            className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-[var(--text-dim)] opacity-0 transition-opacity hover:text-[var(--diff-del)] group-hover:opacity-100"
+                            onClick={() => removeModelRow(m.id)}
+                            title="Remove model"
+                          >
+                            <Trash2 size={11} />
+                          </button>
+                        </div>
+                        {isApi && capsOpen === m.id && (
+                          <ModelCapsEditor kind={provider.kind} baseUrl={provider.base_url} modelId={m.model_id} rowId={m.id} />
+                        )}
                       </div>
                     ))}
                   </ScrollBox>
@@ -873,55 +1164,59 @@ function ProviderCard({
               )}
 
               {/* Manual model creation — for gateways without a list endpoint. */}
-              <div className="flex flex-col gap-1.5">
-                <button
-                  className="flex items-center gap-1.5 self-start text-[11px] text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
-                  onClick={() => setShowAddModel(!showAddModel)}
-                >
-                  <Plus
-                    size={11}
-                    className={`transition-transform ${showAddModel ? "rotate-45" : ""}`}
-                  />
-                  Add model manually
-                </button>
-                <AnimatePresence initial={false}>
-                  {showAddModel && (
-                    <motion.div
-                      className="flex items-center gap-2 overflow-hidden"
-                      initial={{ height: 0, opacity: 0 }}
-                      animate={{ height: "auto", opacity: 1 }}
-                      exit={{ height: 0, opacity: 0 }}
-                      transition={{ duration: 0.15, ease: "easeOut" }}
-                    >
-                      <input
-                        className={`${SINPUT} w-[38%] font-mono`}
-                        placeholder="model id — e.g. claude-sonnet-4-5"
-                        value={newModelId}
-                        onChange={(e) => setNewModelId(e.target.value)}
-                      />
-                      <input
-                        className={`${SINPUT} flex-1 font-mono`}
-                        placeholder="display name (optional)"
-                        value={newModelName}
-                        onChange={(e) => setNewModelName(e.target.value)}
-                      />
-                      <button
-                        className={SBUTTON}
-                        onClick={addModelRow}
-                        disabled={!newModelId.trim()}
-                        title="Add this model to the picker"
+              {!isCli && (
+                <div className="flex flex-col gap-1.5">
+                  <button
+                    className="flex items-center gap-1.5 self-start text-[11px] text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
+                    onClick={() => setShowAddModel(!showAddModel)}
+                  >
+                    <Plus
+                      size={11}
+                      className={`transition-transform ${showAddModel ? "rotate-45" : ""}`}
+                    />
+                    Add model manually
+                  </button>
+                  <AnimatePresence initial={false}>
+                    {showAddModel && (
+                      <motion.div
+                        className="flex items-center gap-2 overflow-hidden"
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: "auto", opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={{ duration: 0.15, ease: "easeOut" }}
                       >
-                        <Plus size={13} />
-                      </button>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </div>
+                        <input
+                          className={`${SINPUT} w-[38%] font-mono`}
+                          placeholder="model id — e.g. claude-sonnet-4-5"
+                          value={newModelId}
+                          onChange={(e) => setNewModelId(e.target.value)}
+                        />
+                        <input
+                          className={`${SINPUT} flex-1 font-mono`}
+                          placeholder="display name (optional)"
+                          value={newModelName}
+                          onChange={(e) => setNewModelName(e.target.value)}
+                        />
+                        <button
+                          className={SBUTTON}
+                          onClick={addModelRow}
+                          disabled={!newModelId.trim()}
+                          title="Add this model to the picker"
+                        >
+                          <Plus size={13} />
+                        </button>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              )}
 
               <div className="text-[11px] text-[var(--text-dim)]">
                 {provider.last_sync
                   ? `Last synced ${new Date(provider.last_sync * 1000).toLocaleString()}`
-                  : "Never synced — press Refresh to fetch the model list, or add models manually."}
+                  : isCli
+                    ? "The model list loads from the CLI once it is installed and signed in."
+                    : "Never synced — press Refresh to fetch the model list, or add models manually."}
               </div>
             </div>
           </motion.div>
@@ -964,10 +1259,30 @@ export function ModelsSettings({
     };
   }, [providers]);
 
+  /** The card just added opens by itself (CLI providers download and sign in there). */
+  const [justAdded, setJustAdded] = useState<string | null>(null);
+
   const create = async (p: Provider) => {
     await db.upsertProvider(p);
-    onProvidersChanged([...providers, p]);
+    onProvidersChanged([...providers.filter((x) => x.id !== p.id), p]);
     setAdding(false);
+    setJustAdded(p.id);
+    // API and Ollama: pull the model list right away. CLI providers pull it
+    // from their card once the CLI is installed (and signed in).
+    if (isCliKind(p.kind)) return;
+    const result = await db.discoverModels(p, {
+      clientId: localStorage.getItem("google_client_id") ?? "",
+      clientSecret: localStorage.getItem("google_client_secret") ?? "",
+    });
+    const next: Provider = result.error || result.models.length === 0
+      ? { ...p, status: "error" }
+      : { ...p, status: "ready", last_sync: Math.floor(Date.now() / 1000) };
+    if (next.status === "ready") {
+      await db.replaceModels(p.id, result.models);
+      onModelsChanged([...models.filter((m) => m.provider_id !== p.id), ...result.models]);
+    }
+    await db.upsertProvider(next);
+    onProvidersChanged([...providers.filter((x) => x.id !== p.id), next]);
   };
 
   const update = (p: Provider) =>
@@ -1016,12 +1331,13 @@ export function ModelsSettings({
           onModelsChanged={onModelsChanged}
           onTokens={(t) => setTokens((prev) => ({ ...prev, [p.id]: t }))}
           onRemoved={remove}
+          initiallyExpanded={p.id === justAdded}
         />
       ))}
 
       {providers.length === 0 && !adding && (
         <div className="rounded-xl border border-dashed border-[var(--border)] px-4 py-8 text-center text-[13px] text-[var(--text-dim)]">
-          No providers yet. Connect Google, add an OpenAI/Anthropic gateway, or run Ollama.
+          No providers yet. Sign in with OpenAI, Anthropic or Google, run Ollama, or add an API endpoint.
         </div>
       )}
     </div>

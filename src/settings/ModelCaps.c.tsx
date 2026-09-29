@@ -2,7 +2,8 @@
  * A model's limits on its row in Settings → Models: context window and
  * longest answer.
  * Loaded when the row scrolls into view (pricing.rs: Ollama asks the model
- * itself, everything else comes from the OpenRouter catalog).
+ * itself, everything else comes from the OpenRouter catalog). For API models
+ * the numbers set by hand (ModelCapsEditor) win and update live.
  */
 import { useEffect, useRef, useState } from "react";
 import * as db from "../core/db.r";
@@ -13,7 +14,7 @@ function fmtTokens(n: number): string {
   return String(n);
 }
 
-export function ModelCaps({ kind, baseUrl, modelId }: { kind: string; baseUrl: string; modelId: string }) {
+export function ModelCaps({ kind, baseUrl, modelId, rowId }: { kind: string; baseUrl: string; modelId: string; rowId?: string }) {
   const ref = useRef<HTMLSpanElement>(null);
   const [info, setInfo] = useState<db.ModelInfo | null>(null);
 
@@ -21,20 +22,23 @@ export function ModelCaps({ kind, baseUrl, modelId }: { kind: string; baseUrl: s
     const el = ref.current;
     if (!el) return;
     let alive = true;
+    const load = () =>
+      void (rowId ? db.effectiveModelInfo(kind, baseUrl, modelId, rowId) : db.modelInfo(kind, baseUrl, modelId))
+        .then((i) => alive && setInfo(i))
+        .catch(() => {});
     const io = new IntersectionObserver((entries) => {
       if (!entries.some((e) => e.isIntersecting)) return;
       io.disconnect();
-      void db
-        .modelInfo(kind, baseUrl, modelId)
-        .then((i) => alive && setInfo(i))
-        .catch(() => {});
+      load();
     });
     io.observe(el);
+    const off = rowId ? db.onModelCapsChanged((id) => id === rowId && load()) : () => {};
     return () => {
       alive = false;
       io.disconnect();
+      off();
     };
-  }, [kind, baseUrl, modelId]);
+  }, [kind, baseUrl, modelId, rowId]);
 
   const known = info && (info.context !== null || info.maxOutput !== null);
   return (

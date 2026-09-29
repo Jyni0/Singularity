@@ -1,4 +1,4 @@
-import { Model, Provider, Gateway, prettyModelName } from "../core/types.i";
+import { Model, Provider, Gateway, prettyModelName, compareModels } from "../core/types.i";
 
 /** Groups providers and their models into the shape the pickers consume. */
 export function toGateways(providers: Provider[], models: Model[]): Gateway[] {
@@ -17,6 +17,7 @@ export function toGateways(providers: Provider[], models: Model[]): Gateway[] {
         name:
           m.name && m.name !== m.model_id ? m.name : prettyModelName(m.model_id),
         meta: m.meta,
-      })),
+      }))
+      .sort((a, b) => compareModels(a.name, b.name)),
   }));
 }

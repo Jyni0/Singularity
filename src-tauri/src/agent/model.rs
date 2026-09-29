@@ -23,7 +23,8 @@ pub(super) struct ModelSetup {
 /// Anthropic thinking budget per effort level (None = thinking off).
 fn anthropic_thinking(effort: &str) -> Option<u64> {
     match effort {
-        "low" => None,
+        // "none": the model has reasoning switched off (Settings → Models).
+        "low" | "none" => None,
         "high" => Some(8192),
         _ => Some(2048),
     }
@@ -54,13 +55,44 @@ pub(super) fn agent_temperature(kind: &str, model: &str, t: f64) -> Option<f64> 
 
 /// Builds the Rig model for this request's provider.
 pub(super) fn build(req: &AgentRequest) -> Result<ModelSetup, String> {
+    let mut setup = build_model(req)?;
+    // The user's own cap for an API model (Settings → Models → model caps).
+    if let Some(cap) = req.max_tokens.filter(|m| *m > 0) {
+        setup.max_tokens = Some(match setup.max_tokens {
+            // Anthropic thinking needs room above its budget (default = budget + 4096).
+            Some(cur) if req.kind == "anthropic-messages" && setup.params.is_some() => cap.max(cur - 4096 + 1024),
+            _ => cap,
+        });
+    }
+    Ok(setup)
+}
+
+fn build_model(req: &AgentRequest) -> Result<ModelSetup, String> {
     let key = req.api_key.trim().to_string();
     let base = req.base_url.trim().trim_end_matches('/').to_string();
     let fail = |e: rig_agent::core::http_client::Error| format!("provider client: {e}");
-    let effort = req.effort.as_str();
+    let effort = match req.effort.as_str() {
+        // Levels above High exist only for the subscription CLIs; an API
+        // provider gets its highest level instead.
+        "xhigh" | "max" | "ultracode" if crate::cli::Cli::from_kind(&req.kind).is_none() => "high",
+        e => e,
+    };
     // "medium" is every provider's default — only low/high are sent.
     let pick = matches!(effort, "low" | "high").then_some(effort);
     let temperature = req.temperature.and_then(|t| agent_temperature(&req.kind, &req.model, t));
+
+    // Subscription CLIs (Codex / Claude Code / Antigravity CLI): a custom Rig model
+    // over the headless CLI process. Effort goes on its command line; the
+    // CLIs take no sampling parameters.
+    if let Some(cli) = crate::cli::Cli::from_kind(&req.kind) {
+        return Ok(ModelSetup {
+            handle: ModelHandle::new(crate::cli::CliModel::new(cli, &req.model, effort)),
+            params: None,
+            temperature: None,
+            max_tokens: None,
+            cache_seen: None,
+        });
+    }
 
     match req.kind.as_str() {
         "anthropic-messages" => {
@@ -107,13 +139,24 @@ pub(super) fn build(req: &AgentRequest) -> Result<ModelSetup, String> {
                 cache_seen: None,
             })
         }
-        // OpenAI (incl. "openai-responses" providers), OpenAI-compatible
-        // gateways, DeepSeek, Gemini's OpenAI endpoint…: plain
-        // /chat/completions. Rig's Responses-API client decodes stream events
-        // strictly, and gateways that emit loosely shaped `response.*` events
-        // killed the run ("did not match any variant of untagged enum
-        // StreamingCompletionChunk"); /chat/completions is what these
-        // providers always served the agent through.
+        // API → "OpenAI Responses": Rig's Responses-API client (POST /responses).
+        "openai-responses" => {
+            let client = openai::Client::builder()
+                .api_key(key)
+                .base_url(&base)
+                .build()
+                .map_err(fail)?;
+            Ok(ModelSetup {
+                handle: ModelHandle::new(client.completion_model(&req.model)),
+                params: pick.map(|e| json!({ "reasoning": { "effort": e } })),
+                temperature,
+                max_tokens: None,
+                cache_seen: None,
+            })
+        }
+        // OpenAI Completions, OpenAI-compatible gateways, DeepSeek, Gemini's
+        // OpenAI endpoint…: plain /chat/completions — what loosely shaped
+        // gateways serve reliably (Rig decodes `response.*` events strictly).
         _ => {
             let http = super::cachenet::CacheClient::new(&req.model);
             let seen = http.seen.clone();

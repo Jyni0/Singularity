@@ -99,6 +99,23 @@ function setLiveStatus(live: LiveTerm, status: TermStatus, error?: string | null
   }
 }
 
+/** Tells the shell whether a terminal has keyboard focus: Ctrl+Shift+C is
+ *  taken from the browser (terminal copy) only then (lib.rs). */
+let terminalFocused = false;
+function trackTerminalFocus() {
+  const sync = () => {
+    const now = !!document.activeElement?.closest(".xterm");
+    if (now === terminalFocused) return;
+    terminalFocused = now;
+    void import("@tauri-apps/api/core")
+      .then(({ invoke }) => invoke("terminal_focus", { focused: now }))
+      .catch(() => {});
+  };
+  document.addEventListener("focusin", sync);
+  document.addEventListener("focusout", () => setTimeout(sync, 0));
+}
+if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) trackTerminalFocus();
+
 /** Copy / paste. In xterm Ctrl+C is SIGINT and the app blocks the native
  *  context menu, so selected text could not be copied at all. Copying is
  *  explicit and only Ctrl+Shift+C (Ctrl+C stays an interrupt); Ctrl+V /

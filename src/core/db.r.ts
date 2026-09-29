@@ -7,6 +7,7 @@
  */
 import type {
   Conversation,
+  Effort,
   Model,
   OAuthTokens,
   PermMode,
@@ -24,7 +25,7 @@ import type {
   StoredImage,
   StoredMessage,
 } from "./types.i";
-import { NO_PROJECT } from "./types.i";
+import { NO_PROJECT, isCliKind } from "./types.i";
 
 export type { Model, OAuthTokens, Provider, StoredImage, StoredMessage };
 
@@ -909,6 +910,123 @@ async function invokeDiscovery(provider: Provider, apiKey: string): Promise<Disc
   }
 }
 
+/* ---------- Subscription CLIs (Codex / Claude Code / Antigravity CLI) ---------- */
+
+/** What Rust knows about a provider's CLI (cli/mod.rs → CliStatus). */
+export interface CliStatus {
+  installed: boolean;
+  /** "path" = the user's own install, "managed" = downloaded by the app. */
+  source: string;
+  path: string;
+  installing: boolean;
+  /** null when the CLI cannot tell without a real request. */
+  signed_in: boolean | null;
+  account: string;
+}
+
+/** Background download progress (`cli://progress`). */
+export interface CliProgress {
+  cli: "codex" | "claude" | "antigravity";
+  stage: "download" | "extract" | "done" | "error";
+  percent: number;
+  message: string;
+}
+
+const CLI_OF: Record<string, CliProgress["cli"]> = {
+  "openai-cli": "codex",
+  "anthropic-cli": "claude",
+  "google-cli": "antigravity",
+};
+
+export function cliIdOf(kind: string): CliProgress["cli"] | undefined {
+  return CLI_OF[kind];
+}
+
+async function cliInvoke(cmd: string, kind: string): Promise<CliStatus> {
+  if (!inTauri) throw new Error("Needs the desktop shell (npm run tauri:dev)");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<CliStatus>(cmd, { kind });
+}
+
+export const cliStatus = (kind: string) => cliInvoke("cli_status", kind);
+/** Starts the background download when no CLI is usable; returns at once. */
+export const cliInstall = (kind: string) => cliInvoke("cli_install", kind);
+/** Opens the vendor's browser sign-in and resolves once it completes. */
+export const cliLogin = (kind: string) => cliInvoke("cli_login", kind);
+export const cliLogout = (kind: string) => cliInvoke("cli_logout", kind);
+
+/** One limit window of a subscription. */
+export interface CliUsageWindow {
+  /** The models it covers ("Gemini Models"), or "". */
+  group: string;
+  /** "5-hour limit", "Weekly limit"… */
+  label: string;
+  /** 0–100. */
+  used_percent: number;
+  /** When it refills (ISO 8601), if known. */
+  resets_at: string | null;
+}
+
+/** A subscription's plan and limits, as its CLI reports them. */
+export interface CliUsage {
+  plan: string;
+  windows: CliUsageWindow[];
+}
+
+export async function cliUsage(kind: string): Promise<CliUsage> {
+  if (!inTauri) throw new Error("Needs the desktop shell");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<CliUsage>("cli_usage", { kind });
+}
+
+/** Last known limits per CLI kind, kept in the settings table so the menu
+ *  shows numbers at once (also after a restart) while fresh ones load. */
+export interface SavedCliUsage {
+  usage: CliUsage;
+  /** Unix ms of the reading. */
+  at: number;
+}
+
+const usageListeners = new Set<(kind: string, saved: SavedCliUsage) => void>();
+const usageInFlight = new Map<string, Promise<SavedCliUsage>>();
+
+export async function savedCliUsage(kind: string): Promise<SavedCliUsage | null> {
+  const raw = await getSetting(`cli_usage:${kind}`).catch(() => null);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as SavedCliUsage;
+  } catch {
+    return null;
+  }
+}
+
+/** Reads fresh limits, saves them and tells every listener (one read at a time per kind). */
+export function refreshCliUsage(kind: string): Promise<SavedCliUsage> {
+  const running = usageInFlight.get(kind);
+  if (running) return running;
+  const job = cliUsage(kind)
+    .then(async (usage) => {
+      const saved = { usage, at: Date.now() };
+      await setSetting(`cli_usage:${kind}`, JSON.stringify(saved)).catch(() => {});
+      usageListeners.forEach((fn) => fn(kind, saved));
+      return saved;
+    })
+    .finally(() => usageInFlight.delete(kind));
+  usageInFlight.set(kind, job);
+  return job;
+}
+
+export function onCliUsage(fn: (kind: string, saved: SavedCliUsage) => void): () => void {
+  usageListeners.add(fn);
+  return () => usageListeners.delete(fn);
+}
+
+export async function onCliProgress(handler: (p: CliProgress) => void): Promise<() => void> {
+  if (!inTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<CliProgress>("cli://progress", (e) => handler(e.payload));
+}
+
 /* ---------- Inference ---------- */
 
 export interface ChatTurn {
@@ -933,7 +1051,7 @@ export interface ProviderConfig {
   model: string;
   system: string;
   /** `low`, `medium` or `high` — ignored by providers without reasoning modes. */
-  effort?: "low" | "medium" | "high";
+  effort?: Effort | "none";
   /** Images attached to the final user turn. */
   images?: ImageAttachment[];
   /** Provider row id — the limiter budgets requests under this key. */
@@ -942,6 +1060,8 @@ export interface ProviderConfig {
   rate_limit_rpm?: number;
   /** Max parallel requests (0 = unlimited). */
   concurrency?: number;
+  /** Longest answer, tokens — the user's cap for an API model. */
+  max_tokens?: number;
 }
 
 /**
@@ -1032,6 +1152,8 @@ export async function credentialFor(
     if (res.error) return { apiKey: "", auth: "key", error: res.error };
     return { apiKey: res.token ?? "", auth: "bearer" };
   }
+  // Subscription CLIs authenticate with their own stored sign-in.
+  if (isCliKind(provider.kind)) return { apiKey: "", auth: "key" };
   if (!provider.api_key.trim()) {
     // Local servers (Ollama, LM Studio, llama.cpp, vLLM on this machine or
     // the LAN) take no key — refusing them here blocked every Ollama call.
@@ -1052,7 +1174,7 @@ export interface AgentRequest {
   system: string;
   workspace: string;
   /** `low`, `medium` or `high` — reasoning depth where the provider supports it. */
-  effort?: "low" | "medium" | "high";
+  effort?: Effort | "none";
   /** When true, commands run without asking; false shows an Allow/Deny prompt. */
   auto_run?: boolean;
   /** Images attached to the final user turn. */
@@ -1070,6 +1192,8 @@ export interface AgentRequest {
   rate_limit_rpm?: number;
   /** Max parallel requests (0 = unlimited). */
   concurrency?: number;
+  /** Longest answer, tokens — the user's cap for an API model. */
+  max_tokens?: number;
   /** Helper agents the main agent may delegate to (Settings → Agent). */
   subagents?: Subagent[];
   /** How many helper agents may work at the same time. */
@@ -2380,4 +2504,71 @@ export async function appWorkspace(): Promise<string> {
   } catch {
     return "";
   }
+}
+
+/* ---------- Model capabilities set by hand (API providers) ---------- */
+
+/**
+ * API endpoints can serve anything, so their model limits and abilities are
+ * the user's to set (Settings → Models → a model's gear). Every other
+ * provider is automatic (catalog / Ollama / the CLI). null = automatic.
+ */
+export interface ModelCapsOverride {
+  /** Context window, tokens. */
+  context: number | null;
+  /** Longest answer, tokens. */
+  maxOutput: number | null;
+  /** Accepts images. */
+  vision: boolean;
+  /** Accepts attached files (inlined text). */
+  files: boolean;
+  /** Can call tools — off means agent mode runs as plain chat. */
+  tools: boolean;
+  /** Takes a reasoning effort. */
+  reasoning: boolean;
+}
+
+const API_KINDS = ["openai-responses", "openai-completions", "anthropic-messages", "openai", "openai-compatible"];
+
+/** Providers whose models are configured by hand. */
+export function isApiKind(kind: string): boolean {
+  return API_KINDS.includes(kind);
+}
+
+export async function loadModelCaps(rowId: string): Promise<ModelCapsOverride | null> {
+  try {
+    const raw = await getSetting(`model_caps:${rowId}`);
+    return raw ? (JSON.parse(raw) as ModelCapsOverride) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveModelCaps(rowId: string, caps: ModelCapsOverride | null): Promise<void> {
+  await setSetting(`model_caps:${rowId}`, caps ? JSON.stringify(caps) : "");
+  capsListeners.forEach((fn) => fn(rowId));
+}
+
+const capsListeners = new Set<(rowId: string) => void>();
+/** Called when a model's caps change (the prompt box re-reads them). */
+export function onModelCapsChanged(fn: (rowId: string) => void): () => void {
+  capsListeners.add(fn);
+  return () => capsListeners.delete(fn);
+}
+
+/** Model info with the user's own numbers on top (API providers only). */
+export async function effectiveModelInfo(kind: string, baseUrl: string, modelId: string, rowId: string): Promise<ModelInfo> {
+  const [info, caps] = await Promise.all([
+    modelInfo(kind, baseUrl, modelId),
+    isApiKind(kind) ? loadModelCaps(rowId) : Promise.resolve(null),
+  ]);
+  if (!caps) return info;
+  return {
+    ...info,
+    context: caps.context ?? info.context,
+    maxOutput: caps.maxOutput ?? info.maxOutput,
+    vision: caps.vision,
+    tools: caps.tools,
+    reasoning: caps.reasoning,
+  };
 }

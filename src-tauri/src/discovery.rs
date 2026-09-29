@@ -35,6 +35,15 @@ pub async fn list_provider_models(req: DiscoveryRequest) -> Result<Vec<Discovere
     let base = req.base_url.trim().trim_end_matches('/').to_string();
     let key = req.api_key.trim().to_string();
 
+    // Subscription CLIs: the model list comes from the installed CLI itself.
+    if let Some(cli) = crate::cli::Cli::from_kind(&req.kind) {
+        return Ok(crate::cli::models(cli)
+            .await?
+            .into_iter()
+            .map(|(model_id, name, meta)| DiscoveredModel { model_id, name, meta })
+            .collect());
+    }
+
     match req.kind.as_str() {
         "google" => list_google(&base, &key, &req.auth).await,
         "ollama" => list_ollama(&base).await,

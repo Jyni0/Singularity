@@ -592,6 +592,49 @@ textarea::-webkit-scrollbar {
     0 8px 32px rgba(0, 0, 0, 0.35);
 }
 
+/* The lip: one glass surface around the prompt box and the strip under it
+   (attach / mic, context / model / effort). The blur lives on the lip alone,
+   since a backdrop-filter nested in another one only sees its parent, not
+   the aurora. So the box inside is clear and reads exactly like the
+   "Latest" pill. The strip adds a faint tint, carried up into the corners
+   beside the box's rounded bottom so there are no gaps. No shadows. */
+.prompt-lip {
+  background: color-mix(in srgb, var(--bg-surface) 62%, transparent);
+  backdrop-filter: blur(18px) saturate(1.25);
+  -webkit-backdrop-filter: blur(18px) saturate(1.25);
+  border: 1px solid color-mix(in srgb, var(--text-main) 12%, transparent);
+}
+.prompt-lip > .prompt-glass {
+  margin: -1px -1px 0;
+  width: calc(100% + 2px);
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, #ffffff 8%, transparent);
+}
+.prompt-lip-strip {
+  --lip-tint: color-mix(in srgb, var(--text-main) 4%, transparent);
+  position: relative;
+  background: var(--lip-tint);
+  border-radius: 0 0 17px 17px;
+}
+.prompt-lip-strip::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -16px;
+  height: 16px;
+  background: var(--lip-tint);
+  pointer-events: none;
+  -webkit-mask:
+    radial-gradient(circle at 100% 0, transparent 15.5px, #000 16px) left / 16px 16px no-repeat,
+    radial-gradient(circle at 0 0, transparent 15.5px, #000 16px) right / 16px 16px no-repeat;
+  mask:
+    radial-gradient(circle at 100% 0, transparent 15.5px, #000 16px) left / 16px 16px no-repeat,
+    radial-gradient(circle at 0 0, transparent 15.5px, #000 16px) right / 16px 16px no-repeat;
+}
+
 /* ---------- Text selection policy ----------
    Selection is OFF everywhere by default (desktop-app feel) and explicitly
    re-enabled only where reading/copying text is the point: the chat thread,

@@ -15,6 +15,11 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    // Cargo writes/locks thousands of files under src-tauri/target; watching them
+    // crashes Vite on Windows with EBUSY. Rust changes are handled by the Tauri CLI.
+    watch: {
+      ignored: ["**/src-tauri/**"],
+    },
   },
   build: {
     target: "es2022",

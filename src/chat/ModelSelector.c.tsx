@@ -1,9 +1,10 @@
-/* ---------- Model selector (gateways → submenu flies right) ---------- */
+/* ---------- Model selector (gateways → submenu flies left) ---------- */
+/* Sits in the lip under the prompt box; the effort has its own chip. */
 import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { Zap, ChevronDown, ChevronRight, Check, Server } from "lucide-react";
+import { Zap, Check, Server } from "lucide-react";
 import { Gateway } from "../core/types.i";
-import { CHIP, POPOVER, POPOVER_LABEL, popoverItem, popMotion } from "../ui/tokens.s";
+import { LIP_CHIP, POPOVER, POPOVER_LABEL, popoverItem, popMotion } from "../ui/tokens.s";
 import { OverlayScroll } from "../ui/ScrollArea.c";
 
 export function ModelSelector({
@@ -52,7 +53,7 @@ export function ModelSelector({
 
   if (!gw || !model) {
     return (
-      <span className={`${CHIP} cursor-default opacity-60`} title="No models available — connect a provider in Settings → Models">
+      <span className={`${LIP_CHIP} cursor-default opacity-60`} title="No models available — connect a provider in Settings → Models">
         <Zap size={12} strokeWidth={1.5} />
         No models
       </span>
@@ -61,15 +62,16 @@ export function ModelSelector({
 
   return (
     <div className="relative min-w-0" ref={ref}>
-      <span className={`${CHIP} max-w-full ${open ? "bg-[var(--hover-bg)] text-[var(--text-main)]" : ""}`} onClick={() => setOpen(!open)} title="Model">
-        <Zap size={12} strokeWidth={1.5} className="shrink-0" />
+      <span
+        className={`${LIP_CHIP} max-w-full ${open ? "bg-[var(--hover-bg)] text-[var(--text-main)]" : ""}`}
+        onClick={() => setOpen(!open)}
+        title={`${model.name} · ${gw.name}`}
+      >
         <span className="truncate">{model.name}</span>
-        <span className="truncate text-[var(--text-dim)]">· {gw.name}</span>
-        <ChevronDown size={12} className="shrink-0" />
       </span>
       <AnimatePresence>
         {open && (
-          <motion.div className={`${POPOVER} absolute bottom-[calc(100%+8px)] left-0 w-[240px] gap-0.5`} {...popMotion(true)}>
+          <motion.div className={`${POPOVER} absolute bottom-[calc(100%+8px)] right-0 w-[240px] gap-0.5`} {...popMotion(true)}>
             <div className={POPOVER_LABEL}>Provider</div>
             {usable.map((g) => (
               <div
@@ -88,15 +90,14 @@ export function ModelSelector({
                     title={g.status}
                   />
                   {g.id === gw.id && <Check size={13} className="shrink-0 text-[var(--accent)]" />}
-                  <ChevronRight size={12} className="shrink-0 text-[var(--text-dim)]" />
                 </button>
                 <AnimatePresence>
                   {hoveredGw === g.id && (
                     <motion.div
-                      className={`${POPOVER} absolute bottom-[-6px] left-[calc(100%+10px)] z-[210] w-[250px]`}
-                      initial={{ opacity: 0, x: -6 }}
+                      className={`${POPOVER} absolute bottom-[-6px] right-[calc(100%+10px)] z-[210] w-[250px]`}
+                      initial={{ opacity: 0, x: 6 }}
                       animate={{ opacity: 1, x: 0 }}
-                      exit={{ opacity: 0, x: -6 }}
+                      exit={{ opacity: 0, x: 6 }}
                       transition={{ duration: 0.12, ease: "easeOut" }}
                     >
                       <div className={POPOVER_LABEL}>

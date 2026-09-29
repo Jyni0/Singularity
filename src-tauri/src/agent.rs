@@ -14,8 +14,10 @@ mod cachenet;
 mod context;
 mod expand;
 mod model;
+mod plain;
 mod prompt;
 mod runtime;
+pub use plain::stream as stream_plain;
 pub use runtime::ContextPart;
 
 use crate::tools;
@@ -228,6 +230,10 @@ pub struct AgentRequest {
     /// run gives up. Settings → Agent; default 5.
     #[serde(default = "default_retries")]
     pub max_retries: usize,
+    /// Longest answer, tokens — set by hand for API models (Settings →
+    /// Models); None keeps the provider's own default.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
 }
 
 fn default_retries() -> usize {
@@ -443,22 +449,4 @@ pub struct RunUsage {
     /// Our estimate of that same request (context_info's method): the
     /// context gauge scales its estimates by first_input / first_est.
     pub first_est: u64,
-}
-
-/// Token accounting as reported by OpenAI-compatible providers (plain chat).
-#[derive(Debug, Clone, Deserialize)]
-pub struct OpenAiUsage {
-    #[serde(default)]
-    pub prompt_tokens: u64,
-    #[serde(default)]
-    pub completion_tokens: u64,
-    #[serde(default)]
-    pub prompt_tokens_details: Option<PromptTokensDetails>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PromptTokensDetails {
-    /// Tokens served from the provider's prompt cache (cheaper, faster).
-    #[serde(default)]
-    pub cached_tokens: u64,
 }

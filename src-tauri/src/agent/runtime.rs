@@ -1577,7 +1577,7 @@ pub(super) async fn run(
     };
     let turns = expand_turns(skills.clone(), root, turns).await?;
     ctx.usage.lock().unwrap().first_est =
-        measure(req, system, root, &skills, &mcp, &turns).iter().map(|p| p.tokens as u64).sum();
+        measure(req, system, root, &skills, &mcp, &turns, None).iter().map(|p| p.tokens as u64).sum();
     let (history, prompt) = to_messages(req, &turns);
     // The main agent may run many tool calls of one turn at once (parallel
     // reads, several delegations); at least a handful even with one helper.
@@ -1629,6 +1629,15 @@ fn item(name: impl Into<String>, text: &str) -> ContextItem {
     ContextItem { name: name.into(), tokens: est_tokens(text) }
 }
 
+/// The first words of a message, on one line.
+fn snippet(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 48 {
+        return if flat.is_empty() { "(empty)".into() } else { flat };
+    }
+    format!("{}…", flat.chars().take(47).collect::<String>())
+}
+
 fn category(label: &str, group: &'static str, mut items: Vec<ContextItem>) -> ContextPart {
     items.sort_by(|a, b| b.tokens.cmp(&a.tokens));
     ContextPart { label: label.into(), group, tokens: items.iter().map(|i| i.tokens).sum(), items }
@@ -1649,8 +1658,10 @@ pub(super) async fn context_info(
     let counter = AtomicUsize::new(0);
     let skills = Arc::new(crate::skills::for_run(app, &req.workspace));
     let mcp = load_mcp(app, "context-info", &counter).await;
+    // The latest prompt as typed: the rest of its expanded text is @files.
+    let raw_last = turns.iter().rev().find(|t| t.role != "agent" && t.role != "assistant").map(|t| t.text.clone());
     let turns = expand_turns(skills.clone(), root, turns).await?;
-    Ok(measure(req, system, root, &skills, &mcp, &turns))
+    Ok(measure(req, system, root, &skills, &mcp, &turns, raw_last.as_deref()))
 }
 
 /// Estimated tokens per category of one request (see context_info). The
@@ -1662,34 +1673,34 @@ fn measure(
     skills: &[crate::skills::Skill],
     mcp: &[McpBinding],
     turns: &[crate::chat::ChatTurn],
+    raw_last: Option<&str>,
 ) -> Vec<ContextPart> {
     let mut parts = Vec::new();
 
-    // Messages: the conversation history + the latest prompt.
+    // Messages: one line per message ("You · first words…"), the latest
+    // prompt split from the @files expanded into it.
     let is_user = |r: &str| r != "agent" && r != "assistant";
     let last_user = turns.iter().rposition(|t| is_user(&t.role));
-    let (mut user, mut agent, mut n_user, mut n_agent) = (String::new(), String::new(), 0, 0);
-    for (i, t) in turns.iter().enumerate() {
-        if Some(i) == last_user {
-            continue;
-        }
-        if is_user(&t.role) {
-            user.push_str(&t.text);
-            n_user += 1;
-        } else {
-            agent.push_str(&t.text);
-            n_agent += 1;
-        }
-    }
     let mut msgs = Vec::new();
-    if n_user > 0 {
-        msgs.push(item(format!("Your earlier messages ({n_user})"), &user));
-    }
-    if n_agent > 0 {
-        msgs.push(item(format!("Agent replies ({n_agent}, clipped)"), &agent));
-    }
-    if let Some(i) = last_user {
-        msgs.push(item("Latest message (with @files expanded)", &turns[i].text));
+    for (i, t) in turns.iter().enumerate() {
+        let who = if !is_user(&t.role) {
+            "Agent"
+        } else if Some(i) == last_user {
+            "Latest"
+        } else {
+            "You"
+        };
+        match raw_last.filter(|_| Some(i) == last_user) {
+            Some(raw) => {
+                let typed = item(format!("{who} · {}", snippet(raw)), raw);
+                let files = est_tokens(&t.text).saturating_sub(typed.tokens);
+                msgs.push(typed);
+                if files > 0 {
+                    msgs.push(ContextItem { name: "Latest · attached @files".into(), tokens: files });
+                }
+            }
+            None => msgs.push(item(format!("{who} · {}", snippet(&t.text)), &t.text)),
+        }
     }
     parts.push(category("Messages", "messages", msgs));
 

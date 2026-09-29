@@ -17,6 +17,10 @@ export const ROW_ACTIVE = "bg-[var(--hover-bg)]";
 export const CHIP =
   "inline-flex h-7 shrink-0 cursor-pointer items-center gap-1.5 rounded-md px-2.5 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
 
+/** Chip in the prompt lip (model, effort): small and quiet. */
+export const LIP_CHIP =
+  "inline-flex h-7 shrink-0 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
+
 /** Context chip: h 24px, padding 0 8px, 11px */
 export const CHIP_CTX =
   "inline-flex h-6 shrink-0 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[11px] text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";

@@ -20,7 +20,7 @@
 use super::context::one_line;
 use super::prompt::{summarize, tool_specs};
 use super::{
-    ask_confirm, cancelled_result, emit_step, emit_text, emit_think, emit_usage, is_cancelled,
+    ask_confirm, cancelled_result, emit_retry, emit_step, emit_text, emit_think, emit_usage, is_cancelled,
     model, run_ssh_tool, AgentRequest, RunUsage, SubagentDef, MAX_TURNS,
 };
 use crate::tools;
@@ -1330,16 +1330,7 @@ async fn run_with_retry(
         }
         attempt += 1;
         let who = label.map(|l| format!("{l}: ")).unwrap_or_default();
-        emit_text(
-            &ctx.app,
-            &ctx.run_id,
-            format!(
-                "\n\n⚠️ {who}{} — retrying in {}s ({attempt}/{})…\n\n",
-                one_line(&err, 200),
-                RETRY_DELAY.as_secs(),
-                ctx.req.max_retries
-            ),
-        );
+        emit_retry(&ctx.app, &ctx.run_id, format!("{who}{}", one_line(&err, 300)), attempt, ctx.req.max_retries);
         tokio::select! {
             _ = tokio::time::sleep(RETRY_DELAY) => {}
             _ = crate::cancel::cancel_signal(&ctx.run_id) => return cancelled_result(text),

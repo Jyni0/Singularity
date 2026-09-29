@@ -128,6 +128,15 @@ pub struct AgentText {
     pub delta: String,
 }
 
+/// A failed request of the run that is retried after a pause.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentRetry {
+    pub run_id: String,
+    pub message: String,
+    pub attempt: usize,
+    pub max: usize,
+}
+
 /// Reasoning the model streams separately from its answer (DeepSeek "think"
 /// mode, Anthropic extended thinking, OpenAI o-series). Shown in its own
 /// collapsible block so it never pollutes the reply.
@@ -358,6 +367,19 @@ fn emit_text(app: &AppHandle, run_id: &str, delta: impl Into<String>) {
         AgentText {
             run_id: run_id.to_string(),
             delta,
+        },
+    );
+}
+
+fn emit_retry(app: &AppHandle, run_id: &str, message: String, attempt: usize, max: usize) {
+    crate::runs::push_event(run_id, crate::runs::RunEvent::Retry { message: message.clone(), attempt, max });
+    let _ = app.emit(
+        "agent://retry",
+        AgentRetry {
+            run_id: run_id.to_string(),
+            message,
+            attempt,
+            max,
         },
     );
 }

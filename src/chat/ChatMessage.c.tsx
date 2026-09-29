@@ -267,6 +267,7 @@ function ChatMessageView({
   streaming,
   durationMs,
   images,
+  error,
   debugMode,
   onEdit,
   onInspectStep,
@@ -281,6 +282,8 @@ function ChatMessageView({
   durationMs?: number;
   /** Photos attached to the message — clickable, open in the side panel. */
   images?: db.StoredImage[];
+  /** Why the turn failed — red text under what it produced. */
+  error?: string;
   /** Debug mode: render the live token HUD. */
   debugMode?: boolean;
   /** User prompts only: rewrite this prompt and run it again. */
@@ -299,6 +302,7 @@ function ChatMessageView({
       if (s.kind === "text" || s.kind === "think") return n + s.text.length;
       if (s.kind === "step") return n + (s.step.result?.length ?? 0) * 7 + (s.step.input.length) * 3 + (s.step.done ? 1 : 0) * 13;
       if (s.kind === "usage") return n + (s.usage.completion_tokens ?? 0) * 3;
+      if (s.kind === "retry") return n + s.attempt * 17;
       return n;
     }, 0) ?? 0);
   const lastChange = { current: changedAt(signature, !!streaming) };
@@ -383,8 +387,10 @@ function ChatMessageView({
           if (seg.kind === "text") {
             return seg.text.trim() ? <Markdown key={`t${i}`} text={seg.text} /> : null;
           }
+          if (seg.kind === "retry") return <RetryNotice key={`r${i}`} retry={seg} />;
           return null;
         })}
+        {error && <ErrorText text={error} />}
         <LiveTail streaming={streaming} lastChange={lastChange} segments={segments} />
         <div className="flex items-center justify-between">
           {actions || <span />}
@@ -398,11 +404,29 @@ function ChatMessageView({
   return (
     <div className="group -mx-3 flex flex-col gap-1.5 rounded-xl px-3 py-2 transition-colors hover:bg-[var(--hover-bg)]/40">
       {answerText && <Markdown text={text} />}
+      {error && <ErrorText text={error} />}
       <LiveTail streaming={streaming} lastChange={lastChange} />
       <div className="flex items-center justify-between">
         {actions || <span />}
         <DurationFooter streaming={streaming} durationMs={durationMs} />
       </div>
+    </div>
+  );
+}
+
+/** Why a turn failed: plain red text, nothing more. */
+function ErrorText({ text }: { text: string }) {
+  return <div className="select-text whitespace-pre-wrap break-words text-[13px] leading-relaxed text-[var(--diff-del)]">{text}</div>;
+}
+
+/** A failed request being retried: one line whose counter moves. */
+function RetryNotice({ retry }: { retry: { message: string; attempt: number; max: number } }) {
+  return (
+    <div className="flex min-w-0 items-baseline gap-2 text-[12.5px]" title={retry.message}>
+      <span className="shrink-0 text-[var(--text-muted)]">
+        Retrying {retry.attempt}/{retry.max}
+      </span>
+      <span className="min-w-0 truncate text-[var(--diff-del)]">{retry.message}</span>
     </div>
   );
 }
@@ -506,6 +530,7 @@ export const ChatMessage = memo(ChatMessageView, (a: ChatMessageProps, b: ChatMe
   a.streaming === b.streaming &&
   a.durationMs === b.durationMs &&
   a.images === b.images &&
+  a.error === b.error &&
   a.debugMode === b.debugMode &&
   !!a.onEdit === !!b.onEdit
 );

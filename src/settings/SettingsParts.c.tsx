@@ -38,10 +38,10 @@ export function SettingRow({
   children?: React.ReactNode;
 }) {
   return (
-    <div className="flex items-center gap-3">
+    <div className="flex min-w-0 items-center gap-4 py-0.5">
       <div className="min-w-0 flex-1">
         <div className="text-[13px] text-[var(--text-main)]">{title}</div>
-        {hint && <div className="mt-0.5 text-[12px] text-[var(--text-dim)]">{hint}</div>}
+        {hint && <div className="mt-0.5 text-[12px] leading-snug text-[var(--text-dim)]">{hint}</div>}
       </div>
       {children && <div className="flex shrink-0 items-center">{children}</div>}
     </div>
@@ -50,7 +50,7 @@ export function SettingRow({
 
 export function SettingsCard({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex flex-col gap-3 rounded-xl border border-[var(--border)] bg-[var(--bg-surface)] px-4 py-3.5">
+    <div className="flex min-w-0 flex-col gap-3 rounded-lg border border-[var(--border-soft)] bg-[var(--bg-surface)] px-4 py-3">
       {children}
     </div>
   );

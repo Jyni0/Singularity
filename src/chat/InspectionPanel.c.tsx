@@ -6,13 +6,14 @@
  * are no list/overview screens anymore. The panel itself is drag-resizable
  * from its left edge; the width is owned (and persisted) by the App.
  */
-import { FileDiff, Terminal, Wrench, X, Image as ImageIcon } from "lucide-react";
+import { Activity, FileDiff, Terminal, Wrench, X, Image as ImageIcon } from "lucide-react";
 import { motion } from "motion/react";
 import type { Msg, PanelOpen, PanelTabSpec } from "./message.i";
 import { collectSteps } from "./message.u";
 import { computeDiff } from "../utils/diff.u";
 import type * as db from "../core/db.r";
 import { OverlayScroll } from "../ui/ScrollArea.c";
+import { BgTaskView } from "./BackgroundTasks.c";
 
 /** Renders a file's diff, reused by the file tab. */
 function FileDiffBody({ step }: { step: db.AgentStepEvent }) {
@@ -63,12 +64,15 @@ function tabIcon(t: PanelTabSpec) {
   if (t.type === "file") return <FileDiff size={12} strokeWidth={1.8} />;
   if (t.type === "command") return <Terminal size={12} strokeWidth={1.8} />;
   if (t.type === "image") return <ImageIcon size={12} strokeWidth={1.8} />;
+  if (t.type === "bgtask") return <Activity size={12} strokeWidth={1.8} />;
   return <Wrench size={12} strokeWidth={1.8} />;
 }
 
 function TabBody({ tab, msgs }: { tab: PanelTabSpec; msgs: Msg[] }) {
   // Steps of THIS conversation resolve file/command/tool tabs by identity.
   const steps = collectSteps(msgs);
+
+  if (tab.type === "bgtask") return <BgTaskView id={tab.taskId} />;
 
   if (tab.type === "image") {
     return (

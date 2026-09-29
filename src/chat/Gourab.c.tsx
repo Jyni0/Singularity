@@ -58,11 +58,8 @@ function readActivity(segments: Segment[] | undefined): { activity: Activity; de
   const tail = [...(segments ?? [])].reverse().find((s) => s.kind !== "usage");
   if (!tail) return { activity: "thinking", detail: "" };
   if (tail.kind === "think") return { activity: "thinking", detail: "" };
-  if (tail.kind === "text") {
-    const lastLine = tail.text.trimEnd().split("\n").pop() ?? "";
-    if (/retrying in \d+s/.test(lastLine)) return { activity: "retrying", detail: "" };
-    return { activity: "writing", detail: "" };
-  }
+  if (tail.kind === "retry") return { activity: "retrying", detail: "" };
+  if (tail.kind === "text") return { activity: "writing", detail: "" };
   if (tail.kind === "step") {
     const { name, input, done } = tail.step;
     // A finished tool means the model is deciding what comes next.

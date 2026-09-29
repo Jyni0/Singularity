@@ -1,6 +1,25 @@
 import { useState, useEffect } from "react";
 import { motion } from "motion/react";
-import { Folder, Settings as SettingsIcon, Trash2, X } from "lucide-react";
+import {
+  Bot,
+  Box,
+  Folder,
+  FolderCog,
+  Folders,
+  Info,
+  Palette,
+  Plug,
+  Puzzle,
+  ScrollText,
+  Settings as SettingsIcon,
+  ShieldCheck,
+  SlidersHorizontal,
+  Sparkles,
+  SquareTerminal,
+  Trash2,
+  X,
+  type LucideIcon,
+} from "lucide-react";
 import type { Model, Project, Provider, Theme, PermMode } from "../core/types.i";
 import { APP_VERSION, NO_PROJECT, THEME_LIST } from "../core/types.i";
 import { Combobox } from "../ui/Combobox.c";
@@ -21,6 +40,7 @@ import { PluginsSettings } from "./PluginsSettings.c";
 
 export type SettingsSection =
   | "general"
+  | "appearance"
   | "permissions"
   | "projects"
   | "project-settings"
@@ -113,7 +133,7 @@ export function SettingsModal({
   const [section, setSection] = useState<SettingsSection>(initialSection ?? "general");
   // A section that this mode does not offer (deep link / stale state) lands
   // on General — General and About exist in EVERY mode.
-  const sshSections: SettingsSection[] = ["general", "terminal", "logs", "about"];
+  const sshSections: SettingsSection[] = ["general", "appearance", "terminal", "logs", "about"];
   const effectiveSection = mode === "ssh" && !sshSections.includes(section) ? "general" : section;
   const [settingsProject, setSettingsProject] = useState<string | null>(initialProject ?? null);
   const [name, setName] = useState("");
@@ -133,52 +153,85 @@ export function SettingsModal({
     setName("");
   };
 
-  // Both modes share this modal. General/About (and their groups) are always
-  // available; agent-specific sections show in agent mode only, the SSH
-  // Terminal section in SSH Client mode only.
-  type NavItem = { id: SettingsSection; label: string };
-  type NavGroup = { group: string; items: NavItem[] };
-  const settingsItems: NavItem[] =
+  // Both modes share this modal. General, Appearance and About exist in
+  // every mode; the agent sections show in agent mode only, the SSH
+  // Terminal and Logs in SSH Client mode only. Grouped by what they touch.
+  type NavItem = { id: SettingsSection; label: string; icon: LucideIcon };
+  type NavGroup = { group?: string; items: NavItem[] };
+  const basics: NavGroup = {
+    items: [
+      { id: "general", label: "General", icon: SlidersHorizontal },
+      { id: "appearance", label: "Appearance", icon: Palette },
+    ],
+  };
+  const navItems: NavGroup[] =
     mode === "agent"
       ? [
-          { id: "general", label: "General" },
-          { id: "models", label: "Models" },
-          { id: "agents", label: "Agent" },
-          { id: "plugins", label: "Plugins" },
-          { id: "skills", label: "Skills" },
-          { id: "mcp", label: "MCP Servers" },
-        ]
-      : [
-          { id: "general", label: "General" },
-          { id: "terminal", label: "Terminal" },
-          { id: "logs", label: "Logs" },
-        ];
-  const navItems: NavGroup[] = [
-    { group: "Settings", items: settingsItems },
-    ...(mode === "agent"
-      ? ([
+          basics,
+          {
+            group: "Agent",
+            items: [
+              { id: "models", label: "Models", icon: Box },
+              { id: "agents", label: "Subagents", icon: Bot },
+              { id: "permissions", label: "Permissions", icon: ShieldCheck },
+            ],
+          },
+          {
+            group: "Extensions",
+            items: [
+              { id: "plugins", label: "Plugins", icon: Puzzle },
+              { id: "skills", label: "Skills", icon: Sparkles },
+              { id: "mcp", label: "MCP Servers", icon: Plug },
+            ],
+          },
           {
             group: "Projects",
             items: [
-              { id: "permissions", label: "Permissions" },
-              { id: "projects", label: "Manage Projects" },
-              { id: "project-settings", label: "Project Settings" },
+              { id: "projects", label: "Projects", icon: Folders },
+              { id: "project-settings", label: "Project Settings", icon: FolderCog },
             ],
           },
-        ] as NavGroup[])
-      : []),
-    { group: "App", items: [{ id: "about", label: "About" }] },
-  ];
+        ]
+      : [
+          basics,
+          {
+            group: "SSH",
+            items: [
+              { id: "terminal", label: "Terminal", icon: SquareTerminal },
+              { id: "logs", label: "Logs", icon: ScrollText },
+            ],
+          },
+        ];
+
+  const navButton = (it: NavItem) => {
+    const Icon = it.icon;
+    const on = effectiveSection === it.id;
+    return (
+      <button
+        key={it.id}
+        className={`flex h-8 w-full items-center gap-2.5 rounded-md px-2.5 text-left text-[13px] transition-colors ${
+          on
+            ? "bg-[var(--hover-bg)] text-[var(--text-main)]"
+            : "text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+        }`}
+        onClick={() => setSection(it.id)}
+      >
+        <Icon size={15} strokeWidth={1.7} className="shrink-0" />
+        <span className="truncate">{it.label}</span>
+      </button>
+    );
+  };
 
   const titles: Record<SettingsSection, [string, string]> = {
-    general: ["General", "Appearance, theme and workspace defaults"],
+    general: ["General", "How the app behaves"],
+    appearance: ["Appearance", "Theme and the animation behind the chat"],
     models: ["Models", "Connect providers and manage the models they expose"],
-    agents: ["Agent", "Helper subagents and how many can work at once"],
+    agents: ["Subagents", "Helper agents, how many work at once and retries"],
     plugins: ["Plugins", "What the agent can do — built-in tools and one-click add-ons"],
     skills: ["Skills", "Instruction packs the agent loads when a task matches — or you call with /name"],
     mcp: ["MCP Servers", "External tool servers (Model Context Protocol) the agent can use"],
-    permissions: ["Global Permissions", "Tool and filesystem access rules"],
-    projects: ["Manage Projects", "Create and organize project folders"],
+    permissions: ["Permissions", "What the agent may do without asking"],
+    projects: ["Projects", "Create and organize project folders"],
     "project-settings": ["Project Settings", "Rename, permissions and delete for one project"],
     terminal: ["Terminal", "Theme and behaviour of the SSH console"],
     logs: ["Logs", "The SSH audit trail of connections and commands"],
@@ -195,47 +248,35 @@ export function SettingsModal({
       onClick={onClose}
     >
       <motion.div
-        className="flex h-[min(760px,calc(100vh-40px))] w-[min(1100px,calc(100vw-40px))] overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-app)] shadow-[0_25px_50px_-12px_rgba(0,0,0,0.7)]"
+        className="flex h-[min(720px,calc(100vh-40px))] w-[min(980px,calc(100vw-40px))] overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-app)] shadow-[0_25px_50px_-12px_rgba(0,0,0,0.7)]"
         initial={{ opacity: 0, scale: 0.97 }}
         animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.2, ease: "easeOut" }}
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Left column — categories */}
-        <ScrollArea
-          className="w-[210px] shrink-0 border-r border-[var(--border)]"
-          innerClassName="flex flex-col gap-3 px-3 py-4"
-        >
-          {navItems.map((grp) => (
-            <div key={grp.group}>
-              <div className="mb-1.5 mt-3 px-2.5 text-[11px] font-medium uppercase tracking-wide text-[var(--text-dim)] first:mt-0">
-                {grp.group}
+        {/* Left column — sections, grouped; About pinned to the bottom. */}
+        <div className="flex w-[200px] shrink-0 flex-col border-r border-[var(--border-soft)] bg-[var(--bg-surface)]">
+          <ScrollArea className="min-h-0 flex-1" innerClassName="flex flex-col gap-4 px-2 py-3">
+            {navItems.map((grp, gi) => (
+              <div key={grp.group ?? gi} className="flex flex-col gap-0.5">
+                {grp.group && <div className="px-2.5 pb-1 text-[11px] text-[var(--text-dim)]">{grp.group}</div>}
+                {grp.items.map(navButton)}
               </div>
-              {grp.items.map((it) => (
-                <button
-                  key={it.id}
-                  className={`flex h-8 w-full items-center rounded-lg px-2.5 text-left text-[13px] transition-colors ${
-                    effectiveSection === it.id
-                      ? "bg-[var(--bg-elevated)] text-[var(--text-main)]"
-                      : "text-[var(--text-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-                  }`}
-                  onClick={() => setSection(it.id)}
-                >
-                  {it.label}
-                </button>
-              ))}
-            </div>
-          ))}
-        </ScrollArea>
+            ))}
+          </ScrollArea>
+          <div className="px-2 pb-3">{navButton({ id: "about", label: "About", icon: Info })}</div>
+        </div>
 
         {/* Right column — content */}
-        <ScrollArea className="flex-1" innerClassName="px-7 py-6">
-          <div className="mb-6 flex items-start">
-            <div>
-              <div className="text-[21px] font-semibold text-[var(--text-main)]">
-                {titles[section][0]}
+        {/* min-w-0: long content (paths, descriptions) must truncate inside
+            the column, never widen it past the modal. */}
+        <ScrollArea className="min-w-0 flex-1" innerClassName="min-w-0 px-8 py-6">
+          <div className="mb-5 flex items-start">
+            <div className="min-w-0">
+              <div className="text-[17px] font-semibold text-[var(--text-main)]">
+                {titles[effectiveSection][0]}
               </div>
-              <div className="mt-1 text-[13px] text-[var(--text-dim)]">{titles[section][1]}</div>
+              <div className="mt-0.5 text-[12.5px] text-[var(--text-dim)]">{titles[effectiveSection][1]}</div>
             </div>
             <button
               className="ml-auto flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
@@ -246,7 +287,7 @@ export function SettingsModal({
             </button>
           </div>
 
-          {effectiveSection === "general" && (
+          {effectiveSection === "appearance" && (
             <SettingsCard>
               <SettingRow title="Theme" hint="Application color scheme — searchable">
                 {/* Searchable dropdown with a 3-dot palette preview per theme */}
@@ -265,7 +306,6 @@ export function SettingsModal({
                   />
                 </div>
               </SettingRow>
-              {/* Debug Mode is an agent-chat setting — agent mode only. */}
               {mode === "agent" && (
                 <>
                   <Sep />
@@ -279,6 +319,20 @@ export function SettingsModal({
                       }}
                     />
                   </SettingRow>
+                </>
+              )}
+            </SettingsCard>
+          )}
+
+          {effectiveSection === "general" && (
+            <SettingsCard>
+              <SettingRow
+                title="Background"
+                hint="Closing the window keeps the app in the system tray; agents finish their runs there"
+              />
+              {/* Debug Mode is an agent-chat setting — agent mode only. */}
+              {mode === "agent" && (
+                <>
                   <Sep />
                   <SettingRow
                     title="Debug Mode"
@@ -468,11 +522,6 @@ export function SettingsModal({
               <SettingRow
                 title="Storage"
                 hint={persistent ? "SQLite (desktop shell)" : "In-memory (browser preview)"}
-              />
-              <Sep />
-              <SettingRow
-                title="Background"
-                hint="Closing the window keeps the app in the system tray; agents finish their runs there"
               />
             </SettingsCard>
           )}

@@ -11,7 +11,10 @@ export type Segment =
   | { kind: "text"; text: string }
   | { kind: "step"; step: db.AgentStepEvent }
   /** Debug-mode token accounting of this turn (live while streaming). */
-  | { kind: "usage"; usage: db.RunUsage };
+  | { kind: "usage"; usage: db.RunUsage }
+  /** A failed request being retried: one notice, its counter moves. Gone
+   *  once the run gets going again; never stored. */
+  | ({ kind: "retry" } & db.RunRetry);
 
 export interface Msg {
   /** "compact" = a /compact summary: the model sees it instead of everything before it. */
@@ -24,6 +27,8 @@ export interface Msg {
   durationMs?: number;
   /** Images attached to this message, rendered as clickable previews. */
   images?: db.StoredImage[];
+  /** Why the turn failed — shown under whatever it produced. Live only. */
+  error?: string;
 }
 
 /**
@@ -39,7 +44,9 @@ export type PanelTabSpec =
   /** stepIndex restarts at 1 in every run — msgIndex says WHICH turn. */
   | { id: string; type: "command"; label: string; msgIndex: number; stepIndex: number }
   | { id: string; type: "tool"; label: string; msgIndex: number; stepIndex: number }
-  | { id: string; type: "image"; label: string; image: db.StoredImage };
+  | { id: string; type: "image"; label: string; image: db.StoredImage }
+  /** A background task (dev server, watcher): its live output. */
+  | { id: string; type: "bgtask"; label: string; taskId: number };
 
 /** The panel while it is open: its tab list plus the active tab id. */
 export interface PanelOpen {

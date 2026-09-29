@@ -170,12 +170,30 @@ export function useChat(options: UseChatOptions) {
 
   /** Applies one run event to the conversation's live (last) agent turn. */
   const applyNow = useCallback(
-    (convId: string, ev: { kind: "text"; delta: string } | { kind: "think"; delta: string } | { kind: "step"; step: db.AgentStepEvent } | { kind: "usage"; usage: db.RunUsage; accumulate: boolean }) => {
+    (
+      convId: string,
+      ev:
+        | { kind: "text"; delta: string }
+        | { kind: "think"; delta: string }
+        | { kind: "step"; step: db.AgentStepEvent }
+        | { kind: "usage"; usage: db.RunUsage; accumulate: boolean }
+        | { kind: "retry"; retry: db.RunRetry }
+    ) => {
       updateConvMsgs(convId, (prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
         if (!last || last.role !== "agent") return prev;
-        const segs: Segment[] = [...(last.segments ?? [])];
+        let segs: Segment[] = [...(last.segments ?? [])];
+        // One retry notice per turn: a new attempt moves its counter; once
+        // the run produces anything again it has recovered and the notice goes.
+        const retryAt = segs.findIndex((s) => s.kind === "retry");
+        if (ev.kind === "retry") {
+          if (retryAt >= 0) segs[retryAt] = { kind: "retry", ...ev.retry };
+          else segs.push({ kind: "retry", ...ev.retry });
+          next[next.length - 1] = { ...last, segments: segs };
+          return next;
+        }
+        if (retryAt >= 0 && ev.kind !== "usage") segs = segs.filter((s) => s.kind !== "retry");
         const tail = segs[segs.length - 1];
         if (ev.kind === "text") {
           // Prose appends to the open text segment; a step closes it.
@@ -580,6 +598,7 @@ export function useChat(options: UseChatOptions) {
               onStep: (step) => applyEvent(convId, { kind: "step", step }),
               onThink: (delta) => applyEvent(convId, { kind: "think", delta }),
               onUsage: (usage) => applyEvent(convId, { kind: "usage", usage, accumulate: false }),
+              onRetry: (retry) => applyEvent(convId, { kind: "retry", retry }),
               onConfirm: (req) => setConfirmReqs((prev) => ({ ...prev, [req.run_id]: req })),
             }
           )
@@ -612,7 +631,7 @@ export function useChat(options: UseChatOptions) {
       const finalSegments = (convMsgsRef.current[convId] ?? []).at(-1)?.segments;
       const stepsCount = finalSegments?.filter((s) => s.kind === "step").length ?? 0;
       if (answer.trim() || stepsCount > 0) {
-        const persisted = finalSegments?.filter((s) => s.kind !== "think");
+        const persisted = finalSegments?.filter((s) => s.kind !== "think" && s.kind !== "retry");
         await db.appendMessage(convId, "agent", answer, {
           durationMs: elapsed,
           segmentsJson: persisted && persisted.length ? JSON.stringify(persisted) : undefined,
@@ -633,14 +652,13 @@ export function useChat(options: UseChatOptions) {
       const msg = e instanceof Error ? e.message : String(e);
       const elapsed = Date.now() - startedAt;
       setErroredConv(convId);
+      // The error belongs to the turn it ended: shown under what it made.
       updateConvMsgs(convId, (prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
-        if (last && last.role === "agent" && last.text === "" && !last.segments?.length) {
-          next[next.length - 1] = { role: "agent", text: `⚠️ ${msg}`, durationMs: elapsed };
-        } else {
-          next.push({ role: "agent", text: `⚠️ ${msg}`, durationMs: elapsed });
-        }
+        const segments = last?.role === "agent" ? last.segments?.filter((s) => s.kind !== "retry") : undefined;
+        if (last && last.role === "agent") next[next.length - 1] = { ...last, segments, error: msg, durationMs: elapsed };
+        else next.push({ role: "agent", text: "", error: msg, durationMs: elapsed });
         return next;
       });
       // Save what was generated before the failure/stop.
@@ -648,7 +666,7 @@ export function useChat(options: UseChatOptions) {
         const cur = convMsgsRef.current[convId] ?? [];
         const live = cur.at(-1);
         if (live && live.role === "agent" && (live.text.trim() || live.segments?.some((s) => s.kind === "step"))) {
-          const persisted = live.segments?.filter((s) => s.kind !== "think");
+          const persisted = live.segments?.filter((s) => s.kind !== "think" && s.kind !== "retry");
           await db.appendMessage(convId, "agent", live.text, {
             durationMs: elapsed,
             segmentsJson: persisted && persisted.length ? JSON.stringify(persisted) : undefined,
@@ -892,6 +910,8 @@ export function useChat(options: UseChatOptions) {
               done: ev.done, path: ev.path, old_text: ev.old_text, new_text: ev.new_text,
             },
           });
+        } else if (ev.kind === "Retry") {
+          applyEvent(convId, { kind: "retry", retry: { message: ev.message, attempt: ev.attempt, max: ev.max } });
         } else if (ev.kind === "Confirm") {
           setConfirmReqs((prev) => ({ ...prev, [runId]: { run_id: runId, command: ev.command, cwd: ev.cwd, reason: ev.reason } }));
         }
@@ -901,7 +921,7 @@ export function useChat(options: UseChatOptions) {
       }
       const terminal = [...snapshot].reverse().find((e) => e.kind === "Done" || e.kind === "Error");
 
-      const finish = async (answer: string, failed: boolean) => {
+      const finish = async (answer: string, error?: string) => {
         localStorage.removeItem("dsh:live-run");
         dropKey(setActiveRuns, convId);
         dropKey(setRunPhase, convId);
@@ -934,18 +954,17 @@ export function useChat(options: UseChatOptions) {
           const cur = prev[convId] ?? [];
           if (!cur.length) return prev;
           const next = [...cur];
-          next[next.length - 1] = { role: "agent", text: finalText, segments: segs };
-          if (failed) next.push({ role: "agent", text: "⚠️ The run failed while the page was reloading." });
+          next[next.length - 1] = { role: "agent", text: finalText, segments: segs, error };
           return { ...prev, [convId]: next };
         });
       };
 
       if (terminal) {
-        await finish(terminal.kind === "Done" ? terminal.answer : "", terminal.kind === "Error");
+        await finish(terminal.kind === "Done" ? terminal.answer : "", terminal.kind === "Error" ? terminal.message : undefined);
         return;
       }
       if (!live.includes(runId)) {
-        await finish("", false);
+        await finish("");
         return;
       }
       const answer = await db.resumeAgent(runId, {
@@ -957,9 +976,10 @@ export function useChat(options: UseChatOptions) {
           }),
         onThink: (d) => apply({ kind: "Think", delta: d }),
         onConfirm: (req) => setConfirmReqs((prev) => ({ ...prev, [req.run_id]: req })),
+        onRetry: (r) => apply({ kind: "Retry", ...r }),
       });
       if (cancelled) return;
-      await finish(answer, false);
+      await finish(answer);
     })();
     return () => {
       cancelled = true;

@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from "motion/react";
 import {
   Send, Plus, X, Square, Mic, Loader2, Paperclip, FileText, Folder, GitBranch, SquarePen, Zap, Rabbit, Scale, Brain,
   Sparkles, Plug, ListChecks, SearchCode, BookOpen, Wrench, FlaskConical, GitCommitHorizontal,
-  ListPlus, Pencil, Play, CornerDownRight, Minimize2,
+  ListPlus, Pencil, Play, Minimize2, ChevronUp,
 } from "lucide-react";
 import * as db from "../core/db.r";
 import type { Project, Gateway, Attachment, Effort } from "../core/types.i";
@@ -12,9 +12,10 @@ import { clampEffort, effortsFor } from "../core/types.i";
 import type { ChatSelection, QueuedPrompt } from "../hooks/useChat.h";
 import { toAttachments, formatSize } from "../utils/attachments.u";
 import { useDictation } from "../hooks/useDictation.h";
-import { BackgroundTasks } from "./BackgroundTasks.c";
+import { BgTasksChip } from "./BackgroundTasks.c";
 import { useOverlayThumb } from "../hooks/useOverlayThumb.h";
 import { Thumb } from "../ui/Thumb.c";
+import { ScrollBox } from "../ui/ScrollArea.c";
 
 import { EffortChip } from "./EffortChip.c";
 import { ModelSelector } from "./ModelSelector.c";
@@ -76,6 +77,7 @@ export function PromptBox({
   queued = [],
   onTakeQueued,
   onRunQueued,
+  onOpenBgTask,
   contextMeter,
 }: {
   onSend: (text: string, selection: ChatSelection, attachments: Attachment[]) => void;
@@ -104,6 +106,8 @@ export function PromptBox({
   onTakeQueued?: (id: string) => QueuedPrompt | undefined;
   /** Sends a queued prompt now (the queue is paused after Stop). */
   onRunQueued?: (id: string) => void;
+  /** Opens a background task (dev server, watcher) in the side panel. */
+  onOpenBgTask?: (task: db.BgTask) => void;
 }) {
   const [text, setText] = useState("");
   const [gatewayId, setGatewayId] = useState("");
@@ -114,6 +118,8 @@ export function PromptBox({
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
+  /** The queue plate above the prompt: collapsed to one line by default. */
+  const [queueOpen, setQueueOpen] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
   const promptThumb = useOverlayThumb(ref);
@@ -473,13 +479,82 @@ export function PromptBox({
             <ProjectPicker projects={projects} project={project} onSelect={onSelectProject} />
           </div>
         )}
+        {/* Queued follow-ups: their own small plate above the prompt, one
+            line until opened; open, it shows up to 5 and scrolls the rest. */}
+        {queued.length > 0 && (
+          <div className="prompt-lip mx-3 mb-1.5 flex flex-col rounded-xl">
+            <button
+              className="flex h-8 items-center gap-2 px-3 text-[12px] text-[var(--text-muted)] transition-colors hover:text-[var(--text-main)]"
+              onClick={() => setQueueOpen((o) => !o)}
+              title={queueOpen ? "Collapse the queue" : "Show the queue"}
+            >
+              <ListPlus size={13} className="shrink-0" />
+              <span className="shrink-0 text-[var(--text-main)]">{queued.length} queued</span>
+              <span className="min-w-0 flex-1 truncate text-left text-[var(--text-dim)]">
+                {queueOpen ? (busy ? "runs after the current task" : "paused after Stop") : queued[0].text}
+              </span>
+              <ChevronUp size={13} className={`shrink-0 transition-transform ${queueOpen ? "rotate-180" : ""}`} />
+            </button>
+            {queueOpen && (
+              <ScrollBox className="flex max-h-[164px] flex-col gap-0.5 px-1.5 pb-1.5">
+              {queued.map((q, i) => (
+                <div key={q.id} className="group flex h-8 shrink-0 items-center gap-2 rounded-lg pl-2 pr-1 transition-colors hover:bg-[var(--hover-bg)]">
+                  <span className="w-3 shrink-0 text-right font-mono text-[10.5px] text-[var(--text-dim)]">{i + 1}</span>
+                  <span className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--text-main)]" title={q.text}>
+                    {q.text || "(attachments)"}
+                  </span>
+                  {q.attachments.length > 0 && (
+                    <span className="flex shrink-0 items-center gap-0.5 text-[10.5px] text-[var(--text-dim)]">
+                      <Paperclip size={10} /> {q.attachments.length}
+                    </span>
+                  )}
+                  <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100">
+                    {!busy && (
+                      <button
+                        className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--accent)] transition-colors hover:bg-[var(--hover-bg)]"
+                        title="Send now"
+                        onClick={() => onRunQueued?.(q.id)}
+                      >
+                        <Play size={12} />
+                      </button>
+                    )}
+                    <button
+                      className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
+                      title="Edit — moves it back into the prompt box"
+                      onClick={() => {
+                        const item = onTakeQueued?.(q.id);
+                        if (!item) return;
+                        setText((prev) => (prev.trim() ? `${prev}\n${item.text}` : item.text));
+                        setAttachments((prev) => [...prev, ...item.attachments]);
+                        requestAnimationFrame(() => {
+                          autoGrow();
+                          ref.current?.focus();
+                        });
+                      }}
+                    >
+                      <Pencil size={11} />
+                    </button>
+                    <button
+                      className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)]"
+                      title="Remove from the queue"
+                      onClick={() => onTakeQueued?.(q.id)}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+              </ScrollBox>
+            )}
+          </div>
+        )}
         {/* The lip: a tray behind the prompt box, with the model + effort */}
         {/* picker along its bottom edge. */}
         <div className="prompt-lip flex w-full flex-col rounded-[18px]">
         {/* Glassmorphism container: the chat-column aurora glows through the blur. */}
         <div
           className={`prompt-glass relative flex w-full flex-col rounded-2xl transition-colors ${
-            dragging ? "border-[var(--accent)]" : ""
+            dragging ? "border-b-[var(--accent)]" : ""
           }`}
           onDragOver={(e) => {
             e.preventDefault();
@@ -506,66 +581,6 @@ export function PromptBox({
               />
             )}
           </AnimatePresence>
-          {/* Dev servers / watchers the agent left running: watch and stop them. */}
-          <BackgroundTasks />
-          {/* Queued follow-ups: sent in order once the running task ends. */}
-          {queued.length > 0 && (
-            <div className="flex flex-col gap-1 px-3 pt-3">
-              <div className="flex items-center gap-1.5 px-1 text-[10.5px] font-medium uppercase tracking-wide text-[var(--text-dim)]">
-                <ListPlus size={11} />
-                {busy ? `Queued · runs after the current task` : `Queued · paused after Stop`}
-              </div>
-              {queued.map((q, i) => (
-                <div
-                  key={q.id}
-                  className="group flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-input)] py-1 pl-2 pr-1"
-                >
-                  <span className="shrink-0 font-mono text-[10.5px] text-[var(--text-dim)]">{i + 1}</span>
-                  <CornerDownRight size={12} className="shrink-0 text-[var(--text-dim)]" />
-                  <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text-main)]" title={q.text}>
-                    {q.text || "(attachments)"}
-                  </span>
-                  {q.attachments.length > 0 && (
-                    <span className="flex shrink-0 items-center gap-0.5 text-[10.5px] text-[var(--text-dim)]">
-                      <Paperclip size={10} /> {q.attachments.length}
-                    </span>
-                  )}
-                  {!busy && (
-                    <button
-                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--accent)] transition-colors hover:bg-[var(--hover-bg)]"
-                      title="Send now"
-                      onClick={() => onRunQueued?.(q.id)}
-                    >
-                      <Play size={12} />
-                    </button>
-                  )}
-                  <button
-                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-                    title="Edit — moves it back into the prompt box"
-                    onClick={() => {
-                      const item = onTakeQueued?.(q.id);
-                      if (!item) return;
-                      setText((prev) => (prev.trim() ? `${prev}\n${item.text}` : item.text));
-                      setAttachments((prev) => [...prev, ...item.attachments]);
-                      requestAnimationFrame(() => {
-                        autoGrow();
-                        ref.current?.focus();
-                      });
-                    }}
-                  >
-                    <Pencil size={11} />
-                  </button>
-                  <button
-                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)]"
-                    title="Remove from the queue"
-                    onClick={() => onTakeQueued?.(q.id)}
-                  >
-                    <X size={12} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
           {/* Attachment previews, above the input */}
           {attachments.length > 0 && (
             <div className="flex flex-wrap gap-1.5 px-3 pt-3">
@@ -640,6 +655,8 @@ export function PromptBox({
                   e.preventDefault();
                   return;
                 }
+                // Enter sends; Alt+Enter adds to the queue (while the agent
+                // works any send queues — idle, it just runs).
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
                   send();
@@ -650,22 +667,25 @@ export function PromptBox({
             <Thumb thumb={promptThumb} />
           </div>
             {/* Send / Stop sit in the box; everything else is in the lip. */}
-            <div className="flex shrink-0 items-center gap-1 pb-2.5 pr-2.5">
-              {/* While the agent works, Send queues a follow-up next to Stop. */}
-              {busy && (text.trim() || attachments.length > 0) && (
-                <button
-                  className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--accent)] text-white transition-colors hover:bg-[var(--accent-hover)]"
-                  onClick={send}
-                  title="Queue — sends when the current task ends (Enter)"
-                >
-                  <ListPlus size={15} />
-                </button>
-              )}
+            <div className="group/send relative flex shrink-0 items-center gap-1 pb-2.5 pr-2.5">
+              {/* Hover hint: the keys, instead of extra buttons. */}
+              <div className="pointer-events-none absolute bottom-[calc(100%+4px)] right-1 z-[210] flex w-max flex-col gap-1 rounded-lg border border-[var(--border)] bg-[var(--bg-surface)] px-2.5 py-2 text-[11.5px] text-[var(--text-muted)] opacity-0 shadow-[var(--shadow-popup)] transition-opacity delay-300 group-hover/send:opacity-100">
+                {busy && <div className="text-[var(--text-main)]">Stop generation</div>}
+                {[
+                  ["Enter", busy ? "Add to queue" : "Send"],
+                  ["Alt + Enter", "Add to queue"],
+                  ["Shift + Enter", "New line"],
+                ].map(([k, v]) => (
+                  <div key={k} className="flex items-center justify-between gap-4">
+                    <span>{v}</span>
+                    <kbd className="rounded border border-[var(--border)] px-1 font-mono text-[10.5px] text-[var(--text-dim)]">{k}</kbd>
+                  </div>
+                ))}
+              </div>
               {busy ? (
                 <motion.button
                   className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--diff-del)] text-white transition-opacity hover:opacity-90"
                   onClick={onStop}
-                  title="Stop generation"
                   initial={{ scale: 0.8 }}
                   animate={{ scale: 1 }}
                   transition={{ type: "spring", stiffness: 500, damping: 28 }}
@@ -677,7 +697,6 @@ export function PromptBox({
                   className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--accent)] text-white transition-colors hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--bg-elevated)] disabled:text-[var(--text-dim)]"
                   onClick={send}
                   disabled={!text.trim()}
-                  title="Send"
                 >
                   <Send size={14} />
                 </button>
@@ -743,6 +762,8 @@ export function PromptBox({
                 />
               )}
             </button>
+            {/* Dev servers / watchers the agent left running. */}
+            <BgTasksChip onOpen={onOpenBgTask} />
           </div>
           <div className="flex min-w-0 items-center gap-0.5">
             <ModelSelector

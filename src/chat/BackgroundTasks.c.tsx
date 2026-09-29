@@ -1,14 +1,20 @@
 /**
- * Background tasks panel above the prompt box: the dev servers, watchers
- * and long builds the agent started with `run_command background:true`.
- * Each can be opened to watch its live output and stopped; finished ones
- * can be cleared. Hidden while there are none.
+ * Background tasks: the dev servers, watchers and long builds the agent
+ * started with `run_command background:true`.
+ *
+ * `BgTasksChip` sits in the prompt lip (after the mic) while there are any:
+ * a dropdown like the model picker lists them, and picking one opens it as
+ * a tab of the side panel — `BgTaskView` there shows its live output with
+ * Stop / Clear.
  */
 import { useEffect, useRef, useState } from "react";
-import { Activity, ChevronDown, ChevronRight, ScrollText, Square, X } from "lucide-react";
+import { motion, AnimatePresence } from "motion/react";
+import { Activity, Square, X } from "lucide-react";
 import * as db from "../core/db.r";
 import { inTauri } from "../utils/env.u";
 import { formatDuration } from "../utils/format.u";
+import { LIP_CHIP, POPOVER, POPOVER_LABEL, popoverItem, popMotion } from "../ui/tokens.s";
+import { OverlayScroll, ScrollBox } from "../ui/ScrollArea.c";
 
 const POLL_MS = 2000;
 
@@ -24,26 +30,116 @@ function status(t: db.BgTask): { text: string; color: string } {
   return { text: `exited ${t.exitCode ?? "?"}`, color: "var(--diff-del)" };
 }
 
-export function BackgroundTasks() {
+/** The task list, polled — cheap local IPC calls. */
+function useBgTasks(): [db.BgTask[], () => void] {
   const [tasks, setTasks] = useState<db.BgTask[]>([]);
-  const [open, setOpen] = useState(false);
-  const [logFor, setLogFor] = useState<number | null>(null);
-  const [log, setLog] = useState("");
-  const logRef = useRef<HTMLPreElement>(null);
+  const refresh = () => void db.bgList().then(setTasks).catch(() => {});
+  useEffect(() => {
+    if (!inTauri) return;
+    refresh();
+    const t = setInterval(refresh, POLL_MS);
+    return () => clearInterval(t);
+  }, []);
+  return [tasks, refresh];
+}
 
-  // Poll the task list (and the open log) — cheap local IPC calls.
+/** Lip chip + dropdown of the background tasks; hidden while there are none. */
+export function BgTasksChip({ onOpen }: { onOpen?: (task: db.BgTask) => void }) {
+  const [tasks, refresh] = useBgTasks();
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  if (tasks.length === 0) return null;
+  const running = tasks.filter((t) => t.running).length;
+
+  return (
+    <div className="relative shrink-0" ref={ref}>
+      <span
+        className={`${LIP_CHIP} ${open ? "bg-[var(--hover-bg)] text-[var(--text-main)]" : ""}`}
+        onClick={() => setOpen(!open)}
+        title="Background tasks"
+      >
+        <Activity size={14} strokeWidth={1.6} className={running ? "text-[var(--diff-add)]" : ""} />
+        {running > 0 ? running : tasks.length}
+      </span>
+      <AnimatePresence>
+        {open && (
+          <motion.div className={`${POPOVER} absolute bottom-[calc(100%+8px)] left-0 w-[340px]`} {...popMotion(true)}>
+            <div className={POPOVER_LABEL}>
+              <span>Background tasks</span>
+              <span className="normal-case tracking-normal">
+                {running} running{tasks.length > running ? ` · ${tasks.length - running} done` : ""}
+              </span>
+            </div>
+            <ScrollBox className="flex max-h-[260px] flex-col gap-0.5">
+              {tasks.map((t) => {
+                const st = status(t);
+                return (
+                  <div
+                    key={t.id}
+                    className={`${popoverItem(false)} group cursor-pointer`}
+                    onClick={() => {
+                      onOpen?.(t);
+                      setOpen(false);
+                    }}
+                    title={`${t.command}\n${t.cwd}`}
+                  >
+                    <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: st.color }} />
+                    <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-[var(--text-main)]">{t.command}</span>
+                    <span className="shrink-0 text-[10.5px]" style={{ color: st.color }}>
+                      {st.text}
+                    </span>
+                    <button
+                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] opacity-0 transition-all hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)] group-hover:opacity-100"
+                      title={t.running ? "Stop this task" : "Clear from the list"}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void (t.running ? db.bgStop(t.id) : db.bgRemove(t.id)).then(refresh).catch(() => {});
+                      }}
+                    >
+                      {t.running ? <Square size={10} /> : <X size={12} />}
+                    </button>
+                  </div>
+                );
+              })}
+            </ScrollBox>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+/** Side-panel tab of one background task: live output, Stop / Clear. */
+export function BgTaskView({ id }: { id: number }) {
+  const [task, setTask] = useState<db.BgTask | null | undefined>(undefined);
+  const [log, setLog] = useState("");
+  const logRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     if (!inTauri) return;
     let alive = true;
     const tick = async () => {
       try {
         const list = await db.bgList();
+        const t = list.find((x) => x.id === id) ?? null;
+        const text = t ? await db.bgOutput(id).catch(() => "") : "";
         if (!alive) return;
-        setTasks(list);
-        if (logFor !== null) {
-          const text = await db.bgOutput(logFor).catch(() => "");
-          if (alive) setLog(text);
-        }
+        setTask(t);
+        setLog(text);
       } catch {
         /* the backend may not be ready yet */
       }
@@ -54,7 +150,7 @@ export function BackgroundTasks() {
       alive = false;
       clearInterval(t);
     };
-  }, [logFor]);
+  }, [id]);
 
   // Keep the log scrolled to the newest line.
   useEffect(() => {
@@ -62,79 +158,42 @@ export function BackgroundTasks() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [log]);
 
-  if (tasks.length === 0) return null;
-  const running = tasks.filter((t) => t.running).length;
-
-  const refresh = () => void db.bgList().then(setTasks).catch(() => {});
-
+  if (task === null) {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center p-4 text-[12px] text-[var(--text-dim)]">
+        This background task is no longer in the list.
+      </div>
+    );
+  }
+  const st = task ? status(task) : null;
   return (
-    <div className="flex flex-col gap-1 px-3 pt-3">
-      <button
-        className="flex items-center gap-1.5 px-1 text-[10.5px] font-medium uppercase tracking-wide text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
-        onClick={() => setOpen((o) => !o)}
-        title={open ? "Hide background tasks" : "Show background tasks"}
-      >
-        {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-        <Activity size={11} className={running ? "text-[var(--diff-add)]" : ""} />
-        Background · {running} running{tasks.length > running ? ` · ${tasks.length - running} done` : ""}
-      </button>
-      {open &&
-        tasks.map((t) => {
-          const st = status(t);
-          const showing = logFor === t.id;
-          return (
-            <div key={t.id} className="rounded-lg border border-[var(--border)] bg-[var(--bg-input)]">
-              <div className="flex items-center gap-2 py-1 pl-2 pr-1">
-                <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: st.color }} />
-                <span className="shrink-0 font-mono text-[10.5px] text-[var(--text-dim)]">#{t.id}</span>
-                <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-[var(--text-main)]" title={`${t.command}\n${t.cwd}\npid ${t.pid} · ${t.shell}`}>
-                  {t.command}
-                </span>
-                <span className="shrink-0 text-[10.5px]" style={{ color: st.color }}>
-                  {st.text}
-                </span>
-                <button
-                  className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition-colors hover:bg-[var(--hover-bg)] ${showing ? "text-[var(--accent)]" : "text-[var(--text-dim)] hover:text-[var(--text-main)]"}`}
-                  title={showing ? "Hide output" : "Show output"}
-                  onClick={() => {
-                    setLog("");
-                    setLogFor(showing ? null : t.id);
-                  }}
-                >
-                  <ScrollText size={12} />
-                </button>
-                {t.running ? (
-                  <button
-                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)]"
-                    title="Stop this task (and everything it started)"
-                    onClick={() => void db.bgStop(t.id).then(refresh).catch(() => {})}
-                  >
-                    <Square size={11} />
-                  </button>
-                ) : (
-                  <button
-                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]"
-                    title="Clear from the list"
-                    onClick={() => {
-                      if (showing) setLogFor(null);
-                      void db.bgRemove(t.id).then(refresh).catch(() => {});
-                    }}
-                  >
-                    <X size={12} />
-                  </button>
-                )}
-              </div>
-              {showing && (
-                <pre
-                  ref={logRef}
-                  className="max-h-[220px] overflow-auto whitespace-pre-wrap break-all border-t border-[var(--border)] px-2 py-1.5 font-mono text-[11px] leading-[1.45] text-[var(--text-muted)]"
-                >
-                  {log || "(no output yet)"}
-                </pre>
-              )}
-            </div>
-          );
-        })}
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex shrink-0 items-center gap-2 border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 py-1.5">
+        {st && <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: st.color }} />}
+        <code className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--text-main)]" title={task ? `${task.command}\n${task.cwd}\npid ${task.pid} · ${task.shell}` : ""}>
+          {task?.command ?? "…"}
+        </code>
+        {st && (
+          <span className="shrink-0 text-[10.5px]" style={{ color: st.color }}>
+            {st.text}
+          </span>
+        )}
+        {task && (
+          <button
+            className="flex h-6 shrink-0 items-center gap-1 rounded-md px-2 text-[11px] text-[var(--text-muted)] transition-colors hover:bg-[var(--diff-del)]/15 hover:text-[var(--diff-del)]"
+            title={task.running ? "Stop this task (and everything it started)" : "Clear from the list"}
+            onClick={() => void (task.running ? db.bgStop(id) : db.bgRemove(id)).catch(() => {})}
+          >
+            {task.running ? <Square size={10} /> : <X size={11} />}
+            {task.running ? "Stop" : "Clear"}
+          </button>
+        )}
+      </div>
+      <OverlayScroll wrapperClassName="min-h-0 flex-1" className="h-full overflow-auto bg-[var(--bg-app)]" innerRef={logRef}>
+        <pre className="whitespace-pre-wrap break-all px-3 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
+          {log || "(no output yet)"}
+        </pre>
+      </OverlayScroll>
     </div>
   );
 }

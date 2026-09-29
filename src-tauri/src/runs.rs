@@ -48,6 +48,13 @@ pub enum RunEvent {
         #[serde(default)]
         reason: String,
     },
+    /// A failed request about to be retried. The chat shows ONE notice per
+    /// run whose counter moves, so a later Retry replaces the earlier one.
+    Retry {
+        message: String,
+        attempt: usize,
+        max: usize,
+    },
     Done {
         answer: String,
     },
@@ -115,6 +122,10 @@ pub fn push_event(run_id: &str, ev: RunEvent) {
                     return;
                 }
                 _ => {}
+            }
+            if let (RunEvent::Retry { .. }, Some(last @ RunEvent::Retry { .. })) = (&ev, slot.events.last_mut()) {
+                *last = ev;
+                return;
             }
             // Live card updates of a call still streaming its arguments
             // replace the previous update instead of stacking up.

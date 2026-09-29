@@ -243,7 +243,7 @@ export function SkillsSettings({ workspace }: { workspace: string }) {
                   onClick={() => void open(s)}
                 >
                   <Sparkles size={14} className={s.enabled ? "shrink-0 text-[var(--accent)]" : "shrink-0 text-[var(--text-dim)]"} />
-                  <span className="shrink-0 font-mono text-[12.5px] font-medium text-[var(--text-main)]">/{s.name}</span>
+                  <span className="max-w-[45%] shrink-0 truncate font-mono text-[12.5px] font-medium text-[var(--text-main)]">/{s.name}</span>
                   <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text-dim)]">{s.description || "No description"}</span>
                   {s.source !== "user" && (
                     <span className="shrink-0 rounded border border-[var(--border)] px-1.5 text-[10px] text-[var(--text-dim)]" title={s.dir}>
@@ -279,11 +279,11 @@ export function SkillsSettings({ workspace }: { workspace: string }) {
                       </>
                     )}
                   </div>
-                  <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 font-mono text-[11.5px] text-[var(--text-main)]">
+                  <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-words rounded-md border border-[var(--border)] bg-[var(--bg-input)] px-2.5 py-2 font-mono text-[11.5px] text-[var(--text-main)]">
                     {preview.body}
                   </pre>
                   {preview.files.length > 0 && (
-                    <div className="text-[11px] text-[var(--text-dim)]">Files: {preview.files.join(", ")}</div>
+                    <div className="break-all text-[11px] text-[var(--text-dim)]">Files: {preview.files.join(", ")}</div>
                   )}
                 </div>
               )}

@@ -946,6 +946,12 @@ export default function App() {
     });
   }, []);
 
+  /** A background task from the prompt lip opens as a side-panel tab. */
+  const openBgTask = useCallback(
+    (t: db.BgTask) => openPanelTab({ id: `bg:${t.id}`, type: "bgtask", label: t.command, taskId: t.id }),
+    [openPanelTab]
+  );
+
   /** Closes one tab; the neighbor becomes active, empty panel closes itself. */
   const closePanelTab = useCallback((id: string) => {
     setPanel((prev) => {
@@ -1201,6 +1207,7 @@ export default function App() {
                   onPickModel={pickModel}
                   workspace={workspaceOf(newChatProject)}
                   onCommand={onPromptCommand}
+                  onOpenBgTask={openBgTask}
                   onSend={(text, selection, attachments) => sendMessage(text, null, selection, attachments)}
                 />
               </motion.div>
@@ -1253,6 +1260,7 @@ export default function App() {
                             streaming={streaming && i === draftMsgs.length - 1}
                             durationMs={m.durationMs}
                             images={m.images}
+                            error={m.error}
                             debugMode={debugMode}
                             onEdit={
                               m.role === "user" && activeConv && !streaming
@@ -1398,6 +1406,7 @@ export default function App() {
                 onStop={() => activeConv && chat.stop(activeConv.id)}
                 workspace={workspaceOf(activeConv?.project ?? NO_PROJECT)}
                 onCommand={onPromptCommand}
+                onOpenBgTask={openBgTask}
                 queued={activeConv ? chat.queues[activeConv.id] ?? [] : []}
                 onTakeQueued={(id) => (activeConv ? chat.takeQueued(activeConv.id, id) : undefined)}
                 onRunQueued={(id) => activeConv && void chat.runQueued(activeConv.id, activeConv.project, id)}

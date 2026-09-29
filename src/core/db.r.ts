@@ -1412,6 +1412,8 @@ export async function runAgent(
     onConfirm?: (req: ConfirmRequest) => void;
     /** Cumulative token usage — the Debug mode HUD. */
     onUsage?: (usage: RunUsage) => void;
+    /** A failed request is being retried — one notice whose counter moves. */
+    onRetry?: (retry: RunRetry) => void;
   }
 ): Promise<string> {
   if (!inTauri) {
@@ -1445,6 +1447,10 @@ export async function runAgent(
       if (e.payload.run_id !== runId) return;
       handlers.onUsage?.(e.payload);
     }),
+    listen<RunRetry & { run_id: string }>("agent://retry", (e) => {
+      if (e.payload.run_id !== runId) return;
+      handlers.onRetry?.(e.payload);
+    }),
   ]);
 
   try {
@@ -1466,6 +1472,13 @@ export async function runAgent(
    the frontend asks which runs are still live, replays their buffers and
    keeps listening until done. */
 
+/** A failed request of a run, retried after a pause (attempt of max). */
+export interface RunRetry {
+  message: string;
+  attempt: number;
+  max: number;
+}
+
 /** One buffered event of a live run (mirror of Rust runs::RunEvent). */
 export type RunEvent =
   | { kind: "Text"; delta: string }
@@ -1484,6 +1497,7 @@ export type RunEvent =
     }
   /** A command waiting for Allow/Deny — re-shown after a reload. */
   | { kind: "Confirm"; command: string; cwd: string; reason?: string }
+  | ({ kind: "Retry" } & RunRetry)
   /** Terminal markers, present only in a finished run's buffer. */
   | { kind: "Done"; answer: string }
   | { kind: "Error"; message: string };
@@ -1524,6 +1538,7 @@ export function resumeAgent(
     /** The re-attached run may ask for command permission — without this the
      *  run would hang forever waiting for an Allow/Deny nobody can see. */
     onConfirm?: (req: ConfirmRequest) => void;
+    onRetry?: (retry: RunRetry) => void;
   }
 ): Promise<string> {
   if (!inTauri) return Promise.resolve("");
@@ -1562,6 +1577,12 @@ export function resumeAgent(
         await listen<ConfirmRequest>("agent://confirm", (e) => {
           if (e.payload.run_id !== runId) return;
           handlers.onConfirm?.(e.payload);
+        })
+      );
+      offs.push(
+        await listen<RunRetry & { run_id: string }>("agent://retry", (e) => {
+          if (e.payload.run_id !== runId) return;
+          handlers.onRetry?.(e.payload);
         })
       );
       offs.push(

@@ -25,6 +25,7 @@ mod tray;
 mod updater;
 mod utf8stream;
 mod web;
+mod imagegen;
 
 use tauri::Manager;
 
@@ -311,6 +312,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             agent_workspace,
+            imagegen::read_generated_image,
+            imagegen::save_generated_image,
             agent_context,
             pricing::model_info,
             plugins::plugin_install,

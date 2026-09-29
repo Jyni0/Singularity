@@ -36,6 +36,8 @@ pub enum RunEvent {
         path: Option<String>,
         old_text: Option<String>,
         new_text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
     },
     /// A command waiting for Allow/Deny. Buffered so a WebView reload can
     /// re-show the banner — otherwise the run waits forever for an answer

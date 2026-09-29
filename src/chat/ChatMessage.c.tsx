@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState, memo } from "react";
-import { ArrowUp, Bug, Check, ChevronDown, ChevronRight, Copy, Pencil, Wrench } from "lucide-react";
+import { Fragment, useEffect, useRef, useState, memo } from "react";
+import { ArrowUp, Bug, Check, ChevronDown, ChevronRight, Copy, Image as ImageIcon, Pencil, Wrench } from "lucide-react";
 import * as db from "../core/db.r";
 import { formatDuration } from "../utils/format.u";
 import { Markdown, ToolCall, ThinkBlock } from "./Markdown.c";
 import { GourabDock } from "./Gourab.c";
 import type { Segment } from "./message.i";
+import { GeneratedImage } from "./GeneratedImage.c";
 import { FileIcon, Button, Spinner, IconButton } from "../components";
 
 /*
@@ -365,17 +366,30 @@ function ChatMessageView({
         {grouped.map((seg, i) => {
           const isLast = i === grouped.length - 1;
           if ("group" in seg) {
+            const steps = seg.group.map((s) => (s as { kind: "step"; step: db.AgentStepEvent }).step);
+            // Pictures stay visible under the (collapsible) action log.
+            const drawing = steps.filter((s) => s.name === "generate_image" && (s.image || (!s.done && streaming)));
             return (
-              <StepGroup
-                key={`g${i}`}
-                streaming={!!streaming && isLast}
-                durationMs={durationMs}
-                onInspectStep={onInspectStep}
-                steps={seg.group.map((s, j) => ({
-                  step: (s as { kind: "step"; step: db.AgentStepEvent }).step,
-                  key: `s${i}-${j}`,
-                }))}
-              />
+              <Fragment key={`g${i}`}>
+                <StepGroup
+                  streaming={!!streaming && isLast}
+                  durationMs={durationMs}
+                  onInspectStep={onInspectStep}
+                  steps={steps.map((step, j) => ({ step, key: `s${i}-${j}` }))}
+                />
+                {drawing.map((s) =>
+                  s.image ? (
+                    <GeneratedImage key={`img${s.index}`} path={s.image} prompt={s.input} onOpen={onInspectImage} />
+                  ) : (
+                    <div
+                      key={`img${s.index}`}
+                      className="flex h-48 w-72 animate-pulse items-center justify-center gap-2 rounded-2xl bg-[var(--bg-input)] text-[12px] text-[var(--text-dim)]"
+                    >
+                      <ImageIcon size={14} /> Drawing…
+                    </div>
+                  ),
+                )}
+              </Fragment>
             );
           }
           // Debug stats are pinned to the very bottom of the turn instead.

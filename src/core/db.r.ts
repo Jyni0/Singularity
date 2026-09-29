@@ -1185,6 +1185,8 @@ export interface AgentRequest {
   ssh_units?: { id: string; name: string; host: string }[];
   /** Built-in tools switched off in Settings → Plugins. */
   disabled_tools?: string[];
+  /** Where generate_image draws; absent = no picture generation this run. */
+  image_gen?: ImageGenConfig;
   /** Provider row id — the limiter budgets requests under this key. */
   provider_id?: string;
   /** Max requests/minute for the provider (0 = unlimited). */
@@ -1274,6 +1276,33 @@ export interface AgentStepEvent {
   old_text?: string;
   /** Content after the change. */
   new_text?: string;
+  /** generate_image: the picture file it produced. */
+  image?: string;
+}
+
+/** Reads a picture the agent generated (a file in the app's data folder) as a data URL. */
+export async function readGeneratedImage(path: string): Promise<string> {
+  if (!inTauri) throw new Error("needs the desktop shell");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string>("read_generated_image", { path });
+}
+
+/** Copies a generated picture to `dest` (a path from the save dialog). */
+export async function saveGeneratedImage(path: string, dest: string): Promise<void> {
+  if (!inTauri) throw new Error("needs the desktop shell");
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("save_generated_image", { path, dest });
+}
+
+/** Where the agent's generate_image tool draws (mirror of Rust imagegen::ImageGenConfig). */
+export interface ImageGenConfig {
+  kind: string;
+  base_url: string;
+  api_key: string;
+  auth: "key" | "bearer";
+  /** Image model id; "" = the provider's own chat model draws. */
+  model: string;
+  chat_model: string;
 }
 
 /** Marks an error as "the user pressed Stop", so callers keep partial output. */
@@ -1493,6 +1522,7 @@ export type RunEvent =
       path?: string;
       old_text?: string;
       new_text?: string;
+      image?: string;
     }
   /** A command waiting for Allow/Deny — re-shown after a reload. */
   | { kind: "Confirm"; command: string; cwd: string; reason?: string }

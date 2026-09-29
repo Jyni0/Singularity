@@ -37,6 +37,9 @@ pub struct ToolResult {
     /// Content after the change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_text: Option<String>,
+    /// Picture the tool produced (generate_image) — a file the chat shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 /// Cap on the before/after snapshots attached to a result — the Changes panel
@@ -59,6 +62,7 @@ impl ToolResult {
             path: None,
             old_text: None,
             new_text: None,
+            image: None,
         }
     }
     pub fn err(output: impl Into<String>) -> Self {
@@ -68,6 +72,7 @@ impl ToolResult {
             path: None,
             old_text: None,
             new_text: None,
+            image: None,
         }
     }
     /// Attaches the before/after snapshot so the UI can render a diff.

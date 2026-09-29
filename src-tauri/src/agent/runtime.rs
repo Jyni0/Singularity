@@ -657,6 +657,7 @@ fn live_summary(name: &str, args: &str) -> String {
         "grep" | "find_files" => "pattern",
         "web_search" => "query",
         "web_fetch" => "url",
+        "generate_image" => "prompt",
         "git" => "subcommand",
         "delegate" => "agent",
         "skill" => "name",
@@ -751,6 +752,7 @@ fn fs_tools(ctx: &RunCtx) -> Vec<DynamicTool> {
                                 crate::web::fetch(&get("url"), start).await
                             }
                             "change_dir" => change_dir(&c, &get("path")),
+                            "generate_image" => crate::imagegen::tool(&c.app, c.req.image_gen.as_ref(), &args).await,
                             _ => {
                                 // Tools block (file IO, processes): keep the async
                                 // workers free so events keep flowing.
@@ -1453,6 +1455,19 @@ fn preamble_sections(
     if !mcp.is_empty() && !mcp_deferred(req, mcp) {
         env.push_str(
             "\n\nTools named mcp__<server>__<tool> come from MCP servers the user connected; use them when they fit the task better than the built-in tools.",
+        );
+    }
+    // Without this the model "generates" a picture in words and tells the
+    // user it is shown above — while nothing is.
+    if req.image_gen.is_some() && on("generate_image") {
+        env.push_str(
+            "\n\nPictures: when the user asks for an image, photo, drawing, logo or icon, call generate_image — \
+             it is shown to the user automatically; afterwards just say it is ready (one short line).",
+        );
+    } else {
+        env.push_str(
+            "\n\nPictures: this run has no image generator. If the user asks for a picture, say you cannot draw \
+             with the current model and that an image model can be added in Settings → Models; never claim a picture was made.",
         );
     }
     out.push(("Environment & working rules", env));

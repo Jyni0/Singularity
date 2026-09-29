@@ -49,6 +49,12 @@ export const BUILTIN_PLUGINS: BuiltinPlugin[] = [
     description: "Run commands on the servers saved in the SSH client — deploys, logs, restarts.",
     tools: ["ssh_exec"],
   },
+  {
+    id: "images",
+    title: "Image generation",
+    description: "Draw pictures on request — Google (Antigravity / Gemini), OpenAI API image models, Imagen, Flux… Claude and Codex chats borrow a provider that can draw. Shown right in the chat.",
+    tools: ["generate_image"],
+  },
 ];
 
 const DISABLED_KEY = "disabled_tools";

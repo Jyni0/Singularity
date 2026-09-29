@@ -58,6 +58,14 @@ export interface ContextReport {
   calibration: number | null;
 }
 
+/** Model ids that draw pictures (gpt-image-1, dall-e-3, imagen-4, gemini-2.5-flash-image, flux…). */
+const IMAGE_MODEL =
+  /(gpt-image|dall-e|imagen|flux|stable-diffusion|sdxl|\bsd3|image-gen|nano-banana|z-image|recraft|ideogram|[-_/]image(-preview|-generation)?$)/i;
+/** Provider kinds that can draw without a separate image model in the list. */
+const DRAWING_APIS = ["openai-responses", "openai-completions", "google", "google-cli"];
+/** Kinds that draw for OTHER providers' chats too (Claude, Codex…): tested paths only. */
+const SHARED_DRAWERS = ["google-cli", "google"];
+
 const COMPACT_SYSTEM =
   "You compress a conversation between a user and a coding agent into a summary the agent will continue from. " +
   "The summary REPLACES the conversation, so anything left out is forgotten.";
@@ -376,6 +384,51 @@ export function useChat(options: UseChatOptions) {
     };
   };
 
+  /**
+   * Where this run's pictures come from: an image model of the chat's own
+   * provider, else the provider itself when its API can draw (OpenAI's
+   * image tool / Images API, Gemini image models), else any other provider
+   * with an image model. None = the model is told it cannot draw.
+   */
+  const imageGenFor = async (
+    provider: Provider,
+    cred: { apiKey: string; auth: "key" | "bearer" },
+    chatModel: string,
+  ): Promise<db.ImageGenConfig | undefined> => {
+    const o = opts.current;
+    const imageModel = (providerId: string) =>
+      o.models.find((m) => m.provider_id === providerId && m.enabled !== false && IMAGE_MODEL.test(m.model_id));
+    const config = (p: Provider, c: { apiKey: string; auth: "key" | "bearer" }, model: string): db.ImageGenConfig => ({
+      kind: p.kind,
+      base_url: p.base_url,
+      api_key: c.apiKey,
+      auth: c.auth,
+      model,
+      chat_model: chatModel,
+    });
+    const own = imageModel(provider.id);
+    if (own) return config(provider, cred, own.model_id);
+    if (DRAWING_APIS.includes(provider.kind)) return config(provider, cred, "");
+    // Another provider draws: one with an image model first, then a Google
+    // one (Antigravity / Gemini API draw with no image model listed).
+    const others = o.providers.filter((p) => p.id !== provider.id && p.enabled);
+    const candidates = [
+      ...others.flatMap((p) => {
+        const m = imageModel(p.id);
+        return m ? [{ p, model: m.model_id }] : [];
+      }),
+      ...others.filter((p) => SHARED_DRAWERS.includes(p.kind)).map((p) => ({ p, model: "" })),
+    ];
+    for (const { p, model } of candidates) {
+      const c = await db.credentialFor(p, {
+        clientId: localStorage.getItem("google_client_id") ?? "",
+        clientSecret: localStorage.getItem("google_client_secret") ?? "",
+      });
+      if (!c.error) return config(p, c, model);
+    }
+    return undefined;
+  };
+
   /** Provider, model row and credentials of a selection — or why not. */
   const resolveModel = async (selection: ChatSelection) => {
     const o = opts.current;
@@ -402,7 +455,10 @@ export function useChat(options: UseChatOptions) {
     if ("error" in r || !r.provider) return null;
     const { provider, modelRow, cred } = r;
     const history = convId ? convMsgsRef.current[convId] ?? [] : [];
-    const request = agentRequest(provider, cred, modelRow.model_id, selection, projectName, workspaceOf(projectName));
+    const request = {
+      ...agentRequest(provider, cred, modelRow.model_id, selection, projectName, workspaceOf(projectName)),
+      image_gen: await imageGenFor(provider, cred, modelRow.model_id),
+    };
     const [parts, info] = await Promise.all([
       db.agentContext(request, modelTurns(history)).catch(() => [] as db.ContextPart[]),
       db.effectiveModelInfo(provider.kind, provider.base_url, modelRow.model_id, modelRow.id),
@@ -586,12 +642,18 @@ export function useChat(options: UseChatOptions) {
     };
 
     const turns = modelTurns(history);
+    const imageGen = useAgent ? await imageGenFor(provider, cred, modelRow.model_id) : undefined;
 
     try {
       const answer = useAgent
         ? await db.runAgent(
             runId,
-            { ...agentRequest(provider, cred, modelRow.model_id, selection, projectName, runWorkspace, runImages), effort: runEffort, max_tokens: maxTokens },
+            {
+              ...agentRequest(provider, cred, modelRow.model_id, selection, projectName, runWorkspace, runImages),
+              effort: runEffort,
+              max_tokens: maxTokens,
+              image_gen: imageGen,
+            },
             turns,
             {
               onText,
@@ -907,7 +969,7 @@ export function useChat(options: UseChatOptions) {
             kind: "step",
             step: {
               name: ev.name, input: ev.input, result: ev.result, ok: ev.ok, index: ev.index,
-              done: ev.done, path: ev.path, old_text: ev.old_text, new_text: ev.new_text,
+              done: ev.done, path: ev.path, old_text: ev.old_text, new_text: ev.new_text, image: ev.image,
             },
           });
         } else if (ev.kind === "Retry") {
@@ -937,7 +999,7 @@ export function useChat(options: UseChatOptions) {
           } else if (ev.kind === "Step") {
             const step: db.AgentStepEvent = {
               name: ev.name, input: ev.input, result: ev.result, ok: ev.ok, index: ev.index,
-              done: true, path: ev.path, old_text: ev.old_text, new_text: ev.new_text,
+              done: true, path: ev.path, old_text: ev.old_text, new_text: ev.new_text, image: ev.image,
             };
             const at = segs.findIndex((s) => s.kind === "step" && s.step.index === ev.index);
             if (at >= 0) segs[at] = { kind: "step", step };

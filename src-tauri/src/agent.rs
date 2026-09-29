@@ -167,6 +167,9 @@ pub struct AgentStep {
     pub old_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_text: Option<String>,
+    /// Picture file a generate_image call produced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -243,6 +246,9 @@ pub struct AgentRequest {
     /// Models); None keeps the provider's own default.
     #[serde(default)]
     pub max_tokens: Option<u64>,
+    /// Where `generate_image` draws (None = this run cannot make pictures).
+    #[serde(default)]
+    pub image_gen: Option<crate::imagegen::ImageGenConfig>,
 }
 
 fn default_retries() -> usize {
@@ -411,6 +417,7 @@ fn emit_step(app: &AppHandle, run_id: &str, index: usize, name: &str, input: Str
             path: res.path.clone(),
             old_text: res.old_text.clone(),
             new_text: res.new_text.clone(),
+            image: res.image.clone(),
         },
     );
     let _ = app.emit(
@@ -426,6 +433,7 @@ fn emit_step(app: &AppHandle, run_id: &str, index: usize, name: &str, input: Str
             path: res.path.clone(),
             old_text: res.old_text.clone(),
             new_text: res.new_text.clone(),
+            image: res.image.clone(),
         },
     );
 }

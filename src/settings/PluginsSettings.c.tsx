@@ -9,6 +9,7 @@ import {
   Download,
   FileCode2,
   GitBranch,
+  ImageIcon,
   Globe,
   Puzzle,
   RefreshCw,
@@ -29,6 +30,7 @@ const ICONS: Record<string, React.ReactNode> = {
   git: <GitBranch size={15} />,
   web: <Globe size={15} />,
   ssh: <Server size={15} />,
+  images: <ImageIcon size={15} />,
 };
 
 function PluginIcon({ children }: { children: React.ReactNode }) {

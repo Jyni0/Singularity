@@ -213,6 +213,26 @@ pub(super) fn tool_specs(req: &AgentRequest) -> Value {
             }
         }));
     }
+    if req.image_gen.is_some() {
+        specs.as_array_mut().unwrap().push(json!({
+            "name": "generate_image",
+            "description": "Generate a picture (photo, illustration, logo, icon…) from a text description. \
+                 The picture appears in the chat for the user by itself; you get its file path back. \
+                 Write the prompt in English with the subject, style, composition, lighting and colours.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "Detailed description of the picture." },
+                    "size": {
+                        "type": "string",
+                        "enum": ["auto", "1024x1024", "1536x1024", "1024x1536"],
+                        "description": "Square, landscape or portrait; default auto."
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }));
+    }
     if !req.disabled_tools.is_empty() {
         if let Some(list) = specs.as_array_mut() {
             list.retain(|t| !req.disabled_tools.iter().any(|d| t["name"].as_str() == Some(d.as_str())));
@@ -315,6 +335,7 @@ pub(super) fn summarize(name: &str, args: &Value) -> String {
             None => get("action").to_string(),
         },
         "web_fetch" => get("url").to_string(),
+        "generate_image" => one_line(get("prompt"), 100),
         "delegate" => format!("{}: {}", get("agent"), one_line(get("task"), 80)),
         "skill" => {
             if get("file").is_empty() {

@@ -232,7 +232,7 @@ pub(super) fn default_system() -> String {
      1. Do exactly what the request asks, nothing more. No unrequested refactors, renames, \
      formatting, comments, tests, docs or fixes; mention other issues in one line instead. \
      If the request is ambiguous, do the narrowest thing its wording supports.\n\
-     2. Plan briefly, then act. Before the first tool call write a short plan: the goal in \
+     2. A message that needs no work in the workspace (a greeting, small talk, a general      question) gets a direct answer with no tool calls. Otherwise plan briefly, then act. Before the first tool call write a short plan: the goal in \
      the user's terms and 1-5 steps, each serving something the request asks for. Then \
      act; independent calls (several reads, searches) go together in one turn. If a result \
      proves the plan wrong, say so in one line and adjust. Read only the files the task needs.\n\
@@ -323,8 +323,11 @@ pub(super) fn summarize(name: &str, args: &Value) -> String {
                 format!("{}: {}", get("name"), get("file"))
             }
         }
+        "mcp_find" => get("query").to_string(),
+        "mcp_call" => format!("{} {}", get("tool"), one_line(&args.get("arguments").map(|a| a.to_string()).unwrap_or_default(), 90)),
         // MCP tools have arbitrary arguments — show them compactly.
         n if n.starts_with("mcp__") => one_line(&args.to_string(), 100),
         _ => get("path").to_string(),
     }
 }
+

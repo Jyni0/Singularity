@@ -93,9 +93,15 @@ pub(super) fn build(req: &AgentRequest) -> Result<ModelSetup, String> {
                 .base_url(&base)
                 .build()
                 .map_err(fail)?;
+            // `think` is always sent: thinking models (Qwen3, DeepSeek-R1…)
+            // think by default, and on a local box that generates a few
+            // tokens a second that meant minutes of reasoning before the
+            // first word — "it thinks forever". Only High turns it on.
+            // keep_alive: a 10+ GB model evicted after Ollama's default 5
+            // idle minutes is reloaded from disk on the next message.
             Ok(ModelSetup {
                 handle: ModelHandle::new(client.completion_model(&req.model)),
-                params: pick.map(|e| json!({ "think": e == "high" })),
+                params: Some(json!({ "think": effort == "high", "keep_alive": "30m" })),
                 temperature,
                 max_tokens: None,
                 cache_seen: None,

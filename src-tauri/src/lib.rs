@@ -256,6 +256,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         // Folder picker for choosing the agent workspace.
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(
             tauri_plugin_sql::Builder::default()
                 .add_migrations(db::DB_URL, migrations)
@@ -400,6 +401,7 @@ fn keep_find_keys_for_the_page(window: &tauri::WebviewWindow) {
     const VK_F: u32 = 0x46;
     const VK_G: u32 = 0x47;
     const VK_F3: u32 = 0x72;
+    const VK_C: u32 = 0x43;
 
     let _ = window.with_webview(|webview| unsafe {
         let handler = AcceleratorKeyPressedEventHandler::create(Box::new(|_, args| {
@@ -408,7 +410,10 @@ fn keep_find_keys_for_the_page(window: &tauri::WebviewWindow) {
             args.VirtualKey(&mut key)?;
             // The event only fires for accelerators (Ctrl/Alt combos and
             // function keys), so a bare F/G typed into a field never lands here.
-            if matches!(key, VK_F | VK_G | VK_F3) {
+            // Ctrl+Shift+C is DevTools' "inspect element" — the terminal
+            // copies with it, so the browser must not take it first.
+            let shift = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) < 0;
+            if matches!(key, VK_F | VK_G | VK_F3) || (key == VK_C && shift) {
                 if let Ok(args2) = args.cast::<ICoreWebView2AcceleratorKeyPressedEventArgs2>() {
                     args2.SetIsBrowserAcceleratorKeyEnabled(false)?;
                 }

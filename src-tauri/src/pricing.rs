@@ -172,6 +172,19 @@ fn pick<'a>(list: &'a [Entry], kind: &str, base_url: &str, model: &str) -> Optio
     hits.first().copied()
 }
 
+/// Context length of the model as currently loaded (`/api/ps`), if it is.
+async fn ollama_running_ctx(client: &reqwest::Client, base_url: &str, model: &str) -> Option<u64> {
+    let url = format!("{}/api/ps", base_url.trim_end_matches('/'));
+    let v: serde_json::Value = client.get(url).send().await.ok()?.json().await.ok()?;
+    v.get("models")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("name").and_then(|n| n.as_str()) == Some(model) || m.get("model").and_then(|n| n.as_str()) == Some(model))?
+        .get("context_length")?
+        .as_u64()
+        .filter(|&n| n > 0)
+}
+
 async fn ollama_info(base_url: &str, model: &str) -> ModelInfo {
     let mut info = ModelInfo { source: "ollama".into(), local: true, input_per_mtok: Some(0.0), output_per_mtok: Some(0.0), ..Default::default() };
     let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(8)).build() else { return info };
@@ -187,7 +200,11 @@ async fn ollama_info(base_url: &str, model: &str) -> ModelInfo {
     let trained = v.get("model_info").and_then(|m| m.as_object()).and_then(|m| {
         m.iter().find(|(k, _)| k.ends_with(".context_length")).and_then(|(_, n)| n.as_u64())
     });
-    info.context = num_ctx.or(trained);
+    // A loaded model reports the window the server really runs it with —
+    // often far below the trained one (32k of 262k). Showing the trained
+    // one hid that Ollama silently cuts the prompt's start past it.
+    let running = ollama_running_ctx(&client, base_url, model).await;
+    info.context = running.or(num_ctx).or(trained);
     info.matched = model.to_string();
     // Newer Ollama lists capabilities: ["completion", "tools", "vision", "thinking"].
     if let Some(caps) = v.get("capabilities").and_then(|c| c.as_array()) {

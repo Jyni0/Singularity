@@ -460,13 +460,28 @@ impl AgentHook for UiHook {
         // system / outside-project paths ALWAYS need one.
         // MCP tools act outside the app — they ask like commands do, unless
         // the server marks the tool read-only or the project auto-runs.
-        let gate = match self.ctx.mcp_tools.get(event.tool_name) {
-            Some((server, read_only)) => (!self.ctx.req.auto_run && !read_only).then(|| Gate {
-                what: format!("{} {}", event.tool_name, one_line(&canonical(&args), 200)),
+        // mcp_call is gated as the MCP tool it runs.
+        let mcp_target = if event.tool_name == "mcp_call" {
+            let name = args.get("tool").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let hit = self.ctx.mcp_tools.get_key_value(name.as_str()).or_else(|| {
+                let tail = format!("__{name}");
+                let mut hits = self.ctx.mcp_tools.iter().filter(|(k, _)| k.ends_with(&tail));
+                let first = hits.next()?;
+                hits.next().is_none().then_some(first)
+            });
+            // Unknown name: the tool itself reports it, nothing runs.
+            hit.map(|(k, v)| (k.clone(), v.clone(), args.get("arguments").cloned().unwrap_or(Value::Null)))
+        } else {
+            self.ctx.mcp_tools.get(event.tool_name).map(|v| (event.tool_name.to_string(), v.clone(), args.clone()))
+        };
+        let gate = match (event.tool_name == "mcp_call", mcp_target) {
+            (_, Some((tool, (server, read_only), shown))) => (!self.ctx.req.auto_run && !read_only).then(|| Gate {
+                what: format!("{tool} {}", one_line(&canonical(&shown), 200)),
                 place: format!("MCP server {server}"),
                 reason: String::new(),
             }),
-            None => permission_gate(
+            (true, None) => None,
+            (false, None) => permission_gate(
                 event.tool_name,
                 &args,
                 &self.ctx.req.workspace,
@@ -645,6 +660,8 @@ fn live_summary(name: &str, args: &str) -> String {
         "git" => "subcommand",
         "delegate" => "agent",
         "skill" => "name",
+        "mcp_find" => "query",
+        "mcp_call" => "tool",
         _ => "path",
     };
     let head = partial_field(args, key).unwrap_or_default();
@@ -941,6 +958,147 @@ fn mcp_tool(b: &McpBinding) -> DynamicTool {
                     Ok((text, false)) => tools::ToolResult::ok(text),
                     Ok((text, true)) => tools::ToolResult::err(text),
                     Err(e) => tools::ToolResult::err(e),
+                };
+                let text = model_text(&res);
+                stash_result(fp, &res);
+                tctx.insert_result(res);
+                Ok(ToolOutput::text(text))
+            })
+        }),
+    )
+}
+
+/// MCP schemas above this many tokens are not sent inline (see mcp_deferred).
+const MCP_INLINE_TOKENS: usize = 6_000;
+
+fn mcp_schema_tokens(mcp: &[McpBinding]) -> usize {
+    mcp.iter()
+        .map(|b| est_tokens(&format!("{}{}{}", b.name, b.tool.description, b.tool.input_schema)))
+        .sum()
+}
+
+/// Whether MCP tools are offered through mcp_find / mcp_call instead of one
+/// tool each. A dozen servers (Playwright, DevTools…) carry 20k+ tokens of
+/// schemas into EVERY request: on a local model reading ~40 tokens/s that
+/// was minutes before the first word and more than its whole window (Ollama
+/// then silently cuts the prompt's start — the model lost its instructions
+/// and never finished). Local models always defer; others once it is big.
+fn mcp_deferred(req: &AgentRequest, mcp: &[McpBinding]) -> bool {
+    !mcp.is_empty() && (req.kind == "ollama" || mcp_schema_tokens(mcp) > MCP_INLINE_TOKENS)
+}
+
+/// The MCP binding a model-given name points at: the full
+/// `mcp__server__tool` name, or the bare tool name when that is unique.
+fn find_mcp<'a>(mcp: &'a [McpBinding], name: &str) -> Option<&'a McpBinding> {
+    let name = name.trim();
+    mcp.iter().find(|b| b.name == name).or_else(|| {
+        let mut hits = mcp.iter().filter(|b| b.tool.name == name);
+        let first = hits.next()?;
+        hits.next().is_none().then_some(first)
+    })
+}
+
+/// Catalog for the system prompt: server → tool names, no schemas.
+fn mcp_catalog(mcp: &[McpBinding]) -> String {
+    let mut out = String::from(
+        "\n\nMCP tools — extra tools from servers the user connected. Their parameters are NOT loaded: \
+         call mcp_find with what you need (or an exact tool name) to get its name and parameters, \
+         then run it with mcp_call {tool, arguments}. Use them when they fit better than the built-in tools.",
+    );
+    let mut servers: Vec<&str> = Vec::new();
+    for b in mcp {
+        if !servers.contains(&b.server.name.as_str()) {
+            servers.push(&b.server.name);
+        }
+    }
+    for server in servers {
+        let names: Vec<&str> = mcp.iter().filter(|b| b.server.name == server).map(|b| b.name.as_str()).collect();
+        out.push_str(&format!("\n- {server}: {}", names.join(", ")));
+    }
+    out
+}
+
+/// `mcp_find`: full name, description and parameters of matching MCP tools.
+fn mcp_find_tool(mcp: Arc<Vec<McpBinding>>) -> DynamicTool {
+    DynamicTool::new(
+        "mcp_find",
+        "Look up MCP tools listed in the system prompt: returns their exact names, descriptions and parameter schemas. Pass keywords (\"screenshot\", \"navigate page\") or an exact tool name.",
+        json!({
+            "type": "object",
+            "properties": { "query": { "type": "string", "description": "Keywords or an exact tool name." } },
+            "required": ["query"]
+        }),
+        tool_fn(move |tctx, args| {
+            let mcp = mcp.clone();
+            Box::pin(async move {
+                let args = norm_args(&args);
+                let fp = fingerprint("mcp_find", &args);
+                let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                let words: Vec<&str> = query.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|w| w.len() > 1).collect();
+                let mut scored: Vec<(usize, &McpBinding)> = match find_mcp(&mcp, &query) {
+                    Some(b) => vec![(usize::MAX, b)],
+                    None => mcp
+                        .iter()
+                        .map(|b| {
+                            let hay = format!("{} {} {}", b.name, b.server.name, b.tool.description).to_lowercase();
+                            (words.iter().filter(|w| hay.contains(*w)).count(), b)
+                        })
+                        .filter(|(n, _)| *n > 0)
+                        .collect(),
+                };
+                scored.sort_by(|a, b| b.0.cmp(&a.0));
+                let res = if scored.is_empty() {
+                    tools::ToolResult::err(format!("no MCP tool matches {query:?} — pick a name from the list in the system prompt"))
+                } else {
+                    tools::ToolResult::ok(
+                        scored
+                            .iter()
+                            .take(6)
+                            .map(|(_, b)| format!("{}\n{}\nparameters: {}", b.name, one_line(&b.tool.description, 600), b.tool.input_schema))
+                            .collect::<Vec<_>>()
+                            .join("\n\n"),
+                    )
+                };
+                let text = model_text(&res);
+                stash_result(fp, &res);
+                tctx.insert_result(res);
+                Ok(ToolOutput::text(text))
+            })
+        }),
+    )
+}
+
+/// `mcp_call`: runs one MCP tool by name.
+fn mcp_call_tool(mcp: Arc<Vec<McpBinding>>) -> DynamicTool {
+    DynamicTool::new(
+        "mcp_call",
+        "Run an MCP tool. Get its exact name and parameters with mcp_find first.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tool": { "type": "string", "description": "Exact MCP tool name (mcp__server__tool)." },
+                "arguments": { "type": "object", "description": "The tool's parameters, as mcp_find showed them." }
+            },
+            "required": ["tool"]
+        }),
+        tool_fn(move |tctx, args| {
+            let mcp = mcp.clone();
+            Box::pin(async move {
+                let args = norm_args(&args);
+                let fp = fingerprint("mcp_call", &args);
+                let name = args.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+                let call_args = match args.get("arguments") {
+                    Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| json!({})),
+                    Some(v) if v.is_object() => v.clone(),
+                    _ => json!({}),
+                };
+                let res = match find_mcp(&mcp, name) {
+                    None => tools::ToolResult::err(format!("unknown MCP tool {name:?} — use mcp_find to get the exact name")),
+                    Some(b) => match crate::mcp::call(&b.server, &b.tool.name, call_args).await {
+                        Ok((text, false)) => tools::ToolResult::ok(text),
+                        Ok((text, true)) => tools::ToolResult::err(text),
+                        Err(e) => tools::ToolResult::err(e),
+                    },
                 };
                 let text = model_text(&res);
                 stash_result(fp, &res);
@@ -1255,7 +1413,7 @@ fn preamble_sections(
     req: &AgentRequest,
     root: &Path,
     skills: &[crate::skills::Skill],
-    mcp_count: usize,
+    mcp: &[McpBinding],
 ) -> Vec<(&'static str, String)> {
     let parallel = req.max_agents.clamp(1, MAX_AGENTS);
     let mut out: Vec<(&'static str, String)> = vec![("System prompt", system.to_string())];
@@ -1301,12 +1459,15 @@ fn preamble_sections(
         "\n\nSpeed: whenever several tool calls do not depend on each other (reading several files, several searches, \
          listing folders), issue them together in ONE turn — they run in parallel. Avoid one-call-per-turn crawling.",
     );
-    if mcp_count > 0 {
+    if !mcp.is_empty() && !mcp_deferred(req, mcp) {
         env.push_str(
             "\n\nTools named mcp__<server>__<tool> come from MCP servers the user connected; use them when they fit the task better than the built-in tools.",
         );
     }
     out.push(("Environment & working rules", env));
+    if mcp_deferred(req, mcp) {
+        out.push(("MCP catalog", mcp_catalog(mcp)));
+    }
     if !skills.is_empty() {
         let mut list = String::from(
             "\n\nSkills — instruction packs for particular kinds of tasks. When the request matches a skill's description, call the `skill` tool with its name BEFORE you start, then follow it:",
@@ -1392,7 +1553,9 @@ pub(super) async fn run(
     };
 
     let has_helpers = has_helpers(req);
-    let preamble: String = preamble_sections(system, req, root, &skills, mcp.len())
+    let deferred = mcp_deferred(req, &mcp);
+    let mcp_all = Arc::new(mcp.clone());
+    let preamble: String = preamble_sections(system, req, root, &skills, &mcp)
         .into_iter()
         .map(|(_, text)| text)
         .collect();
@@ -1404,7 +1567,12 @@ pub(super) async fn run(
         if !skills.is_empty() {
             t.push(skill_tool(skills.clone()));
         }
-        t.extend(mcp.iter().map(mcp_tool));
+        if deferred {
+            t.push(mcp_find_tool(mcp_all.clone()));
+            t.push(mcp_call_tool(mcp_all.clone()));
+        } else {
+            t.extend(mcp.iter().map(mcp_tool));
+        }
         t
     };
     let turns = expand_turns(skills.clone(), root, turns).await?;
@@ -1543,7 +1711,14 @@ fn measure(
     }
     parts.push(category("System tools", "tools", tools_items));
 
-    if !mcp.is_empty() {
+    if mcp_deferred(req, mcp) {
+        // Only the catalog and the two lookup tools ride along.
+        let items = vec![
+            item("catalog (names only)", &mcp_catalog(mcp)),
+            item("mcp_find + mcp_call", &" ".repeat(1_400)),
+        ];
+        parts.push(category("MCP tools", "mcp", items));
+    } else if !mcp.is_empty() {
         let items = mcp
             .iter()
             .map(|b| item(format!("{} · {}", b.server.name, b.tool.name), &format!("{}{}{}", b.name, b.tool.description, b.tool.input_schema)))
@@ -1551,7 +1726,7 @@ fn measure(
         parts.push(category("MCP tools", "mcp", items));
     }
 
-    let sections = preamble_sections(system, req, root, skills, mcp.len());
+    let sections = preamble_sections(system, req, root, skills, mcp);
     if !skills.is_empty() {
         // Only name + description ride along; a skill's body loads on use.
         let items = skills
@@ -1562,7 +1737,7 @@ fn measure(
     }
     let sys_items = sections
         .iter()
-        .filter(|(label, _)| *label != "Skills list")
+        .filter(|(label, _)| *label != "Skills list" && *label != "MCP catalog")
         .map(|(label, text)| item(*label, text))
         .collect();
     parts.push(category("System prompt", "system", sys_items));
@@ -1670,3 +1845,34 @@ mod tests {
         assert_eq!(canonical(&a), canonical(&b));
     }
 }
+
+#[cfg(test)]
+mod mcp_defer_tests {
+    use super::*;
+
+    fn binding(server: &str, tool: &str) -> McpBinding {
+        let tool = crate::mcp::McpTool {
+            name: tool.into(),
+            description: format!("{tool} does things"),
+            input_schema: json!({ "type": "object" }),
+            read_only: false,
+        };
+        let server: crate::mcp::McpServer = serde_json::from_value(json!({
+            "id": "s", "name": server, "transport": "http", "url": "http://x", "enabled": true
+        }))
+        .unwrap_or_else(|_| panic!("McpServer shape"));
+        McpBinding { name: crate::mcp::tool_name(&server.name, &tool.name), server: Arc::new(server), tool }
+    }
+
+    #[test]
+    fn deferred_lookup_by_full_or_bare_name() {
+        let mcp = vec![binding("Browser", "navigate"), binding("Browser", "click"), binding("DevTools", "click")];
+        assert_eq!(find_mcp(&mcp, "navigate").map(|b| b.tool.name.as_str()), Some("navigate"));
+        assert!(find_mcp(&mcp, "click").is_none(), "ambiguous bare name");
+        let full = mcp[2].name.clone();
+        assert_eq!(find_mcp(&mcp, &full).map(|b| b.server.name.as_str()), Some("DevTools"));
+        let cat = mcp_catalog(&mcp);
+        assert!(cat.contains("- Browser: ") && cat.contains("- DevTools: "));
+    }
+}
+

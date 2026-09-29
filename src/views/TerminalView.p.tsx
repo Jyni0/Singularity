@@ -5,6 +5,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
+import { readText as clipboardRead, writeText as clipboardWrite } from "@tauri-apps/plugin-clipboard-manager";
 import * as db from "../core/db.r";
 import type { SshServer } from "../core/types.i";
 import { DEFAULT_TERMINAL_THEME, terminalTheme } from "../ui/TerminalTheme.s";
@@ -19,17 +20,45 @@ const DEFAULT_SSH_TERMINAL = {
   term: "xterm-256color",
 };
 
-/**
- * connId → live PTY session id. Module-level on purpose: connection pages
- * unmount when the user switches tabs (they are separate routes), and
- * remounting must RE-ATTACH to the same shell instead of spawning a second
- * one. The entry is dropped when the shell exits or the connection is
- * closed from the sidebar.
- */
-const SESSION_BY_CONN = new Map<string, string>();
+type TermStatus = "connecting" | "open" | "closed" | "error";
 
-/** connId → the mounted xterm of that connection page. */
-const TERM_BY_CONN = new Map<string, Terminal>();
+/**
+ * One live terminal per connection page, kept for the page's whole life —
+ * NOT per mount. Connection pages unmount when the user switches tabs;
+ * disposing the xterm then and repainting it later from the 256 KB ring
+ * buffer lost everything a full-screen program (htop, watch, a dev server's
+ * status screen) drew before the buffer's cut: only the parts that kept
+ * changing came back. Now the xterm, its screen, scrollback and selection
+ * stay intact and keep receiving output while hidden; a remount only moves
+ * its element back into the page. Disposed when the connection is closed
+ * (forgetConnSession) or reconnected.
+ */
+interface LiveTerm {
+  term: Terminal;
+  fit: FitAddon;
+  /** xterm's own box — moved between page mounts, never recreated. */
+  el: HTMLDivElement;
+  background: string;
+  /** TERM value asked for the PTY. */
+  termType: string;
+  sessionId: string | null;
+  status: TermStatus;
+  error: string | null;
+  /** The mounted page (null while the tab is hidden). */
+  view: { setStatus: (s: TermStatus) => void; setError: (e: string | null) => void } | null;
+  onSession: (sessionId: string | null) => void;
+  dead: boolean;
+  cleanup: (() => void)[];
+}
+
+// On globalThis so a hot reload of this module (dev) keeps the SAME map: a
+// fresh one left the old xterms alive and subscribed, and every one of them
+// answered the shell's terminal queries (background colour, cursor
+// position) — the extra answers landed in the prompt as "11;rgb:…;1R".
+const LIVE: Map<string, LiveTerm> = ((globalThis as { __sshTerms?: Map<string, LiveTerm> }).__sshTerms ??= new Map());
+
+/** connId → "copied" toast of the page showing that connection. */
+const COPIED_BY_CONN = new Map<string, () => void>();
 
 /**
  * Pastes text into a connection's terminal as if the user pasted it: xterm
@@ -38,31 +67,213 @@ const TERM_BY_CONN = new Map<string, Terminal>();
  * Returns false when that terminal is not mounted.
  */
 export function pasteIntoConn(connId: string, text: string): boolean {
-  const term = TERM_BY_CONN.get(connId);
-  if (!term) return false;
-  term.paste(text);
-  term.focus();
+  const live = LIVE.get(connId);
+  if (!live || live.dead) return false;
+  live.term.paste(text);
+  live.term.focus();
   return true;
 }
 
-/** Drop a connection's cached session — called by the App when the
- *  Connections row is closed (the PTY itself is killed there too). */
+function disposeLive(connId: string) {
+  const live = LIVE.get(connId);
+  if (!live) return;
+  LIVE.delete(connId);
+  live.dead = true;
+  live.cleanup.forEach((f) => f());
+  live.el.remove();
+  live.term.dispose();
+}
+
+/** Drop a connection's terminal — called by the App when the Connections
+ *  row is closed (the PTY itself is killed there too). */
 export function forgetConnSession(connId: string) {
-  SESSION_BY_CONN.delete(connId);
+  disposeLive(connId);
+}
+
+function setLiveStatus(live: LiveTerm, status: TermStatus, error?: string | null) {
+  live.status = status;
+  live.view?.setStatus(status);
+  if (error !== undefined) {
+    live.error = error;
+    live.view?.setError(error);
+  }
+}
+
+/** Copy / paste. In xterm Ctrl+C is SIGINT and the app blocks the native
+ *  context menu, so selected text could not be copied at all. Copying is
+ *  explicit and only Ctrl+Shift+C (Ctrl+C stays an interrupt); Ctrl+V /
+ *  Ctrl+Shift+V and right click paste. Through the system clipboard (Tauri
+ *  plugin) — the WebView's navigator.clipboard silently failed here. */
+function wireClipboard(live: LiveTerm, onCopied: () => void) {
+  const { term, el } = live;
+  const write = (text: string) =>
+    clipboardWrite(text)
+      .catch(() => navigator.clipboard.writeText(text))
+      .then(onCopied)
+      .catch((e) => console.error("[terminal] copy failed", e));
+  const copySelection = () => {
+    const text = term.getSelection();
+    if (!text) return false;
+    void write(text);
+    term.clearSelection();
+    return true;
+  };
+  const paste = () => {
+    void clipboardRead()
+      .catch(() => navigator.clipboard.readText())
+      .then((text) => {
+        if (text) term.paste(text);
+      })
+      .catch((e) => console.error("[terminal] paste failed", e));
+  };
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type !== "keydown" || !(e.ctrlKey || e.metaKey) || e.altKey) return true;
+    if (e.code === "KeyC" && e.shiftKey) {
+      e.preventDefault();
+      copySelection();
+      return false;
+    }
+    if (e.code === "KeyV") {
+      e.preventDefault();
+      paste();
+      return false;
+    }
+    return true;
+  });
+  const onContextMenu = (e: MouseEvent) => {
+    e.preventDefault();
+    paste();
+  };
+  el.addEventListener("contextmenu", onContextMenu);
+  live.cleanup.push(
+    () => el.removeEventListener("contextmenu", onContextMenu),
+  );
+}
+
+/** Creates the connection's terminal and its PTY session (or re-attaches to
+ *  a session that outlived a reload). Runs detached from any mount. */
+async function createLive(onSession: (sessionId: string | null) => void): Promise<LiveTerm> {
+  // 0. SSH-mode terminal settings (Settings → Terminal persists them).
+  const [fs, ff, sb, cb, termType, themeName] = await Promise.all([
+    db.getSetting("ssh_font_size"),
+    db.getSetting("ssh_font_family"),
+    db.getSetting("ssh_scrollback"),
+    db.getSetting("ssh_cursor_blink"),
+    db.getSetting("ssh_term"),
+    db.getSetting("ssh_theme"),
+  ]);
+  const tset = {
+    fontSize: fs ? Number(fs) || DEFAULT_SSH_TERMINAL.fontSize : DEFAULT_SSH_TERMINAL.fontSize,
+    fontFamily: ff || DEFAULT_SSH_TERMINAL.fontFamily,
+    scrollback: sb ? Number(sb) || DEFAULT_SSH_TERMINAL.scrollback : DEFAULT_SSH_TERMINAL.scrollback,
+    cursorBlink: cb === null ? DEFAULT_SSH_TERMINAL.cursorBlink : cb === "1",
+    term: termType || DEFAULT_SSH_TERMINAL.term,
+    theme: themeName || DEFAULT_TERMINAL_THEME,
+  };
+
+  // 1. The full palette comes from the picked theme (Settings → Terminal);
+  //    a stored but unknown name falls back to the default palette.
+  const css = getComputedStyle(document.documentElement);
+  const term = new Terminal({
+    cursorBlink: tset.cursorBlink,
+    fontSize: tset.fontSize,
+    fontFamily: tset.fontFamily,
+    scrollback: tset.scrollback,
+    theme: terminalTheme(tset.theme),
+  });
+  const el = document.createElement("div");
+  el.style.width = "100%";
+  el.style.height = "100%";
+  const fit = new FitAddon();
+  term.loadAddon(fit);
+  term.loadAddon(new WebLinksAddon());
+  const live: LiveTerm = {
+    term,
+    fit,
+    el,
+    // Blend with the app surface: match the page background outside the
+    // terminal box so the palette does not clash with the shell theme.
+    background: terminalTheme(tset.theme).background ?? css.getPropertyValue("--bg-input").trim(),
+    termType: tset.term,
+    sessionId: null,
+    status: "connecting",
+    error: null,
+    view: null,
+    onSession,
+    dead: false,
+    cleanup: [],
+  };
+  return live;
+}
+
+/** Opens the session of a fresh live terminal (its element is mounted and
+ *  fitted by now, so cols×rows are the real ones). */
+async function connectLive(live: LiveTerm, server: SshServer) {
+  const { term } = live;
+  // 2. Output listener FIRST, session second: the listener filters by
+  //    sessionId, so wiring it before the session id exists is safe and
+  //    closes the race where a fresh PTY's first bytes (the login banner)
+  //    are emitted before onSshEvent resolved. Those bytes are ALSO in the
+  //    Rust ring buffer — step 3 paints the screen from the snapshot.
+  try {
+    const off = await db.onSshEvent({
+      onShellData: (pl) => {
+        if (pl.sessionId === live.sessionId) term.write(db.decodeB64(pl.data));
+      },
+      onShellExit: (pl) => {
+        if (pl.sessionId !== live.sessionId) return;
+        const code = pl.code === null ? "" : " with code " + pl.code;
+        term.writeln("\r\n\x1b[33m[session closed" + code + "]\x1b[0m");
+        live.sessionId = null;
+        setLiveStatus(live, "closed");
+        live.onSession(null);
+      },
+    });
+    live.cleanup.push(off);
+    if (live.dead) return;
+
+    const sessionId = await db.sshShellOpen(server.id, term.cols, term.rows, live.termType);
+    if (live.dead) {
+      // Closed mid-connect — do not leak the shell we just opened.
+      void db.sshShellClose(sessionId).catch(() => {});
+      return;
+    }
+    live.sessionId = sessionId;
+    live.onSession(sessionId);
+
+    // 3. Paint a clean screen from the ring-buffer snapshot: it covers
+    //    everything up to now, including banner bytes emitted meanwhile.
+    const snapshot = await db.sshShellSnapshot(sessionId);
+    if (live.dead) return;
+    term.reset();
+    if (snapshot.length) term.write(snapshot);
+    setLiveStatus(live, "open");
+
+    // 4. Keyboard → PTY.
+    const send = (data: string) => {
+      if (live.sessionId) void db.sshShellInput(live.sessionId, data).catch(() => {});
+    };
+    const inputDisp = term.onData(send);
+    const binDisp = term.onBinary(send);
+    live.cleanup.push(() => inputDisp.dispose(), () => binDisp.dispose());
+  } catch (e) {
+    if (live.dead) return;
+    const msg = e instanceof Error ? e.message : String(e);
+    setLiveStatus(live, "error", msg);
+    term.writeln("\x1b[31m" + msg + "\x1b[0m");
+  }
 }
 
 /**
  * Terminal page — a real interactive PTY session on one server, sized to
- * the window. One component instance == one connection (Termius-style
- * tabs): every instance opens its OWN shell and reports its session id up
- * via onSession, so the App can kill exactly this PTY when the connection
- * row is closed. The terminal box fills the remaining window; a
- * ResizeObserver keeps the PTY geometry in sync (the size is negotiated
- * with sshd at open time AND on every resize — that is what keeps `top`,
- * `vim` etc. from drawing at the default 80×24). Output arrives
- * base64-encoded on ssh://shell-data and is written as raw bytes, so
- * binary-safe. Unmounting closes the session: the connection page IS the
- * session's lifetime.
+ * the window. One connection page == one terminal and one PTY
+ * (Termius-style tabs), reported up via onSession so the App can kill
+ * exactly this PTY when the connection row is closed. The terminal box
+ * fills the remaining window; a ResizeObserver keeps the PTY geometry in
+ * sync (the size is negotiated with sshd at open time AND on every resize —
+ * that is what keeps `top`, `vim` etc. from drawing at the default 80×24).
+ * Output arrives base64-encoded on ssh://shell-data and is written as raw
+ * bytes, so binary-safe. The terminal outlives the page mount (see LIVE).
  */
 export function TerminalView({
   server,
@@ -80,194 +291,96 @@ export function TerminalView({
   onClose: () => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
-  const termRef = useRef<Terminal | null>(null);
-  const sessionRef = useRef<string | null>(null);
-  const fitRef = useRef<FitAddon | null>(null);
-  const [status, setStatus] = useState<"connecting" | "open" | "closed" | "error">("connecting");
-  const [error, setError] = useState<string | null>(null);
-  /** Bumped by Reconnect: the host div remounts (key) and the effect reruns. */
+  const existing = LIVE.get(connId);
+  const [status, setStatus] = useState<TermStatus>(existing?.status ?? "connecting");
+  const [error, setError] = useState<string | null>(existing?.error ?? null);
+  const [copied, setCopied] = useState(0);
+  /** Bumped by Reconnect: the effect reruns with a fresh terminal. */
   const [nonce, setNonce] = useState(0);
 
   useEffect(() => {
-    let cancelled = false;
-    let offEvents: (() => void) | undefined;
-    let offResizeObs: (() => void) | undefined;
-    const cleanupFns: (() => void)[] = [];
+    if (!copied) return;
+    const t = setTimeout(() => setCopied(0), 1200);
+    return () => clearTimeout(t);
+  }, [copied]);
 
-    const savedSession = SESSION_BY_CONN.get(connId);
+  useEffect(() => {
+    let unmounted = false;
+    let ro: ResizeObserver | undefined;
+    let live: LiveTerm | undefined;
 
-    const boot = async () => {
+    const mount = (l: LiveTerm) => {
       const host = hostRef.current;
-      if (!host) return;
-
-      // 0. SSH-mode terminal settings (Settings → Terminal persists them).
-      const [fs, ff, sb, cb, termType, themeName] = await Promise.all([
-        db.getSetting("ssh_font_size"),
-        db.getSetting("ssh_font_family"),
-        db.getSetting("ssh_scrollback"),
-        db.getSetting("ssh_cursor_blink"),
-        db.getSetting("ssh_term"),
-        db.getSetting("ssh_theme"),
-      ]);
-      if (cancelled) {
-        return;
-      }
-      const tset = {
-        fontSize: fs ? Number(fs) || DEFAULT_SSH_TERMINAL.fontSize : DEFAULT_SSH_TERMINAL.fontSize,
-        fontFamily: ff || DEFAULT_SSH_TERMINAL.fontFamily,
-        scrollback: sb ? Number(sb) || DEFAULT_SSH_TERMINAL.scrollback : DEFAULT_SSH_TERMINAL.scrollback,
-        cursorBlink: cb === null ? DEFAULT_SSH_TERMINAL.cursorBlink : cb === "1",
-        term: termType || DEFAULT_SSH_TERMINAL.term,
-        theme: themeName || DEFAULT_TERMINAL_THEME,
-      };
-
-      // 1. Terminal fills its box; the full palette comes from the picked
-      //    theme (Settings → Terminal). A stored but unknown name falls back
-      //    to the default palette.
-      const css = getComputedStyle(document.documentElement);
-      const term = new Terminal({
-        cursorBlink: tset.cursorBlink,
-        fontSize: tset.fontSize,
-        fontFamily: tset.fontFamily,
-        scrollback: tset.scrollback,
-        theme: terminalTheme(tset.theme),
-      });
-      // Blend with the app surface: match the page background outside the
-      // terminal box so the palette does not clash with the shell theme.
-      host.style.backgroundColor = terminalTheme(tset.theme).background ?? css.getPropertyValue("--bg-input").trim();
-      const fit = new FitAddon();
-      term.loadAddon(fit);
-      term.loadAddon(new WebLinksAddon());
-      term.open(host);
-      fit.fit();
-      termRef.current = term;
-      fitRef.current = fit;
-      TERM_BY_CONN.set(connId, term);
-
-      // 2. Output listener FIRST, session second: the listener filters by
-      //    sessionRef, so wiring it before the session id exists is safe and
-      //    closes the race where a fresh PTY's first bytes (the login banner)
-      //    are emitted before onSshEvent resolved. Bytes that arrive in that
-      //    window are ALSO in the Rust ring buffer — step 3 re-syncs from the
-      //    snapshot, and a duplicate of the pre-snapshot tail is corrected by
-      //    writing the snapshot into a fresh terminal (reset + write).
-      let off: (() => void) | undefined;
-      let inputDisp: { dispose: () => void } | undefined;
-      let binDisp: { dispose: () => void } | undefined;
-      try {
-        off = await db.onSshEvent({
-          onShellData: (pl) => {
-            if (pl.sessionId !== sessionRef.current) return;
-            term.write(db.decodeB64(pl.data));
-          },
-          onShellExit: (pl) => {
-            if (pl.sessionId !== sessionRef.current) return;
-            setStatus("closed");
-            const code = pl.code === null ? "" : " with code " + pl.code;
-            term.writeln("\r\n\x1b[33m[session closed" + code + "]\x1b[0m");
-            sessionRef.current = null;
-            SESSION_BY_CONN.delete(connId);
-            onSession(null);
-          },
-        });
-        if (cancelled) {
-          off();
-          term.dispose();
-          return;
-        }
-        offEvents = off;
-
-        // One connection page == one PTY. When this page had a session
-        // before (the user switched to another tab and back), re-attach to
-        // it; otherwise open a fresh PTY WITH the measured size (cols×rows).
-        let sessionId: string;
-        let reattached = false;
-        const live = await db.sshShellList();
-        const own = savedSession && live.find(([sid]) => sid === savedSession);
-        if (own) {
-          sessionId = own[0];
-          reattached = true;
-        } else {
-          sessionId = await db.sshShellOpen(server.id, term.cols, term.rows, tset.term);
-        }
-        if (cancelled) {
-          // Unmounted mid-connect — do not leak the shell we just opened.
-          if (!reattached) void db.sshShellClose(sessionId).catch(() => {});
-          term.dispose();
-          return;
-        }
-        sessionRef.current = sessionId;
-        SESSION_BY_CONN.set(connId, sessionId);
-        if (!reattached) onSession(sessionId);
-
-        // 3. Re-sync from the ring-buffer snapshot: it covers everything up
-        //    to now (including any banner bytes emitted while we awaited),
-        //    so paint a clean screen from it rather than risking duplicates.
-        const snapshot = await db.sshShellSnapshot(sessionId);
-        if (!cancelled) {
-          term.reset();
-          if (snapshot.length) term.write(snapshot);
-          setStatus("open");
-        }
-
-        // 4. Keyboard → PTY (only after the session exists).
-        inputDisp = term.onData((data) => {
-          if (sessionRef.current) void db.sshShellInput(sessionRef.current, data).catch(() => {});
-        });
-        binDisp = term.onBinary((data) => {
-          if (sessionRef.current) void db.sshShellInput(sessionRef.current, data).catch(() => {});
-        });
-        cleanupFns.push(() => inputDisp?.dispose(), () => binDisp?.dispose());
-      } catch (e) {
-        if (!cancelled) {
-          setStatus("error");
-          setError(e instanceof Error ? e.message : String(e));
-          term.writeln("\x1b[31m" + (e instanceof Error ? e.message : String(e)) + "\x1b[0m");
-        }
-        return;
-      }
-
+      if (!host || unmounted) return;
+      live = l;
+      l.view = { setStatus, setError };
+      l.onSession = onSession;
+      setStatus(l.status);
+      setError(l.error);
+      host.style.backgroundColor = l.background;
+      host.appendChild(l.el);
+      if (!l.term.element) l.term.open(l.el);
       // 5. Window/panel resizes → refit → tell the remote PTY the new size.
       const sendResize = () => {
         try {
-          fitRef.current?.fit();
+          l.fit.fit();
         } catch {
           return;
         }
-        const t = termRef.current;
-        if (t && sessionRef.current) {
-          void db.sshShellResize(sessionRef.current, t.cols, t.rows).catch(() => {});
-        }
+        if (l.sessionId) void db.sshShellResize(l.sessionId, l.term.cols, l.term.rows).catch(() => {});
       };
-      const ro = new ResizeObserver(() => sendResize());
+      sendResize();
+      l.term.refresh(0, l.term.rows - 1);
+      ro = new ResizeObserver(sendResize);
       ro.observe(host);
-      offResizeObs = () => ro.disconnect();
-
-      cleanupFns.push(() => inputDisp.dispose(), () => binDisp.dispose());
+      l.term.focus();
     };
 
-    void boot();
+    const known = LIVE.get(connId);
+    if (known) {
+      mount(known);
+    } else {
+      void createLive(onSession).then((l) => {
+        if (LIVE.has(connId)) {
+          // A second mount won the race — use its terminal.
+          l.term.dispose();
+          if (!unmounted) mount(LIVE.get(connId)!);
+          return;
+        }
+        LIVE.set(connId, l);
+        wireClipboard(l, () => COPIED_BY_CONN.get(connId)?.());
+        mount(l);
+        void connectLive(l, server);
+      });
+    }
 
     return () => {
-      cancelled = true;
-      offEvents?.();
-      offResizeObs?.();
-      cleanupFns.forEach((f) => f());
-      sessionRef.current = null;
-      // The PTY itself stays alive in Rust: switching connection tabs only
-      // unmounts the view — switching back re-attaches via SESSION_BY_CONN.
-      // The session is killed by closeSshConn when the Connections row dies.
-      if (TERM_BY_CONN.get(connId) === termRef.current) TERM_BY_CONN.delete(connId);
-      termRef.current?.dispose();
-      termRef.current = null;
+      unmounted = true;
+      ro?.disconnect();
+      if (live) {
+        live.view = null;
+        // Hidden, not destroyed: output keeps landing in it.
+        live.el.remove();
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connId, server.id, nonce]);
 
+  // The copy toast of whichever page shows this connection.
+  useEffect(() => {
+    const f = () => setCopied(Date.now());
+    COPIED_BY_CONN.set(connId, f);
+    return () => {
+      if (COPIED_BY_CONN.get(connId) === f) COPIED_BY_CONN.delete(connId);
+    };
+  }, [connId]);
+
   const reconnect = () => {
+    const old = LIVE.get(connId);
+    if (old?.sessionId) void db.sshShellClose(old.sessionId).catch(() => {});
+    disposeLive(connId);
     setStatus("connecting");
     setError(null);
-    SESSION_BY_CONN.delete(connId);
     setNonce((n) => n + 1);
   };
 
@@ -320,6 +433,12 @@ export function TerminalView({
       {error && (
         <div className="pointer-events-none absolute left-1/2 top-14 z-10 max-w-[70%] -translate-x-1/2 rounded-full border border-[var(--diff-del)]/40 bg-[var(--bg-surface)]/95 px-3.5 py-1.5 text-[11.5px] text-[var(--diff-del)] shadow-[var(--shadow-popup)] backdrop-blur">
           <span className="block truncate" title={error}>{error}</span>
+        </div>
+      )}
+
+      {copied > 0 && (
+        <div className="pointer-events-none absolute bottom-3 right-3 z-10 rounded-full border border-[var(--border)] bg-[var(--bg-surface)]/95 px-3 py-1 text-[11.5px] text-[var(--text-muted)] shadow-[var(--shadow-popup)] backdrop-blur">
+          Copied
         </div>
       )}
 

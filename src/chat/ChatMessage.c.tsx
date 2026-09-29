@@ -244,6 +244,22 @@ function groupSegments(segments: Segment[]): (Segment | { group: Segment[] })[] 
 
 /* ---------- Unified chat message row ---------- */
 
+/**
+ * When the live turn last visibly changed. Kept outside the component:
+ * switching to another mode/view unmounts the chat, and a ref reset the
+ * "AI is thinking" timer to 0 on the way back although the model had been
+ * quiet all along. One record, not a map by content: every new turn starts
+ * from the same empty-content signature, so a map handed the new prompt the
+ * previous prompt's start time and the timer kept adding up.
+ */
+let LIVE_CHANGE = { signature: NaN, at: 0 };
+
+function changedAt(signature: number, streaming: boolean): number {
+  if (!streaming) return Date.now();
+  if (LIVE_CHANGE.signature !== signature) LIVE_CHANGE = { signature, at: Date.now() };
+  return LIVE_CHANGE.at;
+}
+
 function ChatMessageView({
   role,
   text,
@@ -276,7 +292,6 @@ function ChatMessageView({
 }) {
   const [editing, setEditing] = useState(false);
   // When did this turn last visibly change? Drives the "Working…" pulse.
-  const lastChange = useRef(Date.now());
   const signature =
     (segments?.length ?? 0) * 1_000_003 +
     (text?.length ?? 0) +
@@ -286,9 +301,7 @@ function ChatMessageView({
       if (s.kind === "usage") return n + (s.usage.completion_tokens ?? 0) * 3;
       return n;
     }, 0) ?? 0);
-  useEffect(() => {
-    lastChange.current = Date.now();
-  }, [signature, role]);
+  const lastChange = { current: changedAt(signature, !!streaming) };
 
   if (role === "user") {
     return (

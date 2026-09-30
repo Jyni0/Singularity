@@ -341,10 +341,12 @@ struct UiHook {
     last_call: Mutex<(String, usize)>,
     /// How many of the clearable tool results (oldest first) are stubbed.
     cleared: Mutex<usize>,
+    /// Files this agent has read; forgotten when old results get stubbed.
+    memo: ReadMemo,
 }
 
 impl UiHook {
-    fn new(ctx: RunCtx, label: Option<&str>, snapshot: Snapshot) -> Self {
+    fn new(ctx: RunCtx, label: Option<&str>, snapshot: Snapshot, memo: ReadMemo) -> Self {
         Self {
             ctx,
             snapshot,
@@ -353,6 +355,7 @@ impl UiHook {
             live: Mutex::new(HashMap::new()),
             last_call: Mutex::new((String::new(), 0)),
             cleared: Mutex::new(0),
+            memo,
         }
     }
 
@@ -375,7 +378,13 @@ impl AgentHook for UiHook {
         let permit = crate::limiter::acquire(&key, req.rate_limit_rpm, req.concurrency, &self.ctx.run_id).await;
         *self.permit.lock().unwrap() = Some(permit);
         let mut cleared = self.cleared.lock().unwrap();
-        match clear_old_results(event.history, &mut cleared) {
+        let before = *cleared;
+        let patched = clear_old_results(event.history, &mut cleared);
+        if *cleared != before {
+            // Earlier file contents may be stubs now: reading again is real.
+            self.memo.forget();
+        }
+        match patched {
             Some(history) => CompletionCallAction::patch(rig_agent::agent::RequestPatch::new().history(history)),
             None => CompletionCallAction::Continue,
         }
@@ -716,8 +725,62 @@ fn model_text(res: &tools::ToolResult) -> String {
     }
 }
 
+/// Files one agent has read in this run: path → (content hash, line span
+/// returned). Reading an unchanged file again returned the very text that is
+/// already in the conversation — models did it again and again across the
+/// steps of one answer, each time paying the whole file twice. A read that
+/// an earlier one of the same, unchanged file covers gets a short note
+/// instead; any edit changes the hash, so the next read is a real one.
+#[derive(Clone, Default)]
+struct ReadMemo(Arc<Mutex<HashMap<PathBuf, Vec<(u64, usize, usize)>>>>);
+
+impl ReadMemo {
+    fn forget(&self) {
+        self.0.lock().unwrap().clear();
+    }
+
+    fn read(&self, root: &Path, args: &Value) -> tools::ToolResult {
+        let line = |k: &str| args.get(k).and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok())).map(|n| n as usize);
+        let (start, end) = (line("start_line"), line("end_line"));
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let seen = tools::resolve(root, path).ok().and_then(|full| {
+            let bytes = std::fs::read(&full).ok()?;
+            let hash = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut h);
+                h.finish()
+            };
+            let lines = bytes.split(|b| *b == b'\n').count().max(1);
+            let from = start.unwrap_or(1).max(1);
+            let to = end.unwrap_or(from.saturating_add(READ_SPAN - 1)).min(lines);
+            Some((full, hash, from, to))
+        });
+        if let Some((full, hash, from, to)) = &seen {
+            let map = self.0.lock().unwrap();
+            let covered = map
+                .get(full)
+                .is_some_and(|reads| reads.iter().any(|&(h, a, b)| h == *hash && a <= *from && b >= *to));
+            if covered && from <= to {
+                return tools::ToolResult::ok(format!(
+                    "{path} (lines {from}-{to}) has not changed since you read it earlier in this task — \
+                     its content is already above in this conversation; use that instead of reading it again."
+                ));
+            }
+        }
+        let res = tools::dispatch(root, "read_file", args);
+        if let (true, Some((full, hash, from, to))) = (res.ok, seen) {
+            self.0.lock().unwrap().entry(full).or_default().push((hash, from, to));
+        }
+        res
+    }
+}
+
+/// Lines read_file returns without an end_line (tools::READ_DEFAULT_LINES).
+const READ_SPAN: usize = 2_000;
+
 /// The filesystem / command / SSH tools, as Rig dynamic tools.
-fn fs_tools(ctx: &RunCtx) -> Vec<DynamicTool> {
+fn fs_tools(ctx: &RunCtx, memo: &ReadMemo) -> Vec<DynamicTool> {
     let specs = tool_specs(&ctx.req);
     specs
         .as_array()
@@ -729,6 +792,7 @@ fn fs_tools(ctx: &RunCtx) -> Vec<DynamicTool> {
             let description = spec["description"].as_str().unwrap_or("").to_string();
             let parameters = spec["parameters"].clone();
             let c = ctx.clone();
+            let memo = memo.clone();
             let tool_name = name.clone();
             DynamicTool::new(
                 name,
@@ -736,6 +800,7 @@ fn fs_tools(ctx: &RunCtx) -> Vec<DynamicTool> {
                 parameters,
                 tool_fn(move |tctx, args| {
                     let c = c.clone();
+                    let memo = memo.clone();
                     let tool_name = tool_name.clone();
                     Box::pin(async move {
                         let args = norm_args(&args);
@@ -753,6 +818,12 @@ fn fs_tools(ctx: &RunCtx) -> Vec<DynamicTool> {
                             }
                             "change_dir" => change_dir(&c, &get("path")),
                             "generate_image" => crate::imagegen::tool(&c.app, c.req.image_gen.as_ref(), &args).await,
+                            "read_file" => {
+                                let root = c.cwd();
+                                tokio::task::spawn_blocking(move || memo.read(&root, &args))
+                                    .await
+                                    .unwrap_or_else(|e| tools::ToolResult::err(format!("tool task failed: {e}")))
+                            }
                             _ => {
                                 // Tools block (file IO, processes): keep the async
                                 // workers free so events keep flowing.
@@ -1277,7 +1348,7 @@ async fn drive(
 async fn run_with_retry(
     ctx: &RunCtx,
     preamble: &str,
-    tools: impl Fn() -> Vec<DynamicTool>,
+    tools: impl Fn(&ReadMemo) -> Vec<DynamicTool>,
     label: Option<&str>,
     mut prompt: Message,
     mut history: Vec<Message>,
@@ -1286,16 +1357,19 @@ async fn run_with_retry(
     mut on_text: impl FnMut(&str),
 ) -> Result<String, String> {
     let snapshot: Snapshot = Arc::default();
+    // One per agent history: a retry resumes the same history, so the reads
+    // it remembers are still in it.
+    let memo = ReadMemo::default();
     let mut text = String::new();
     let mut attempt = 0usize;
     loop {
-        let (agent, seen) = build_agent(ctx, preamble, tools())?;
+        let (agent, seen) = build_agent(ctx, preamble, tools(&memo))?;
         let stream = agent
             .stream_chat(prompt.clone(), history.clone())
             .max_turns(MAX_TURNS)
             // Several delegate calls in one turn run side by side.
             .tool_concurrency(parallel)
-            .add_hook(UiHook::new(ctx.clone(), label, snapshot.clone()))
+            .add_hook(UiHook::new(ctx.clone(), label, snapshot.clone(), memo.clone()))
             .await;
         let (part, err) = drive(ctx, stream, &seen, to_ui, &mut on_text).await;
         text.push_str(&part);
@@ -1362,7 +1436,7 @@ async fn run_subagent(ctx: &RunCtx, def: &SubagentDef, task: &str, card: Option<
     // Helpers batch their own independent tool calls too (several reads /
     // searches in one turn run side by side).
     let parallel = ctx.req.max_agents.clamp(1, 8);
-    let result = run_with_retry(ctx, &preamble, || fs_tools(ctx), Some(&def.name), Message::user(task), Vec::new(), parallel, false, |t| {
+    let result = run_with_retry(ctx, &preamble, |memo| fs_tools(ctx, memo), Some(&def.name), Message::user(task), Vec::new(), parallel, false, |t| {
         partial.push_str(t);
         // Live progress in the delegate card, throttled.
         if let Some(idx) = card {
@@ -1455,8 +1529,10 @@ fn preamble_sections(
     );
     // Earlier answers carry the list of what they did (the frontend adds it).
     env.push_str(
-        "\n\nYour earlier answers in this chat end with a \"[Tool calls of this turn]\" list the app adds: what you \
-         already read, changed and ran. Build on it — do not redo that work unless something changed since. \
+        "\n\nYour earlier answers in this chat end with a \"[Tool calls of this turn]\" list the app adds: a record of \
+         what you already read, changed and ran, so you need not search or run it again. It holds no file contents: \
+         to edit a file named there, read_file it first (only the part you need). The names in it are a history, \
+         not your tool set — the tools you have now are exactly the ones you were given in this request, and they work. \
          Never write such a list yourself.",
     );
     if !mcp.is_empty() && !mcp_deferred(req, mcp) {
@@ -1572,8 +1648,8 @@ pub(super) async fn run(
         .into_iter()
         .map(|(_, text)| text)
         .collect();
-    let tools = || {
-        let mut t = fs_tools(&ctx);
+    let tools = |memo: &ReadMemo| {
+        let mut t = fs_tools(&ctx, memo);
         if has_helpers {
             t.push(delegate_tool(&ctx));
         }

@@ -29,7 +29,7 @@ pub(super) fn tool_specs(req: &AgentRequest) -> Value {
         },
         {
             "name": "apply_patch",
-            "description": "The main way to change files. The diff is one or more SEARCH/REPLACE blocks: <<<<<<< SEARCH / exact existing lines / ======= / new lines / >>>>>>> REPLACE (each marker on its own line). Only edit files you have read with read_file in this task — never invent paths or contents. Keep SEARCH short (a few lines) and copy it verbatim from the read, without line numbers. If a patch fails, the error shows the real lines — fix SEARCH from them instead of resending. Every edit is syntax-checked: when the result lists SYNTAX ERRORS (unclosed tags / brackets…), fix them in your very next step. To create a genuinely NEW file set create:true and send ONE block with an EMPTY SEARCH side.",
+            "description": "The main way to change files. The diff is one or more SEARCH/REPLACE blocks: <<<<<<< SEARCH / exact existing lines / ======= / new lines / >>>>>>> REPLACE (each marker on its own line). Copy SEARCH from the file's real content (read it with read_file first when that content is not in this conversation) — never invent paths or contents. Keep SEARCH short (a few lines) and copy it verbatim, without line numbers. If a patch fails, the error shows the real lines — fix SEARCH from them instead of resending. Every edit is syntax-checked: when the result lists SYNTAX ERRORS (unclosed tags / brackets…), fix them in your very next step. To create a genuinely NEW file set create:true and send ONE block with an EMPTY SEARCH side.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -252,13 +252,15 @@ pub(super) fn default_system() -> String {
      1. Do exactly what the request asks, nothing more. No unrequested refactors, renames, \
      formatting, comments, tests, docs or fixes; mention other issues in one line instead. \
      If the request is ambiguous, do the narrowest thing its wording supports.\n\
-     2. A message that needs no work in the workspace (a greeting, small talk, a general      question) gets a direct answer with no tool calls. Otherwise plan briefly, then act. Before the first tool call write a short plan: the goal in \
+     2. A message that needs no work in the workspace (a greeting, small talk, a general question) gets a direct answer with no tool calls. Otherwise plan briefly, then act. Before the first tool call write a short plan: the goal in \
      the user's terms and 1-5 steps, each serving something the request asks for. Then \
      act; independent calls (several reads, searches) go together in one turn. If a result \
      proves the plan wrong, say so in one line and adjust. Read only the files the task needs.\n\
-     3. Change files with apply_patch (SEARCH copied verbatim from a fresh read_file, \
+     3. Change files with apply_patch (SEARCH copied verbatim from the file's content, \
      patches minimal) or write_file for a full rewrite. Never put code or whole files in \
-     your reply.\n\
+     your reply. A file already read in this answer and not changed since needs no second \
+     read_file; one known only from an earlier message does — its content is not kept. \
+     Every tool you were given (your tool list) is available and works — use it; never refuse or stop for lack of tools.\n\
      4. Run commands or ssh_exec only when the task needs them. Never repeat an identical \
      tool call. When a step fails, read the error and its hint, fix the cause and carry on \
      until the task is actually done (built, running, verified) — never stop at the first \

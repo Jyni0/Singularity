@@ -51,6 +51,8 @@ export function modelTurns(history: Msg[]): db.ChatTurn[] {
  *  trimmer clips it apart from the prose). */
 const TOOL_CALLS_MARKER = "\n\n[Tool calls of this turn]";
 const TOOL_CALLS_MAX = 40;
+/** Step cards the app shows that are not tool calls of the model. */
+const NOT_TOOLS = new Set(["mcp"]);
 
 /**
  * One line per tool call an earlier agent turn made. The history carries
@@ -58,7 +60,11 @@ const TOOL_CALLS_MAX = 40;
  * know what it had already read, changed or run — and did it all again.
  */
 function toolCallLog(m: Msg): string {
-  const steps = (m.segments ?? []).flatMap((s) => (s.kind === "step" && s.step.done ? [s.step] : []));
+  // Only real tool calls: an app notice card ("mcp: connect X") listed as a
+  // tool the model had made models conclude their tools did not match.
+  const steps = (m.segments ?? []).flatMap((s) =>
+    s.kind === "step" && s.step.done && !NOT_TOOLS.has(s.step.name) ? [s.step] : []
+  );
   if (steps.length === 0) return "";
   const line = (s: db.AgentStepEvent) => {
     const input = s.input.replace(/\s+/g, " ").trim();

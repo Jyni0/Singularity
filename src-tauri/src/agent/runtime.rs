@@ -838,70 +838,68 @@ fn model_text(res: &tools::ToolResult) -> String {
     }
 }
 
-/// Files one agent has read in this run: path → (content hash, line span
-/// returned). Reading an unchanged file again returned the very text that is
-/// already in the conversation — models did it again and again across the
-/// steps of one answer, each time paying the whole file twice. A read that
-/// an earlier one of the same, unchanged file covers gets a short note
-/// instead; any edit changes the hash, so the next read is a real one.
+/// Files one agent has read in this run: path → (content hash, reads of
+/// that content). Every read returns the real file — a "you read it
+/// already" stub instead of the text left models re-reading in a circle and
+/// never editing. Reading the same unchanged file over and over gets a
+/// nudge appended to the real content instead; any edit resets the count.
 #[derive(Clone, Default)]
-struct ReadMemo(Arc<Mutex<HashMap<PathBuf, Vec<(u64, usize, usize)>>>>);
+/// Keyed by path and the requested line range: paging through a long file
+/// is not re-reading.
+#[allow(clippy::type_complexity)]
+struct ReadMemo(Arc<Mutex<HashMap<(PathBuf, String), (u64, usize)>>>);
+
+/// Reads of one unchanged file before the result carries the nudge.
+const REREAD_NUDGE_AT: usize = 3;
 
 impl ReadMemo {
     fn forget(&self) {
         self.0.lock().unwrap().clear();
     }
 
-    /// An edit tool touched this file (applied or failed): the next read of
-    /// it is always real. A failed patch says "read the file again" — a
-    /// "you read it already" note there left the model rebuilding SEARCH
-    /// from memory, and missing again.
+    /// An edit tool touched this file (applied or failed): its read count
+    /// starts over.
     fn forget_path(&self, root: &Path, path: &str) {
         if let Ok(full) = tools::resolve(root, path) {
-            self.0.lock().unwrap().remove(&full);
+            self.0.lock().unwrap().retain(|(p, _), _| *p != full);
         }
     }
 
     fn read(&self, root: &Path, args: &Value) -> tools::ToolResult {
-        // Files the user changed since are read for real (their hash moved).
-        let line = |k: &str| args.get(k).and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok())).map(|n| n as usize);
-        let (start, end) = (line("start_line"), line("end_line"));
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        let seen = tools::resolve(root, path).ok().and_then(|full| {
-            let bytes = std::fs::read(&full).ok()?;
-            let hash = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                bytes.hash(&mut h);
-                h.finish()
-            };
-            let lines = bytes.split(|b| *b == b'\n').count().max(1);
-            let from = start.unwrap_or(1).max(1);
-            let to = end.unwrap_or(from.saturating_add(READ_SPAN - 1)).min(lines);
-            Some((full, hash, from, to))
-        });
-        if let Some((full, hash, from, to)) = &seen {
-            let map = self.0.lock().unwrap();
-            let covered = map
-                .get(full)
-                .is_some_and(|reads| reads.iter().any(|&(h, a, b)| h == *hash && a <= *from && b >= *to));
-            if covered && from <= to {
-                return tools::ToolResult::ok(format!(
-                    "{path} (lines {from}-{to}) has not changed since you read it earlier in this task — \
-                     its content is already above in this conversation; use that instead of reading it again."
-                ));
-            }
+        let mut res = tools::dispatch(root, "read_file", args);
+        if !res.ok {
+            return res;
         }
-        let res = tools::dispatch(root, "read_file", args);
-        if let (true, Some((full, hash, from, to))) = (res.ok, seen) {
-            self.0.lock().unwrap().entry(full).or_default().push((hash, from, to));
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let Some((full, hash)) = tools::resolve(root, path).ok().and_then(|full| {
+            use std::hash::{Hash, Hasher};
+            let bytes = std::fs::read(&full).ok()?;
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut h);
+            Some((full, h.finish()))
+        }) else {
+            return res;
+        };
+        let count = {
+            let mut map = self.0.lock().unwrap();
+            let range = format!("{}-{}", args.get("start_line").unwrap_or(&Value::Null), args.get("end_line").unwrap_or(&Value::Null));
+            let entry = map.entry((full, range)).or_insert((hash, 0));
+            if entry.0 != hash {
+                *entry = (hash, 0);
+            }
+            entry.1 += 1;
+            entry.1
+        };
+        if count >= REREAD_NUDGE_AT {
+            res.output.push_str(&format!(
+                "\n[You have read {path} {count} times in this task and it has not changed. \
+                 Stop reading it: make the change now with apply_patch (SEARCH copied from the lines above) \
+                 or write_file, or tell the user what blocks you.]"
+            ));
         }
         res
     }
 }
-
-/// Lines read_file returns without an end_line (tools::READ_DEFAULT_LINES).
-const READ_SPAN: usize = 2_000;
 
 /// The filesystem / command / SSH tools, as Rig dynamic tools.
 fn fs_tools(ctx: &RunCtx, memo: &ReadMemo) -> Vec<DynamicTool> {
@@ -2170,6 +2168,32 @@ mod text_call_tests {
         assert!(is_text_tool_call(r#"Reading it now: read_file({"path": "a"})"#));
         assert!(!is_text_tool_call("Done — I changed read_file handling in tools.rs and the build passes."));
         assert!(!is_text_tool_call("Use `functions` in JS as shown."));
+    }
+}
+
+#[cfg(test)]
+mod read_memo_tests {
+    use super::*;
+
+    #[test]
+    fn rereads_return_the_file_and_then_nudge() {
+        let dir = std::env::temp_dir().join(format!("memo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), "const a = 1;\n").unwrap();
+        let memo = ReadMemo::default();
+        let args = serde_json::json!({ "path": "a.ts" });
+        for n in 1..=REREAD_NUDGE_AT {
+            let res = memo.read(&dir, &args);
+            assert!(res.ok && res.output.contains("const a = 1;"), "read {n} must be real");
+            assert_eq!(res.output.contains("Stop reading it"), n >= REREAD_NUDGE_AT);
+        }
+        // Another range is paging, not a re-read.
+        let res = memo.read(&dir, &serde_json::json!({ "path": "a.ts", "start_line": 1, "end_line": 1 }));
+        assert!(!res.output.contains("Stop reading it"));
+        // An edit starts the count over.
+        memo.forget_path(&dir, "a.ts");
+        assert!(!memo.read(&dir, &args).output.contains("Stop reading it"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

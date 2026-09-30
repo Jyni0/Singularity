@@ -6,7 +6,7 @@
 //! Dropping the stream (Stop, retry) kills the process.
 
 use super::protocol::{self, Piece, Rendered, ToolTagFilter};
-use super::{agy_slug, ensure, scratch, tail, Cli};
+use super::{agy_model_args, ensure, scratch, tail, Cli};
 use rig_agent::core::completion::message::{AssistantContent, Text};
 use rig_agent::core::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
@@ -56,11 +56,11 @@ impl CliModel {
         let fail = CompletionError::ProviderError;
         let launch = ensure(self.cli).await.map_err(fail)?;
         let rendered = protocol::render(&req);
-        let agy_model = match (self.cli, self.model_arg()) {
-            (Cli::Antigravity, Some(model)) => Some(agy_slug(&launch, model, &self.effort).await),
-            _ => None,
+        let agy_args = match (self.cli, self.model_arg()) {
+            (Cli::Antigravity, Some(model)) => agy_model_args(&launch, model, &self.effort).await,
+            _ => Vec::new(),
         };
-        let job = Job::prepare(self, &rendered, agy_model.as_deref()).map_err(fail)?;
+        let job = Job::prepare(self, &rendered, &agy_args).map_err(fail)?;
 
         let mut cmd = launch.command();
         cmd.args(&job.args).stdin(Stdio::piped());
@@ -68,12 +68,20 @@ impl CliModel {
             .spawn()
             .map_err(|e| fail(format!("cannot start {}: {e}", self.cli.label())))?;
 
-        // stdin: the prompt, then EOF so the CLI starts working.
+        // stdin: the prompt, then EOF so the CLI starts working. agy keeps it
+        // open: a turn it spent on its own (denied) tools gets a follow-up
+        // message in the same session — see `Decoder::stalled`.
         let mut stdin = child.stdin.take().ok_or_else(|| fail("no stdin".into()))?;
         let input = job.stdin.clone();
-        tokio::spawn(async move {
+        let keep_open = self.cli == Cli::Antigravity;
+        let writer = tokio::spawn(async move {
             let _ = stdin.write_all(input.as_bytes()).await;
+            let _ = stdin.flush().await;
+            if keep_open {
+                return Some(stdin);
+            }
             let _ = stdin.shutdown().await;
+            None
         });
         // stderr: kept for the error message when the CLI fails.
         let mut stderr = child.stderr.take().ok_or_else(|| fail("no stderr".into()))?;
@@ -91,17 +99,49 @@ impl CliModel {
             let mut lines = BufReader::new(stdout).lines();
             let mut state = Decoder::new(cli);
             let mut out = Emitter::new(tx.clone());
+            let mut writer = Some(writer);
+            let mut nudges = 0;
             loop {
                 tokio::select! {
                     line = lines.next_line() => match line {
                         Ok(Some(line)) => {
+                            if cfg!(test) && std::env::var_os("CLI_TRACE").is_some() {
+                                eprintln!("RAW {}", line.chars().take(400).collect::<String>());
+                            }
                             for ev in state.feed(&line) {
                                 if !out.send(ev).await {
                                     return; // consumer gone: child is killed on drop
                                 }
                             }
+                            if state.turn_over {
+                                state.turn_over = false;
+                                // The stdin handle, once the prompt is written.
+                                let mut stdin = match writer.take() {
+                                    Some(w) => w.await.ok().flatten(),
+                                    None => None,
+                                };
+                                if state.stalled && !out.produced && nudges < MAX_NUDGES {
+                                    if let Some(s) = stdin.as_mut() {
+                                        nudges += 1;
+                                        state.stalled = false;
+                                        let _ = s.write_all(nudge(&state.denied).as_bytes()).await;
+                                        let _ = s.flush().await;
+                                        writer = Some(tokio::spawn(async move { stdin }));
+                                        continue;
+                                    }
+                                }
+                                // Done: EOF ends the session.
+                                if let Some(mut s) = stdin {
+                                    let _ = s.shutdown().await;
+                                }
+                            }
                         }
-                        _ => break,
+                        Ok(None) => break,
+                        // Unreadable output must not pass for an empty answer.
+                        Err(e) => {
+                            state.fatal.get_or_insert_with(|| format!("{}: unreadable output ({e})", cli.label()));
+                            break;
+                        }
                     },
                     // Stop pressed while the CLI is silent (thinking).
                     _ = tx.closed() => return,
@@ -112,7 +152,16 @@ impl CliModel {
             job.cleanup();
 
             if let Some(msg) = state.fatal.take() {
-                let _ = tx.send(Err(CompletionError::ProviderError(explain(cli, &msg)))).await;
+                let _ = tx.send(Err(CompletionError::ProviderError(explain(cli, &msg).await))).await;
+                return;
+            }
+            if state.stalled && !out.produced {
+                let msg = format!(
+                    "{} kept reaching for its own tools ({}), which are switched off here, and gave no answer — retry, or pick another model",
+                    cli.label(),
+                    state.denied.join(", ")
+                );
+                let _ = tx.send(Err(CompletionError::ProviderError(msg))).await;
                 return;
             }
             let failed = status.map(|s| !s.success()).unwrap_or(true);
@@ -123,7 +172,7 @@ impl CliModel {
                 } else {
                     format!("{}: {detail}", cli.label())
                 };
-                let _ = tx.send(Err(CompletionError::ProviderError(explain(cli, &msg)))).await;
+                let _ = tx.send(Err(CompletionError::ProviderError(explain(cli, &msg).await))).await;
                 return;
             }
             if !out.flush().await {
@@ -159,9 +208,16 @@ impl CompletionModel for CliModel {
     }
 }
 
-/// Makes the common failures actionable.
-fn explain(cli: Cli, msg: &str) -> String {
+/// Makes the common failures actionable. A CLI too old for the model gets
+/// updated right here, so the run's automatic retry already uses the new one.
+async fn explain(cli: Cli, msg: &str) -> String {
     let low = msg.to_lowercase();
+    if low.contains("or newer is required") || low.contains("does not support this model") {
+        return match super::update_outdated(cli).await {
+            Ok(v) => format!("{msg}\n\n{} was updated to {v} — retrying.", cli.label()),
+            Err(e) => format!("{msg}\n\nUpdating {} failed: {e}", cli.label()),
+        };
+    }
     let auth = ["login", "log in", "sign in", "unauthorized", "401", "not logged", "authenticat", "credentials"];
     if auth.iter().any(|k| low.contains(k)) {
         return format!("{msg}\n\nSign in to {} in Settings → Models (the provider card).", cli.label());
@@ -179,7 +235,7 @@ struct Job {
 }
 
 impl Job {
-    fn prepare(m: &CliModel, r: &Rendered, agy_model: Option<&str>) -> Result<Self, String> {
+    fn prepare(m: &CliModel, r: &Rendered, agy_args: &[String]) -> Result<Self, String> {
         let dir = scratch().join(format!("run-{}", uid()));
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let mut job = Job { args: vec![], stdin: String::new(), files: vec![dir.clone()] };
@@ -266,11 +322,8 @@ impl Job {
                     .iter()
                     .map(|s| s.to_string())
                     .collect();
-                // The effort lives in the model id (`…-low`/`…-high`), picked
-                // in `open` — adding `--effort` to such a model is rejected.
-                if let Some(slug) = agy_model {
-                    job.args.extend(["--model".into(), slug.into()]);
-                }
+                // `--model` (and `--effort` when needed), picked in `open`.
+                job.args.extend(agy_args.iter().cloned());
                 job.args.extend(["-p".into(), String::new()]);
                 let mut text = with_system(r);
                 if !r.images.is_empty() {
@@ -334,6 +387,14 @@ struct Decoder {
     emitted: HashMap<String, usize>,
     /// Codex: a new agent message after an earlier one starts a paragraph.
     messages: usize,
+    /// agy: a turn just ended (its `result` arrived).
+    turn_over: bool,
+    /// agy: the turn ended with no answer after its own tools were denied —
+    /// headless print mode auto-denies them and reports SUCCESS with an
+    /// empty response.
+    stalled: bool,
+    /// agy: its own tools that were denied (RunCommand, …).
+    denied: Vec<String>,
 }
 
 impl Decoder {
@@ -346,6 +407,9 @@ impl Decoder {
             saw_delta: false,
             emitted: HashMap::new(),
             messages: 0,
+            turn_over: false,
+            stalled: false,
+            denied: Vec::new(),
         }
     }
 
@@ -466,6 +530,9 @@ impl Decoder {
         match v["event"].as_str().unwrap_or("") {
             "step_update" => {
                 let su = &v["step_update"];
+                if su["step_type"] == "tool" && su["state"] == "ERROR" {
+                    self.deny(&s(su, "tool_name"));
+                }
                 if su["step_type"] != "agent_response" {
                     return vec![];
                 }
@@ -487,11 +554,13 @@ impl Decoder {
                 let r = &v["result"];
                 let u = &r["usage"];
                 let n = |k: &str| u[k].as_u64().unwrap_or(0);
+                // Session totals: a nudged session's last result covers every turn.
                 self.usage.input_tokens = n("input_tokens");
                 self.usage.cached_input_tokens = n("cache_read_tokens");
                 self.usage.output_tokens = n("output_tokens");
                 self.usage.reasoning_tokens = n("thinking_tokens");
                 self.usage.total_tokens = n("total_tokens");
+                self.turn_over = true;
                 if s(r, "status").eq_ignore_ascii_case("error") {
                     let e = s(r, "error");
                     self.fatal = Some(if e.is_empty() { "request failed".into() } else { e });
@@ -502,6 +571,10 @@ impl Decoder {
                 if !self.saw_delta && !resp.is_empty() {
                     return vec![Ev::Text(resp)];
                 }
+                for d in r["denied_actions"].as_array().into_iter().flatten() {
+                    self.deny(d["display_name"].as_str().or(d["action"].as_str()).unwrap_or(""));
+                }
+                self.stalled = !self.saw_delta && resp.trim().is_empty() && !self.denied.is_empty();
                 vec![]
             }
             _ => {
@@ -512,6 +585,29 @@ impl Decoder {
             }
         }
     }
+}
+
+impl Decoder {
+    fn deny(&mut self, tool: &str) {
+        if !tool.is_empty() && !self.denied.iter().any(|d| d == tool) {
+            self.denied.push(tool.to_string());
+        }
+    }
+}
+
+/// Follow-up turns for an agy session that stalled on its own tools.
+const MAX_NUDGES: usize = 2;
+
+/// The follow-up message: agy's own tools are off, the app's tools are the
+/// `<tool_call>` ones from the instructions.
+fn nudge(denied: &[String]) -> String {
+    let text = format!(
+        "Your built-in tools ({}) are switched off in this app, and the call was denied. \
+         Do not use them again. Use only the tools from my instructions, by writing a <tool_call> block, \
+         or answer me in plain text.",
+        denied.join(", ")
+    );
+    format!("{}\n", json!({ "event": "user", "message": { "role": "user", "content": [{ "type": "text", "text": text }] } }))
 }
 
 /* ---------- Rig stream items ---------- */
@@ -574,5 +670,32 @@ impl Emitter {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// agy's real events when Gemini used its own (denied) run_command.
+    #[test]
+    fn agy_denied_tool_turn_is_stalled_not_empty() {
+        let mut d = Decoder::new(Cli::Antigravity);
+        for line in [
+            r#"{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"agent_response"}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":2,"state":"ERROR","step_type":"tool","tool_name":"run_command"}}"#,
+            r#"{"event":"result","result":{"status":"SUCCESS","response":"","usage":{"input_tokens":12036},"denied_actions":[{"action":"command","display_name":"RunCommand"}]}}"#,
+        ] {
+            assert!(d.feed(line).is_empty());
+        }
+        assert!(d.turn_over && d.stalled);
+        assert_eq!(d.denied, ["run_command", "RunCommand"]);
+        assert!(nudge(&d.denied).ends_with("}\n"));
+
+        // An answered turn is not stalled, even with the old denial on record.
+        let mut d = Decoder::new(Cli::Antigravity);
+        d.feed(r#"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"Hi"}}"#);
+        d.feed(r#"{"event":"result","result":{"status":"SUCCESS","response":"Hi","denied_actions":[{"action":"command"}]}}"#);
+        assert!(d.turn_over && !d.stalled);
     }
 }

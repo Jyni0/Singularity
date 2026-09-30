@@ -95,6 +95,31 @@ pub fn init(app: &AppHandle) {
     });
 }
 
+/// Brings a CLI that is too old for the chosen model up to date: the app's
+/// own copy through its installer, a copy on PATH through the CLI's own
+/// `update` (startup updates only touch the app's copies). Returns the
+/// version now installed.
+pub(crate) async fn update_outdated(cli: Cli) -> Result<String, String> {
+    static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one = ONE.lock().await;
+    let launch = ensure(cli).await?;
+    if launch.source == "managed" {
+        install::update(cli).await?;
+    } else {
+        let args: &[&str] = match cli {
+            Cli::Claude | Cli::Antigravity => &["update"],
+            Cli::Codex => return Err("this Codex comes from npm — run `npm i -g @openai/codex@latest`".into()),
+        };
+        let (ok, text) = run_quiet(&launch, args, Duration::from_secs(300)).await?;
+        if !ok {
+            return Err(tail(&text, 400));
+        }
+    }
+    let launch = resolve(cli).ok_or("the CLI is gone after updating")?;
+    let (_, text) = run_quiet(&launch, &["--version"], Duration::from_secs(30)).await?;
+    Ok(text.split_whitespace().next().unwrap_or("the newest version").to_string())
+}
+
 fn root() -> PathBuf {
     ROOT.get().cloned().unwrap_or_else(|| std::env::temp_dir().join("singularity-cli"))
 }
@@ -371,11 +396,31 @@ fn split_effort(slug: &str) -> (&str, Option<&str>) {
 /// Antigravity bakes the effort into model ids (`…-low` / `…-high`), and a
 /// fixed-effort model plus `--effort` is rejected ("conflicts with
 /// --effort"). The picker lists one entry per model; this turns (model,
-/// effort) into the slug to run: the exact variant, else the nearest one.
-pub(crate) async fn agy_slug(launch: &Launch, model: &str, effort: &str) -> String {
+/// effort) into the arguments to run it with.
+pub(crate) async fn agy_model_args(launch: &Launch, model: &str, effort: &str) -> Vec<String> {
     if AGY_MODELS.lock().unwrap().is_empty() {
         let _ = agy_models(launch).await;
     }
+    if AGY_MODELS.lock().unwrap().is_empty() {
+        // The list could not be read (right after start, agy busy): a base
+        // id then needs an explicit `--effort` — agy rejects it bare.
+        let (base, _) = split_effort(model);
+        let eff = match effort {
+            "low" | "medium" | "high" => effort,
+            "xhigh" | "max" | "ultra" | "ultracode" => "high",
+            _ => "medium",
+        };
+        return if base == model {
+            vec!["--model".into(), model.into(), "--effort".into(), eff.into()]
+        } else {
+            vec!["--model".into(), model.into()]
+        };
+    }
+    vec!["--model".into(), agy_slug(model, effort)]
+}
+
+/// (model, effort) → the slug to run: the exact variant, else the nearest one.
+fn agy_slug(model: &str, effort: &str) -> String {
     let list = AGY_MODELS.lock().unwrap().clone();
     if list.iter().any(|(id, _)| id == model) {
         return model.to_string(); // an exact slug (older saved picks)
@@ -847,7 +892,7 @@ mod live {
         println!("signed_in={:?} email_found={}", st.signed_in, st.account.contains('@'));
         println!("models: {:?}", models(Cli::Antigravity).await);
         let launch = resolve(Cli::Antigravity).unwrap();
-        println!("slug(gemini-3.1-pro, medium) = {}", agy_slug(&launch, "gemini-3.1-pro", "medium").await);
+        println!("args(gemini-3.1-pro, medium) = {:?}", agy_model_args(&launch, "gemini-3.1-pro", "medium").await);
         let req = CompletionRequest {
             model: None,
             preamble: None,
@@ -865,6 +910,56 @@ mod live {
         while let Some(item) = s.next().await {
             println!("item: {item:?}");
         }
+    }
+
+    /// A PATH copy too old for a model updates itself.
+    #[tokio::test]
+    #[ignore]
+    async fn outdated_claude_updates() {
+        let _ = ROOT.set(PathBuf::from(std::env::var("CLI_TEST_ROOT").expect("CLI_TEST_ROOT")));
+        println!("{:?}", update_outdated(Cli::Claude).await);
+    }
+
+    /// Right after app start: nothing has listed the models yet.
+    #[tokio::test]
+    #[ignore]
+    async fn cold_start_answers() {
+        let _ = ROOT.set(PathBuf::from(std::env::var("CLI_TEST_ROOT").expect("CLI_TEST_ROOT")));
+        let (cli, model, effort) = match std::env::var("COLD_CLI").as_deref() {
+            Ok("codex") => (Cli::Codex, "gpt-6-luna", "medium"),
+            Ok("claude") => (Cli::Claude, "claude-opus-5-5", "medium"),
+            _ => (Cli::Antigravity, "gemini-3.8-flash", "medium"),
+        };
+        if std::env::var("COLD_BROKEN").is_ok() {
+            // What a failed `agy models` leaves behind: no variants known.
+            let launch = resolve(Cli::Antigravity).unwrap();
+            println!("args without a list: {:?}", agy_model_args(&launch, "gemini-3.8-flash", effort).await);
+        }
+        let t = std::time::Instant::now();
+        let req = CompletionRequest {
+            model: None,
+            preamble: Some("You are an agent. Use tools when they help.".into()),
+            chat_history: vec![Message::user(
+                std::env::var("COLD_PROMPT").unwrap_or_else(|_| "Привет! Ответь одним словом: как дела?".into()),
+            )],
+            documents: vec![],
+            tools: if std::env::var_os("COLD_NOTOOLS").is_some() { vec![] } else { vec![rig_agent::core::completion::ToolDefinition {
+                name: "list_dir".into(),
+                description: "Lists the files of a folder in the user's project".into(),
+                parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            }] },
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+            record_telemetry_content: false,
+        };
+        let mut s = CliModel::new(cli, model, effort).stream(req).await.expect("open");
+        while let Some(item) = s.next().await {
+            println!("item: {item:?}");
+        }
+        println!("choice: {:?} in {:?}; cached: {:?}", s.choice, t.elapsed(), AGY_MODELS.lock().unwrap().len());
     }
 }
 #[cfg(test)]

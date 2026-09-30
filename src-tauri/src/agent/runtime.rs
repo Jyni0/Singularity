@@ -1743,7 +1743,41 @@ fn preamble_sections(
         }
         out.push(("Skills list", list));
     }
+    if let Some((file, text)) = project_instructions(root) {
+        out.push((
+            "Project instructions",
+            format!(
+                "\n\nProject instructions from {file} in the workspace — the user's standing rules for this project; follow them:\n{text}"
+            ),
+        ));
+    }
     out
+}
+
+/// Largest project instructions file taken into the prompt.
+const PROJECT_RULES_BYTES: usize = 30_000;
+
+/// The workspace's agent instructions (AGENTS.md, else CLAUDE.md): the
+/// conventions and rules users write for coding agents. They were never
+/// read, so the agent ignored what the user had described there.
+fn project_instructions(root: &Path) -> Option<(&'static str, String)> {
+    ["AGENTS.md", "CLAUDE.md"].into_iter().find_map(|name| {
+        let text = std::fs::read_to_string(root.join(name)).ok()?;
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let text = if text.len() > PROJECT_RULES_BYTES {
+            let mut cut = PROJECT_RULES_BYTES;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("{}\n… (truncated — read_file {name} for the rest)", &text[..cut])
+        } else {
+            text.to_string()
+        };
+        Some((name, text))
+    })
 }
 
 /// /commands, invoked skills and @mentions → what the model reads. File IO

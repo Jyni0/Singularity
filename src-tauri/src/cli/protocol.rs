@@ -140,6 +140,16 @@ pub fn render(req: &CompletionRequest) -> Rendered {
         ),
     };
 
+    // The user's latest request, restated at the very end. In a long
+    // transcript (instructions, tool schemas, results) it sat in the
+    // middle, where models read least — and they worked on something else.
+    // (An empty tail = a lone message, sent as it is.)
+    if let Some(ask) = latest_request(&req.chat_history).filter(|_| !tail.is_empty()) {
+        tail.push_str(&format!(
+            "\n\nThe user's latest request — your reply must work on exactly this (the rest above is context):\n<request>\n{ask}\n</request>"
+        ));
+    }
+
     // The CLIs wrap the request in long prompts of their own; a reminder at
     // the very end keeps the app's tool protocol in view.
     if !req.tools.is_empty() {
@@ -158,6 +168,38 @@ pub fn render(req: &CompletionRequest) -> Rendered {
     }
 
     Rendered { system, prompt, turns, tail, images }
+}
+
+/// Longest restatement of the latest request (its @file contents are in
+/// the transcript already).
+const REQUEST_RESTATE_CHARS: usize = 3_000;
+
+/// The text of the user's latest own message — not a tool result, not the
+/// app's own nudges.
+fn latest_request(history: &[Message]) -> Option<String> {
+    history.iter().rev().find_map(|m| match m {
+        Message::User { content } => {
+            let text: String = content
+                .iter()
+                .filter_map(|c| match c {
+                    UserContent::Text(t) if !t.text.trim_start().starts_with("[Singularity]") => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(if text.chars().count() > REQUEST_RESTATE_CHARS {
+                let head: String = text.chars().take(REQUEST_RESTATE_CHARS).collect();
+                format!("{head}\n… (the full request is above)")
+            } else {
+                text.to_string()
+            })
+        }
+        _ => None,
+    })
 }
 
 /// The app's tools, described for a model that can only answer in text.
@@ -535,6 +577,22 @@ mod tests {
         all.extend(f.finish());
         all.retain(|p| !matches!(p, Piece::CallDelta(_)));
         assert_eq!(all, vec![Piece::Call { name: "read_file".into(), arguments: serde_json::json!({}) }, Piece::Text("ok".into())]);
+    }
+
+    #[test]
+    fn latest_request_skips_tool_results_and_nudges() {
+        let history = vec![
+            Message::user("старая задача"),
+            Message::assistant("ok"),
+            Message::user("почини валидацию gateway в provision.ts"),
+            Message::assistant("читаю"),
+            Message::tool_result("c1", "read_file", "file text"),
+            Message::user("[Singularity] Your last message announced a next step"),
+        ];
+        assert_eq!(latest_request(&history).as_deref(), Some("почини валидацию gateway в provision.ts"));
+        let long = "x".repeat(REQUEST_RESTATE_CHARS + 50);
+        let out = latest_request(&[Message::user(long)]).unwrap();
+        assert!(out.ends_with("(the full request is above)") && out.chars().count() < REQUEST_RESTATE_CHARS + 40);
     }
 
     #[test]

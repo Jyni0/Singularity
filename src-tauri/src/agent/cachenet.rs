@@ -26,21 +26,54 @@
 use bytes::Bytes;
 use rig_agent::core::http_client::{self, HttpClientExt, LazyBody, MultipartForm, ReqwestClient, Request, Response, StreamingResponse};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-/// Gateways (by host) that refused the breakpoints — never marked again.
-static REFUSED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-/// Gateways (by host) that refused the 1-hour `ttl` — marked with 5 minutes.
-static NO_TTL: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-
-fn listed(set: &Mutex<Option<HashSet<String>>>, host: &str) -> bool {
-    set.lock().unwrap().as_ref().is_some_and(|s| s.contains(host))
+/// The request extras a gateway (by host) accepts.
+#[derive(Clone, Copy, Debug)]
+struct Accepted {
+    /// `prompt_cache_key`.
+    key: bool,
+    /// The 1-hour `ttl` on breakpoints.
+    ttl: bool,
+    /// Anthropic breakpoints at all.
+    marks: bool,
 }
 
-fn list(set: &Mutex<Option<HashSet<String>>>, host: &str) {
-    set.lock().unwrap().get_or_insert_with(HashSet::new).insert(host.to_string());
+/// Gateways that refused some extra — they never get it again.
+static ACCEPTED: Mutex<Option<HashMap<String, Accepted>>> = Mutex::new(None);
+
+fn accepted(host: &str) -> Accepted {
+    ACCEPTED
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(host).copied())
+        .unwrap_or(Accepted { key: true, ttl: true, marks: true })
+}
+
+/// A 400 that complains about a request field (not, say, a too long
+/// prompt): only then is an extra dropped and the request sent again.
+fn refuses_extra(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("400")
+        && ["prompt_cache_key", "cache_control", "ttl", "unrecognized", "unknown", "extra", "not permitted", "not allowed", "additional propert"]
+            .iter()
+            .any(|w| e.contains(w))
+}
+
+/// The body with the extras added; None = nothing to add (send it as is).
+fn compose(body: &[u8], marks: bool, ttl: bool, key: Option<&str>) -> Option<Vec<u8>> {
+    let marked = marks.then(|| add_breakpoints(body, ttl)).flatten();
+    let Some(key) = key else { return marked };
+    let mut v: Value = serde_json::from_slice(marked.as_deref().unwrap_or(body)).ok()?;
+    let obj = v.as_object_mut()?;
+    if !(obj.contains_key("input") || obj.contains_key("messages")) || obj.contains_key("prompt_cache_key") {
+        return marked;
+    }
+    obj.insert("prompt_cache_key".into(), json!(key));
+    serde_json::to_vec(&v).ok()
 }
 
 /// Cache numbers read from the provider's own usage report.
@@ -58,16 +91,22 @@ pub struct CacheClient {
     mark: bool,
     /// Usage of the latest streamed response.
     pub seen: Arc<Mutex<Option<CacheSeen>>>,
+    /// `prompt_cache_key`: OpenAI routes requests with the same key to the
+    /// same cache — without it a repeated prefix often lands on a machine
+    /// that has never seen it, and a new message started at 0% cache.
+    cache_key: Option<String>,
 }
 
 impl CacheClient {
     pub fn new(model: &str) -> Self {
         let inner = ReqwestClient::new();
-        Self { inner, mark: model.to_lowercase().contains("claude"), seen: Arc::default() }
+        Self { inner, mark: model.to_lowercase().contains("claude"), seen: Arc::default(), cache_key: None }
     }
 
-    fn refused(host: &str) -> bool {
-        listed(&REFUSED, host)
+    /// Requests of one workspace + model share their cache routing key.
+    pub fn with_cache_key(mut self, key: String) -> Self {
+        self.cache_key = Some(key);
+        self
     }
 }
 
@@ -196,39 +235,35 @@ impl HttpClientExt for CacheClient {
         let body: Bytes = body.into();
         let host = parts.uri.host().unwrap_or("").to_string();
         let responses = parts.uri.path().trim_end_matches('/').ends_with("/responses");
-        let mark = self.mark && !Self::refused(&host);
-        let long = !listed(&NO_TTL, &host);
-        let marked = mark.then(|| add_breakpoints(&body, long)).flatten();
-        let short = (mark && long).then(|| add_breakpoints(&body, false)).flatten();
+        let (mark, key) = (self.mark, self.cache_key.clone());
         let inner = self.inner.clone();
         let seen = self.seen.clone();
         async move {
             *seen.lock().unwrap() = None;
             let send = |b: Bytes| inner.send_streaming(Request::from_parts(parts.clone(), b));
-            let rejected = |e: &http_client::Error| e.to_string().contains("400");
-            let resp = match send(marked.clone().map(Bytes::from).unwrap_or_else(|| body.clone())).await {
-                Ok(r) => r,
-                Err(e) if marked.is_some() && rejected(&e) => {
-                    // The gateway did not take the 1-hour marks: 5-minute
-                    // ones, and if those fail too, a plain request — each
-                    // remembered, so the refused form is never sent again.
-                    let retry = match short {
-                        Some(b) => {
-                            list(&NO_TTL, &host);
-                            send(Bytes::from(b)).await
+            // What this gateway accepts; each refusal (a 400) drops one
+            // extra — the one it names, else the key, then the 1-hour ttl,
+            // then the marks — and is remembered, never sent again.
+            let mut ok = accepted(&host);
+            let resp = loop {
+                let out = compose(&body, mark && ok.marks, ok.ttl, key.as_deref().filter(|_| ok.key));
+                let extra = out.is_some();
+                match send(out.map(Bytes::from).unwrap_or_else(|| body.clone())).await {
+                    Ok(r) => break r,
+                    Err(e) if extra && refuses_extra(&e.to_string()) => {
+                        let msg = e.to_string().to_lowercase();
+                        let has_key = key.is_some() && ok.key;
+                        if has_key && (msg.contains("prompt_cache_key") || !msg.contains("ttl")) {
+                            ok.key = false;
+                        } else if mark && ok.marks && ok.ttl {
+                            ok.ttl = false;
+                        } else {
+                            ok.marks = false;
                         }
-                        None => Err(e),
-                    };
-                    match retry {
-                        Ok(r) => r,
-                        Err(e) if rejected(&e) => {
-                            list(&REFUSED, &host);
-                            send(body.clone()).await?
-                        }
-                        Err(e) => return Err(e),
+                        ACCEPTED.lock().unwrap().get_or_insert_with(HashMap::new).insert(host.clone(), ok);
                     }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             };
             use futures_util::StreamExt;
             let (parts, stream) = resp.into_parts();
@@ -365,6 +400,13 @@ pub fn repair_frame(data: &str, seq: &mut u64) -> Option<String> {
         if kind.contains("reasoning_summary") {
             default(&mut v, "summary_index", json!(0));
         }
+        // Part events without their part (some gateways send only indexes).
+        if kind.starts_with("response.reasoning_summary_part.") {
+            default(&mut v, "part", json!({ "type": "summary_text", "text": "" }));
+        }
+        if kind.starts_with("response.content_part.") {
+            default(&mut v, "part", json!({ "type": "output_text", "text": "" }));
+        }
         if kind.ends_with(".delta") {
             default(&mut v, "delta", json!(""));
         }
@@ -390,10 +432,10 @@ pub fn repair_frame(data: &str, seq: &mut u64) -> Option<String> {
             "response.created" | "response.in_progress" | "response.output_item.added"
         ) || kind.starts_with("response.content_part.")
             || kind.starts_with("response.reasoning_summary_part.");
-        eprintln!("[responses] frame {kind} does not decode ({e}): {}", super::context::one_line(data, 300));
         if optional {
             return None;
         }
+        eprintln!("[responses] frame {kind} does not decode ({e}): {}", super::context::one_line(data, 300));
     }
     Some(v.to_string())
 }
@@ -574,6 +616,29 @@ mod tests {
         assert!(short["messages"][0]["content"][0]["cache_control"].get("ttl").is_none());
     }
 
+    #[test]
+    fn only_field_complaints_drop_extras() {
+        assert!(refuses_extra("HTTP 400: Unrecognized request argument supplied: prompt_cache_key"));
+        assert!(refuses_extra("400 Bad Request: cache_control.ttl: Extra inputs are not permitted"));
+        assert!(!refuses_extra("400 Bad Request: prompt is too long: 250000 tokens > 200000 maximum"));
+        assert!(!refuses_extra("429 Too Many Requests"));
+    }
+
+    #[test]
+    fn cache_key_is_added_once_and_only_to_conversations() {
+        let chat = json!({ "model": "gpt-5", "messages": [{ "role": "user", "content": "hi" }] }).to_string();
+        let out: Value = serde_json::from_slice(&compose(chat.as_bytes(), false, true, Some("k1")).unwrap()).unwrap();
+        assert_eq!(out["prompt_cache_key"], "k1");
+        let resp = json!({ "input": [], "prompt_cache_key": "mine" }).to_string();
+        assert!(compose(resp.as_bytes(), false, true, Some("k1")).is_none());
+        assert!(compose(b"{\"x\":1}", false, true, Some("k1")).is_none());
+        // Marks and key together.
+        let claude = json!({ "messages": [{ "role": "user", "content": "hi" }] }).to_string();
+        let out: Value = serde_json::from_slice(&compose(claude.as_bytes(), true, false, Some("k")).unwrap()).unwrap();
+        assert_eq!(out["prompt_cache_key"], "k");
+        assert!(out["messages"][0]["content"][0]["cache_control"].get("ttl").is_none());
+    }
+
     /// Frames as sparse gateways send them decode after the repair.
     #[test]
     fn sparse_responses_frames_are_repaired() {
@@ -583,6 +648,8 @@ mod tests {
             r#"{"type":"response.created","response":{"id":"r1","model":"claude"}}"#,
             r#"{"type":"response.output_item.added","item":{"type":"message","content":[]}}"#,
             r#"{"type":"response.output_text.delta","delta":"При"}"#,
+            r#"{"type":"response.reasoning_summary_part.added","sequence_number":3,"item_id":"rs_1","output_index":0,"summary_index":0,"part_index":0}"#,
+            r#"{"type":"response.content_part.added","item_id":"msg_1","output_index":0,"content_index":0}"#,
             r#"{"type":"response.output_text.done","text":"Привет"}"#,
             r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_1","name":"read_file","arguments":"{}"}}"#,
             r#"{"type":"response.completed","response":{"id":"r1","output":[{"type":"message","content":[{"type":"text","text":"Привет"}]}],"usage":{"input_tokens":10,"output_tokens":2}}}"#,
@@ -591,7 +658,7 @@ mod tests {
             let fixed = repair_frame(f, &mut seq).expect("kept");
             serde_json::from_str::<StreamingCompletionChunk>(&fixed).unwrap_or_else(|e| panic!("{f}\n→ {fixed}\n{e}"));
         }
-        assert_eq!(seq, frames.len() as u64);
+        assert_eq!(seq, 8); // numbering continues after the gateway's own 3
     }
 
     #[test]

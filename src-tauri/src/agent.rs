@@ -294,8 +294,9 @@ pub async fn agent_context(
 ) -> Result<Vec<runtime::ContextPart>, String> {
     let root = Path::new(&req.workspace).to_path_buf();
     let system = if req.system.trim().is_empty() { prompt::default_system() } else { req.system.clone() };
+    let full = turns.clone();
     let turns = context::trim_history(turns);
-    runtime::context_info(&app, &req, &system, &root, turns).await
+    runtime::context_info(&app, &req, &system, &root, turns, &full).await
 }
 
 /// Runs the agent loop, streaming text and reporting each tool call.

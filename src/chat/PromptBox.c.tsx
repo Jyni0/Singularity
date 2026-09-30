@@ -76,6 +76,7 @@ export function PromptBox({
   queued = [],
   onTakeQueued,
   onRunQueued,
+  onEditQueued,
   onOpenBgTask,
   contextMeter,
 }: {
@@ -105,10 +106,16 @@ export function PromptBox({
   onTakeQueued?: (id: string) => QueuedPrompt | undefined;
   /** Sends a queued prompt now (the queue is paused after Stop). */
   onRunQueued?: (id: string) => void;
+  /** Saves a queued prompt's edited text in place (it keeps its turn). */
+  onEditQueued?: (id: string, text: string) => void;
   /** Opens a background task (dev server, watcher) in the side panel. */
   onOpenBgTask?: (task: db.BgTask) => void;
 }) {
   const [text, setText] = useState("");
+  /** The queued prompt being edited in place, and its draft. */
+  const [queueEdit, setQueueEdit] = useState<{ id: string; text: string } | null>(null);
+  /** Enter / Escape already settled the edit — the blur that follows must not. */
+  const queueEditDone = useRef(false);
   const [gatewayId, setGatewayId] = useState("");
   const [modelId, setModelId] = useState("");
   const [effort, setEffort] = useState<Effort>(
@@ -499,9 +506,44 @@ export function PromptBox({
               {queued.map((q, i) => (
                 <div key={q.id} className="group flex h-8 shrink-0 items-center gap-2 rounded-lg pl-2 pr-1 transition-colors hover:bg-[var(--hover-bg)]">
                   <span className="w-3 shrink-0 text-right font-mono text-[10.5px] text-[var(--text-dim)]">{i + 1}</span>
-                  <span className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--text-main)]" title={q.text}>
-                    {q.text || "(attachments)"}
-                  </span>
+                  {queueEdit?.id === q.id ? (
+                    <input
+                      autoFocus
+                      className="min-w-0 flex-1 rounded-md border border-[var(--border)] bg-[var(--bg-app)] px-1.5 py-0.5 text-[12.5px] text-[var(--text-main)] outline-none focus:border-[var(--accent)]"
+                      value={queueEdit.text}
+                      onChange={(e) => setQueueEdit({ id: q.id, text: e.target.value })}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === "Escape") {
+                          e.preventDefault();
+                          queueEditDone.current = true;
+                          if (e.key === "Enter" && (queueEdit.text.trim() || q.attachments.length)) {
+                            onEditQueued?.(q.id, queueEdit.text.trim());
+                          }
+                          setQueueEdit(null);
+                        }
+                      }}
+                      onFocus={() => {
+                        queueEditDone.current = false;
+                      }}
+                      onBlur={() => {
+                        if (!queueEditDone.current && (queueEdit.text.trim() || q.attachments.length)) {
+                          onEditQueued?.(q.id, queueEdit.text.trim());
+                        }
+                        queueEditDone.current = true;
+                        setQueueEdit(null);
+                      }}
+                    />
+                  ) : (
+                    <span
+                      className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--text-main)]"
+                      title={q.text}
+                      onDoubleClick={() => {
+                        if (onEditQueued) setQueueEdit({ id: q.id, text: q.text });
+                      }}
+                    >
+                      {q.text || "(attachments)"}
+                    </span>
+                  )}
                   {q.attachments.length > 0 && (
                     <span className="flex shrink-0 items-center gap-0.5 text-[10.5px] text-[var(--text-dim)]">
                       <Paperclip size={10} /> {q.attachments.length}
@@ -517,8 +559,12 @@ export function PromptBox({
                       </IconButton>
                     )}
                     <IconButton
-                      label="Edit — moves it back into the prompt box" size="xs"
+                      label="Edit here — it keeps its place in the queue" size="xs"
                       onClick={() => {
+                        if (onEditQueued) {
+                          setQueueEdit({ id: q.id, text: q.text });
+                          return;
+                        }
                         const item = onTakeQueued?.(q.id);
                         if (!item) return;
                         setText((prev) => (prev.trim() ? `${prev}\n${item.text}` : item.text));

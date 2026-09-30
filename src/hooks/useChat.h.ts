@@ -881,6 +881,13 @@ export function useChat(options: UseChatOptions) {
     return item;
   };
 
+  /** Changes a queued prompt's text where it stands in the queue. */
+  const editQueued = (convId: string, id: string, text: string) => {
+    const edit = (list: QueuedPrompt[] = []) => list.map((q) => (q.id === id ? { ...q, text } : q));
+    queuesRef.current = { ...queuesRef.current, [convId]: edit(queuesRef.current[convId]) };
+    setQueues((prev) => ({ ...prev, [convId]: edit(prev[convId]) }));
+  };
+
   /** Sends the first queued prompt (or the one with `id`) into the chat. */
   const runQueued = async (convId: string, project: string, id?: string) => {
     if (busy.current.has(convId) || activeRunsRef.current[convId]) return;
@@ -1112,6 +1119,7 @@ export function useChat(options: UseChatOptions) {
     /** Follow-up prompts queued per conversation. */
     queues,
     takeQueued,
+    editQueued,
     runQueued,
     editAndResend,
     stop,

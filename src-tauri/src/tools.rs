@@ -173,14 +173,9 @@ pub fn not_found(root: &Path, path: &str) -> String {
         return msg;
     }
     let files = workspace_files(root);
-    let base = |f: &String| f.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_lowercase();
-    let mut hits: Vec<&String> = files.iter().filter(|f| base(f) == name).take(8).collect();
-    if hits.is_empty() {
-        let stem = name.split('.').next().unwrap_or(&name).to_string();
-        if stem.len() >= 3 {
-            hits = files.iter().filter(|f| base(f).contains(&stem)).take(8).collect();
-        }
-    }
+    // An absolute path inside the workspace compares as its relative part.
+    let rel = full.strip_prefix(root).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| normalize_path(path));
+    let hits = similar_paths(&files, &rel);
     if hits.is_empty() {
         msg.push_str("\nNothing with that name exists under the workspace. Use find_files or list_dir to look around instead of guessing.");
     } else {
@@ -191,6 +186,62 @@ pub fn not_found(root: &Path, path: &str) -> String {
         }
     }
     msg
+}
+
+/// Binary / asset extensions — never what a code path meant unless asked.
+const ASSET_EXT: [&str; 12] = ["png", "jpg", "jpeg", "gif", "ico", "icns", "svg", "webp", "bmp", "woff", "woff2", "ttf"];
+
+/// Workspace paths that look most like `wanted` (a path that does not
+/// exist), best first: the same name, the same name before its first dot
+/// (`App.c.tsx` → `App.tsx`), the same extension, the same folder. A loose
+/// "name contains" match used to list every icon of the app for `App.c.tsx`.
+fn similar_paths<'a>(files: &'a [String], wanted: &str) -> Vec<&'a String> {
+    let wanted = wanted.trim_start_matches("./").replace('\\', "/").to_lowercase();
+    let (dir, name) = match wanted.rsplit_once('/') {
+        Some((d, n)) => (d.to_string(), n.to_string()),
+        None => (String::new(), wanted.clone()),
+    };
+    let stem = name.split('.').next().unwrap_or(&name).to_string();
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_string()).unwrap_or_default();
+    let dirs: Vec<&str> = dir.split('/').filter(|d| !d.is_empty()).collect();
+    let mut scored: Vec<(i32, &String)> = files
+        .iter()
+        .filter_map(|f| {
+            let is_dir = f.ends_with('/');
+            let low = f.trim_end_matches('/').to_lowercase();
+            let (fdir, fname) = low.rsplit_once('/').unwrap_or(("", low.as_str()));
+            let fstem = fname.split('.').next().unwrap_or(fname);
+            let fext = fname.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+            let mut score = if fname == name {
+                100
+            } else if fstem == stem {
+                60
+            } else if stem.len() >= 3 && fstem.contains(stem.as_str()) {
+                20
+            } else {
+                return None;
+            };
+            if !ext.is_empty() && fext == ext {
+                score += 25;
+            }
+            if fdir == dir {
+                score += 30;
+            } else {
+                // Shared leading folders: src/features/… beats src-tauri/icons/….
+                let fdirs: Vec<&str> = fdir.split('/').collect();
+                score += 5 * dirs.iter().zip(&fdirs).take_while(|(a, b)| a == b).count() as i32;
+            }
+            if ASSET_EXT.contains(&fext) && !ASSET_EXT.contains(&ext.as_str()) {
+                score -= 50;
+            }
+            if is_dir && !ext.is_empty() {
+                score -= 30;
+            }
+            (score > 0).then_some((score, f))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.len().cmp(&b.1.len())));
+    scored.into_iter().take(8).map(|(_, f)| f).collect()
 }
 
 fn is_missing(e: &std::io::Error) -> bool {
@@ -2104,6 +2155,30 @@ pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult
 }
 
 /* ---------- Tests ---------- */
+
+#[cfg(test)]
+mod similar_path_tests {
+    use super::similar_paths;
+
+    #[test]
+    fn close_names_rank_above_assets() {
+        let files: Vec<String> = [
+            "src/app/",
+            "src-tauri/app-icon.svg",
+            "src/components/layout/AppShell.c.tsx",
+            "src-tauri/icons/ios/AppIcon-20x20@1x.png",
+            "src/App.tsx",
+            "src/features/workspace/AppStatusBar.c.tsx",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let hits = similar_paths(&files, "src/App.c.tsx");
+        assert_eq!(hits[0], "src/App.tsx");
+        assert!(!hits.iter().any(|h| h.ends_with(".png")));
+        assert!(hits.iter().position(|h| h.ends_with(".svg")).unwrap_or(usize::MAX) > 2);
+    }
+}
 
 #[cfg(test)]
 mod tests {

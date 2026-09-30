@@ -534,7 +534,7 @@ function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?: boolea
       />
       <HudCell
         label="cache"
-        value={cacheRate + "%"}
+        value={promptAll > 0 ? cacheRate + "%" : "—"}
         title={"Cached prompt tokens: " + usage.cached_tokens + " of " + promptAll}
       />
       <HudCell

@@ -1803,20 +1803,54 @@ pub(super) async fn run(
         t
     };
     let turns = expand_turns(skills.clone(), root, turns).await?;
-    ctx.usage.lock().unwrap().first_est =
-        measure(req, system, root, &skills, &mcp, &turns, None).iter().map(|p| p.tokens as u64).sum();
     let (mut history, prompt) = to_messages(req, &turns);
+    let mut parts = measure(req, system, root, &skills, &mcp, &turns, None);
     // The previous answer of this very chat, as the model saw it (tool calls
     // and results included): the request then starts with exactly the bytes
     // the last one sent, and the provider's cache covers all of it.
     if let Some(carried) = carry_take(req, full) {
+        if let Some(p) = parts.iter_mut().find(|p| p.group == "messages") {
+            let mut items: Vec<ContextItem> = carried.iter().map(message_item).collect();
+            items.push(message_item(&prompt));
+            *p = category("Messages", "messages", items);
+        }
         history = carried;
     }
+    ctx.usage.lock().unwrap().first_est = parts.iter().map(|p| p.tokens as u64).sum();
     let carry_out = Mutex::new(None);
     // The main agent may run many tool calls of one turn at once (parallel
     // reads, several delegations); at least a handful even with one helper.
     let tool_parallel = parallel.max(8);
-    let text = run_with_retry(&ctx, &preamble, tools, None, prompt, history, tool_parallel, true, Some(&carry_out), |_| {}).await?;
+    let mut text =
+        run_with_retry(&ctx, &preamble, &tools, None, prompt, history, tool_parallel, true, Some(&carry_out), |_| {}).await?;
+    // A tool call written as plain text ("functions.read_file:0{…}") is no
+    // call: nothing ran and the run ended mid-task. Point it out and go on.
+    for _ in 0..TEXT_CALL_NUDGES {
+        let Some(messages) = carry_out.lock().unwrap().clone() else { break };
+        let Some(Message::Assistant { content, .. }) = messages.last() else { break };
+        // Reasoning counts: some models "call" from inside their thinking.
+        let said: String = content
+            .iter()
+            .filter_map(|c| match c {
+                AssistantContent::Text(t) => Some(t.text.clone()),
+                AssistantContent::Reasoning(r) => Some(r.display_text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !is_text_tool_call(&said) || is_cancelled(run_id) {
+            break;
+        }
+        let nudge = Message::user(
+            "[Singularity] Your last message wrote a tool call as plain text, so nothing ran. \
+             Call the tool through the tool-calling interface (not in your reply text) and continue the task.",
+        );
+        emit_text(app, run_id, "\n\n".to_string());
+        let more =
+            run_with_retry(&ctx, &preamble, &tools, None, nudge, messages, tool_parallel, true, Some(&carry_out), |_| {}).await?;
+        text.push_str("\n\n");
+        text.push_str(&more);
+    }
     if let Some(messages) = carry_out.into_inner().unwrap() {
         carry_put(req, full, messages);
     }
@@ -1826,6 +1860,37 @@ pub(super) async fn run(
         );
     }
     Ok(text)
+}
+
+/* ---------- Tool calls written as text ---------- */
+
+/// Times one run points out a tool call written as text before giving up.
+const TEXT_CALL_NUDGES: usize = 2;
+
+/// Whether an answer ends with a tool call the model wrote as text instead
+/// of calling it: `functions.read_file:0{…}`, `<tool_call>…`, `read_file({…})`.
+/// Only the end of the answer counts — an explanation that mentions a tool
+/// earlier is not a call.
+fn is_text_tool_call(text: &str) -> bool {
+    use std::sync::LazyLock;
+    static CALL: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?x)
+            functions\.[A-Za-z_][\w.-]*\s*(:\s*\d+)?\s*[({]
+            | <\|?(tool_call|function_call|tool_calls_begin|tool▁call)
+            | <function=
+            | \bto=functions\.
+            | \b(read_file|apply_patch|write_file|run_command|list_dir|grep|find_files|file_op|git|web_search|web_fetch|change_dir)\s*\(?\s*\{\s*"
+            "#,
+        )
+        .unwrap()
+    });
+    let tail: String = {
+        let t = text.trim_end();
+        let start = t.char_indices().rev().nth(399).map_or(0, |(i, _)| i);
+        t[start..].to_string()
+    };
+    CALL.is_match(&tail)
 }
 
 /* ---------- Carried conversation ---------- */
@@ -1845,7 +1910,7 @@ static CARRY: Mutex<Vec<(u64, Vec<Message>)>> = Mutex::new(Vec::new());
 fn carry_key(req: &AgentRequest, turns: &[crate::chat::ChatTurn]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (&req.kind, &req.provider_id, &req.base_url, &req.model, &req.workspace, &req.effort, &req.disabled_tools).hash(&mut h);
+    (&req.kind, &req.provider_id, &req.base_url, &req.model, &req.workspace, &req.disabled_tools).hash(&mut h);
     for t in turns {
         (&t.role, &t.text).hash(&mut h);
     }
@@ -1853,11 +1918,11 @@ fn carry_key(req: &AgentRequest, turns: &[crate::chat::ChatTurn]) -> u64 {
 }
 
 /// Whether the provider serves a repeated prefix from a cache (Anthropic,
-/// OpenAI, Gemini, DeepSeek, the subscription CLIs…). A local model has a
-/// small window and no discount: there the longer history would only cost.
+/// OpenAI, Gemini, DeepSeek, the subscription CLIs, local proxies to them…).
+/// Ollama runs the model itself with a small window: there the longer
+/// history would only cost.
 fn carries(req: &AgentRequest) -> bool {
-    let url = req.base_url.to_lowercase();
-    req.kind != "ollama" && !["localhost", "127.0.0.1", "0.0.0.0", "[::1]"].iter().any(|h| url.contains(h))
+    req.kind != "ollama"
 }
 
 /// Largest carried history (serialized chars); beyond it the next message
@@ -1888,6 +1953,61 @@ fn carry_take(req: &AgentRequest, full: &[crate::chat::ChatTurn]) -> Option<Vec<
     let (_, messages) = store.remove(at);
     let size: usize = messages.iter().map(|m| serde_json::to_string(m).map(|j| j.len()).unwrap_or(0)).sum();
     (size <= carry_cap(req)).then_some(messages)
+}
+
+/// The carried history the next message of this chat would continue from
+/// (the chat as shown: ending with the last answer), without taking it.
+fn carry_peek(req: &AgentRequest, full: &[crate::chat::ChatTurn]) -> Option<Vec<Message>> {
+    let n = full.len();
+    if !carries(req) || n < 2 || !matches!(full[n - 1].role.as_str(), "agent" | "assistant") {
+        return None;
+    }
+    let key = carry_key(req, &full[..n - 1]);
+    CARRY.lock().unwrap().iter().find(|(k, _)| *k == key).map(|(_, m)| m.clone())
+}
+
+/// One carried message for the context view: who, and its text.
+fn message_item(m: &Message) -> ContextItem {
+    use rig_agent::core::completion::message::ToolResultContent;
+    let mut label = "";
+    let mut text = String::new();
+    match m {
+        Message::System { content } => {
+            label = "System";
+            text.push_str(content);
+        }
+        Message::User { content } => {
+            for c in content {
+                match c {
+                    UserContent::Text(t) => {
+                        label = "You";
+                        text.push_str(&t.text);
+                    }
+                    UserContent::ToolResult(r) => {
+                        label = "Tool result";
+                        for rc in r.content.iter() {
+                            match rc {
+                                ToolResultContent::Text(t) => text.push_str(&t.text),
+                                ToolResultContent::Json { value } => text.push_str(&value.to_string()),
+                                ToolResultContent::Image(_) => text.push_str(&" ".repeat(4_000)),
+                            }
+                        }
+                    }
+                    _ => {
+                        label = "You";
+                        text.push_str(&" ".repeat(4_000));
+                    }
+                }
+            }
+        }
+        Message::Assistant { content, .. } => {
+            label = "Agent";
+            for c in content {
+                text.push_str(&serde_json::to_string(c).unwrap_or_default());
+            }
+        }
+    }
+    item(format!("{label} · {}", snippet(&text)), &text)
 }
 
 fn carry_put(req: &AgentRequest, full: &[crate::chat::ChatTurn], messages: Vec<Message>) {
@@ -1965,6 +2085,7 @@ pub(super) async fn context_info(
     system: &str,
     root: &Path,
     turns: Vec<crate::chat::ChatTurn>,
+    full: &[crate::chat::ChatTurn],
 ) -> Result<Vec<ContextPart>, String> {
     let req = &with_worker(req);
     let counter = AtomicUsize::new(0);
@@ -1973,7 +2094,15 @@ pub(super) async fn context_info(
     // The latest prompt as typed: the rest of its expanded text is @files.
     let raw_last = turns.iter().rev().find(|t| t.role != "agent" && t.role != "assistant").map(|t| t.text.clone());
     let turns = expand_turns(skills.clone(), root, turns).await?;
-    Ok(measure(req, system, root, &skills, &mcp, &turns, raw_last.as_deref()))
+    let mut parts = measure(req, system, root, &skills, &mcp, &turns, raw_last.as_deref());
+    // The next message continues the model-level history of the last run
+    // (tool calls and results included) — that is what it will carry.
+    if let Some(carried) = carry_peek(req, full) {
+        if let Some(p) = parts.iter_mut().find(|p| p.group == "messages") {
+            *p = category("Messages", "messages", carried.iter().map(message_item).collect());
+        }
+    }
+    Ok(parts)
 }
 
 /// Estimated tokens per category of one request (see context_info). The
@@ -2166,6 +2295,22 @@ mod tests {
         let a: Value = serde_json::from_str(r#"{ "agent": "X",  "task": "t" }"#).unwrap();
         let b: Value = serde_json::from_str(r#"{"agent":"X","task":"t"}"#).unwrap();
         assert_eq!(canonical(&a), canonical(&b));
+    }
+}
+
+#[cfg(test)]
+mod text_call_tests {
+    use super::is_text_tool_call;
+
+    #[test]
+    fn tool_calls_written_as_text_are_seen() {
+        assert!(is_text_tool_call(
+            r#"Проблема с синтаксисом регулярки. Исправлю:functions.read_file:0{"path": "src/a.ts", "start_line": 140}"#
+        ));
+        assert!(is_text_tool_call("Let me look.\n<tool_call>{\"name\": \"read_file\"}"));
+        assert!(is_text_tool_call(r#"Reading it now: read_file({"path": "a"})"#));
+        assert!(!is_text_tool_call("Done — I changed read_file handling in tools.rs and the build passes."));
+        assert!(!is_text_tool_call("Use `functions` in JS as shown."));
     }
 }
 

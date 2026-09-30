@@ -1415,6 +1415,7 @@ export default function App() {
                 queued={activeConv ? chat.queues[activeConv.id] ?? [] : []}
                 onTakeQueued={(id) => (activeConv ? chat.takeQueued(activeConv.id, id) : undefined)}
                 onRunQueued={(id) => activeConv && void chat.runQueued(activeConv.id, activeConv.project, id)}
+                onEditQueued={(id, text) => activeConv && chat.editQueued(activeConv.id, id, text)}
                 contextMeter={
                   pickedModel && (
                     <ContextMeter

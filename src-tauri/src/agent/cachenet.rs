@@ -62,7 +62,11 @@ fn mark_message(msg: &mut Value) -> bool {
             msg["content"] = json!([{ "type": "text", "text": text, "cache_control": cc }]);
             true
         }
-        Some(Value::Array(parts)) => match parts.iter_mut().rev().find(|p| p.get("type").and_then(Value::as_str) == Some("text")) {
+        Some(Value::Array(parts)) => match parts
+            .iter_mut()
+            .rev()
+            .find(|p| matches!(p.get("type").and_then(Value::as_str), Some("text" | "input_text")))
+        {
             Some(p) => {
                 p["cache_control"] = cc;
                 true
@@ -73,9 +77,25 @@ fn mark_message(msg: &mut Value) -> bool {
     }
 }
 
-/// Adds breakpoints to a chat/completions body; None = nothing to change.
+/// Adds breakpoints to a chat/completions or /responses body; None = nothing
+/// to change.
 pub fn add_breakpoints(body: &[u8]) -> Option<Vec<u8>> {
     let mut v: Value = serde_json::from_slice(body).ok()?;
+    // Responses: `instructions` is a plain string (no place for a mark), the
+    // conversation is `input`. One mark on the newest user text or tool
+    // result caches everything before it — tools, instructions, history.
+    if let Some(items) = v.get_mut("input").and_then(Value::as_array_mut) {
+        let last = items.iter_mut().rev().find(|m| {
+            (m["role"] == "user" && m["content"].is_array()) || (m["type"] == "function_call_output" && m["output"].is_string())
+        })?;
+        if last["type"] == "function_call_output" {
+            let text = last["output"].as_str().unwrap_or("").to_string();
+            last["output"] = json!([{ "type": "input_text", "text": text, "cache_control": { "type": "ephemeral" } }]);
+        } else if !mark_message(last) {
+            return None;
+        }
+        return serde_json::to_vec(&v).ok();
+    }
     let msgs = v.get_mut("messages")?.as_array_mut()?;
     let mut changed = false;
     if let Some(sys) = msgs.iter_mut().find(|m| matches!(m["role"].as_str(), Some("system") | Some("developer"))) {
@@ -196,6 +216,33 @@ mod tests {
         assert_eq!(out["messages"][0]["content"][0]["text"], "You are an agent.");
         assert!(out["messages"][1]["content"].is_string(), "only the last user/tool turn is marked");
         assert_eq!(out["messages"][3]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// The body Rig's Responses client really sends (captured).
+    #[test]
+    fn responses_body_is_marked_on_the_newest_user_text() {
+        let body = json!({
+            "input": [
+                { "content": [{ "text": "first", "type": "input_text" }], "role": "user", "type": "message" },
+                { "content": "answer", "role": "assistant", "type": "message" },
+                { "content": [{ "text": "latest", "type": "input_text" }], "role": "user", "type": "message" }
+            ],
+            "instructions": "SYSTEM PROMPT",
+            "model": "claude-opus-4-6",
+            "stream": true
+        });
+        let out: Value = serde_json::from_slice(&add_breakpoints(body.to_string().as_bytes()).unwrap()).unwrap();
+        assert_eq!(out["input"][2]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert!(out["input"][0]["content"][0].get("cache_control").is_none());
+        assert_eq!(out["instructions"], "SYSTEM PROMPT");
+
+        // Inside the tool loop the newest item is a tool result.
+        let mut looped = body.clone();
+        looped["input"].as_array_mut().unwrap().push(json!({ "call_id": "c1", "output": "listing", "type": "function_call_output" }));
+        let out: Value = serde_json::from_slice(&add_breakpoints(looped.to_string().as_bytes()).unwrap()).unwrap();
+        assert_eq!(out["input"][3]["output"][0]["text"], "listing");
+        assert_eq!(out["input"][3]["output"][0]["cache_control"]["type"], "ephemeral");
+        assert!(out["input"][2]["content"][0].get("cache_control").is_none());
     }
 
     #[test]

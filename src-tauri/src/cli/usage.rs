@@ -224,7 +224,33 @@ async fn claude() -> Result<CliUsage, String> {
 
 /* ---------- Antigravity ---------- */
 
+/// This agy build (path, size, mtime) as one line — to remember a build
+/// whose `/usage` is not a print command.
+fn agy_build(launch: &Launch) -> String {
+    let meta = std::fs::metadata(&launch.program).ok();
+    let mtime = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    format!("{}|{}|{mtime}", launch.program.display(), meta.map_or(0, |m| m.len()))
+}
+
+/// Builds known to run "/usage" as a prompt, one per line.
+fn agy_no_usage_file() -> std::path::PathBuf {
+    super::root().join("antigravity-no-usage.txt")
+}
+
 async fn antigravity(launch: &Launch) -> Result<CliUsage, String> {
+    // Some agy builds send "/usage" to the model as an ordinary prompt: ~12k
+    // tokens a call, and the menu polls every minute. Such a build is asked
+    // once, remembered, and never again.
+    const NO_USAGE: &str = "This Antigravity CLI cannot report its limits";
+    let build = agy_build(launch);
+    let known = std::fs::read_to_string(agy_no_usage_file()).unwrap_or_default();
+    if known.lines().any(|l| l == build) {
+        return Err(NO_USAGE.into());
+    }
     let mut cmd = launch.command();
     cmd.args(["-p", "/usage", "--output-format", "json"]);
     let out = tokio::time::timeout(Duration::from_secs(40), cmd.output())
@@ -240,7 +266,11 @@ async fn antigravity(launch: &Launch) -> Result<CliUsage, String> {
     // Print-mode commands came in 1.1.11; an older agy runs "/usage" as a
     // prompt — never report that as numbers.
     if v["command"]["name"].as_str() != Some("usage") {
-        return Err(v["error"].as_str().map(String::from).unwrap_or_else(|| "This Antigravity CLI cannot report its limits".into()));
+        // A model turn answered (it has a conversation and token usage).
+        if v["conversation_id"].is_string() || v["usage"]["input_tokens"].as_u64().unwrap_or(0) > 0 {
+            let _ = std::fs::write(agy_no_usage_file(), format!("{known}{build}\n"));
+        }
+        return Err(v["error"].as_str().map(String::from).unwrap_or_else(|| NO_USAGE.into()));
     }
     let mut windows = Vec::new();
     for g in v["command"]["data"]["groups"].as_array().into_iter().flatten() {
@@ -275,6 +305,18 @@ mod tests {
 #[cfg(test)]
 mod live {
     use super::super::{install, Cli, ROOT};
+
+    /// A build that runs "/usage" as a prompt is asked once, then never.
+    #[tokio::test]
+    #[ignore]
+    async fn antigravity_usage_prompt_is_not_repeated() {
+        let _ = ROOT.set(std::env::var("CLI_TEST_ROOT").expect("CLI_TEST_ROOT").into());
+        for i in 0..2 {
+            let t = std::time::Instant::now();
+            let r = super::usage(Cli::Antigravity).await;
+            println!("call {i}: {:?} in {:?}", r.as_ref().map(|u| u.windows.len()), t.elapsed());
+        }
+    }
 
     #[tokio::test]
     #[ignore]

@@ -34,7 +34,9 @@ export const COMPACT_MARKER = "[Summary of the earlier conversation — older me
 export function modelTurns(history: Msg[]): db.ChatTurn[] {
   const at = history.map((m) => m.role).lastIndexOf("compact");
   const plain = (list: Msg[]) =>
-    list.filter((m) => m.role !== "compact").map((m) => ({ role: m.role, text: m.text }));
+    list
+      .filter((m) => m.role !== "compact")
+      .map((m) => ({ role: m.role, text: m.role === "agent" ? m.text + toolCallLog(m) : m.text }));
   if (at < 0) return plain(history);
   const summary = `${COMPACT_MARKER}\n${history[at].text.trim()}`;
   const rest = plain(history.slice(at + 1));
@@ -43,6 +45,28 @@ export function modelTurns(history: Msg[]): db.ChatTurn[] {
   const out = rest.slice(first);
   out[0] = { role: "user", text: `${summary}\n\n---\n\n${out[0].text}` };
   return out;
+}
+
+/** Heads the tool-call list of an earlier agent turn (the Rust history
+ *  trimmer clips it apart from the prose). */
+const TOOL_CALLS_MARKER = "\n\n[Tool calls of this turn]";
+const TOOL_CALLS_MAX = 40;
+
+/**
+ * One line per tool call an earlier agent turn made. The history carries
+ * only the answer text otherwise, so on the next message the model did not
+ * know what it had already read, changed or run — and did it all again.
+ */
+function toolCallLog(m: Msg): string {
+  const steps = (m.segments ?? []).flatMap((s) => (s.kind === "step" && s.step.done ? [s.step] : []));
+  if (steps.length === 0) return "";
+  const line = (s: db.AgentStepEvent) => {
+    const input = s.input.replace(/\s+/g, " ").trim();
+    return `- ${s.name}: ${input.length > 140 ? `${input.slice(0, 140)}…` : input}${s.ok ? "" : " (failed)"}`;
+  };
+  const shown = steps.slice(-TOOL_CALLS_MAX).map(line);
+  if (steps.length > TOOL_CALLS_MAX) shown.unshift(`- …${steps.length - TOOL_CALLS_MAX} earlier calls`);
+  return `${TOOL_CALLS_MARKER}\n${shown.join("\n")}`;
 }
 
 /** Everything the context gauge shows for one conversation. */
@@ -306,6 +330,24 @@ export function useChat(options: UseChatOptions) {
     modelId: string,
     firstPrompt: string
   ) => {
+    // Codex and Antigravity put ~12k tokens of their own prompt in front of
+    // every call — a whole model run just to name a chat. Those get the
+    // prompt's first words instead.
+    if (provider.kind === "openai-cli" || provider.kind === "google-cli") {
+      const words = firstPrompt.replace(/\s+/g, " ").trim().split(" ").slice(0, 6).join(" ");
+      const title = words.length > 60 ? `${words.slice(0, 60).trim()}…` : words;
+      if (title.length >= 2) {
+        opts.current.onTitle(projectName, convId, title);
+        await db.updateConversationTitle(convId, title).catch(() => {});
+      }
+      return;
+    }
+    // Everyone else names it with their cheapest model, not the chat's one.
+    const mine = opts.current.models.filter((m) => m.provider_id === provider.id && m.enabled);
+    const cheap = [/haiku/i, /flash-lite/i, /flash/i, /\b(mini|nano)\b/i]
+      .map((re) => mine.find((m) => re.test(m.model_id)))
+      .find(Boolean);
+    modelId = cheap?.model_id ?? modelId;
     try {
       let out = "";
       await db.streamChat(

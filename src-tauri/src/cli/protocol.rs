@@ -27,6 +27,12 @@ pub struct Rendered {
     pub system: String,
     /// The conversation. A lone user turn is passed through as-is.
     pub prompt: String,
+    /// The same conversation in pieces: `turns` then `tail` (the closing
+    /// instructions) — joined with blank lines they are `prompt`. Claude
+    /// gets them as separate blocks, so the history before the newest turn
+    /// is a stable prefix its prompt cache hits on the next step.
+    pub turns: Vec<String>,
+    pub tail: String,
     pub images: Vec<Img>,
 }
 
@@ -114,37 +120,44 @@ pub fn render(req: &CompletionRequest) -> Rendered {
     }
 
     // A single plain user turn needs no transcript framing.
-    let prompt = match (turns.len(), req.chat_history.last()) {
+    let (turns, mut tail) = match (turns.len(), req.chat_history.last()) {
         (1, Some(Message::User { content }))
             if content.iter().all(|c| matches!(c, UserContent::Text(_) | UserContent::Image(_))) =>
         {
-            content
+            let text = content
                 .iter()
                 .filter_map(|c| match c {
                     UserContent::Text(t) => Some(t.text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
-                .join("\n")
+                .join("\n");
+            (vec![text], String::new())
         }
-        _ => format!(
-            "{}\n\nContinue the conversation above as the assistant. Write only your next reply — no role tags.",
-            turns.join("\n\n")
+        _ => (
+            turns,
+            "Continue the conversation above as the assistant. Write only your next reply — no role tags.".to_string(),
         ),
     };
 
     // The CLIs wrap the request in long prompts of their own; a reminder at
     // the very end keeps the app's tool protocol in view.
-    let prompt = if req.tools.is_empty() {
-        prompt
-    } else {
-        format!(
-            "{prompt}\n\n(Reminder: when my app's tools can do or look this up, reply with request \
+    if !req.tools.is_empty() {
+        if !tail.is_empty() {
+            tail.push_str("\n\n");
+        }
+        tail.push_str(&format!(
+            "(Reminder: when my app's tools can do or look this up, reply with request \
              lines {OPEN}{{\"name\": …, \"arguments\": {{…}}}}{CLOSE} and stop — my app runs them.)"
-        )
-    };
+        ));
+    }
+    let mut prompt = turns.join("\n\n");
+    if !tail.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&tail);
+    }
 
-    Rendered { system, prompt, images }
+    Rendered { system, prompt, turns, tail, images }
 }
 
 /// The app's tools, described for a model that can only answer in text.

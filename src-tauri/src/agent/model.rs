@@ -141,9 +141,14 @@ fn build_model(req: &AgentRequest) -> Result<ModelSetup, String> {
         }
         // API → "OpenAI Responses": Rig's Responses-API client (POST /responses).
         "openai-responses" => {
+            // Same transport as chat/completions: Claude behind a Responses
+            // gateway gets cache marks, and the HUD sees real cache hits.
+            let http = super::cachenet::CacheClient::new(&req.model);
+            let seen = http.seen.clone();
             let client = openai::Client::builder()
                 .api_key(key)
                 .base_url(&base)
+                .http_client(http)
                 .build()
                 .map_err(fail)?;
             Ok(ModelSetup {
@@ -151,7 +156,7 @@ fn build_model(req: &AgentRequest) -> Result<ModelSetup, String> {
                 params: pick.map(|e| json!({ "reasoning": { "effort": e } })),
                 temperature,
                 max_tokens: None,
-                cache_seen: None,
+                cache_seen: Some(seen),
             })
         }
         // OpenAI Completions, OpenAI-compatible gateways, DeepSeek, Gemini's

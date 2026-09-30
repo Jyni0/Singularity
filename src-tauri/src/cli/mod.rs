@@ -131,6 +131,33 @@ fn scratch() -> PathBuf {
     dir
 }
 
+/// The agy agent chat runs use (`--agent singularity`). Without it every
+/// model call carried agy's own ~12k-token prompt with its 58 built-in tools
+/// (measured: 12,205 tokens for "hi" vs 689 with this agent), and Gemini
+/// sometimes used those tools — denied headless — instead of the app's.
+pub(crate) const AGY_AGENT: &str = "singularity";
+const AGY_AGENT_MD: &str = "---
+name: singularity
+description: Answers through the Singularity app, which runs the tools itself.
+excludeDefaultComponents: true
+tools: []
+---
+
+# System prompt
+
+You answer the user of the Singularity desktop app. Follow the instructions in the user's message.
+";
+
+/// Writes the agent where agy finds project agents: the runs' working folder.
+pub(crate) fn ensure_agy_agent() -> Result<(), String> {
+    let file = scratch().join(".agents").join("agents").join(AGY_AGENT).join("agent.md");
+    if std::fs::read_to_string(&file).ok().as_deref() == Some(AGY_AGENT_MD) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(file.parent().unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(&file, AGY_AGENT_MD).map_err(|e| e.to_string())
+}
+
 /// First `name` on PATH (with the Windows executable extensions).
 fn which(name: &str) -> Option<PathBuf> {
     let exts: Vec<String> = if cfg!(windows) {
@@ -188,6 +215,25 @@ impl Launch {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .env("NO_COLOR", "1");
+        // An app started from inside a Claude Code session inherits its
+        // session variables; Claude Code then writes that session's scratchpad
+        // (a fresh id per process) into every prompt, and nothing is ever
+        // read back from the prompt cache.
+        // The ones a user sets on purpose (auth, cloud, Git Bash) stay.
+        const KEEP: [&str; 5] = [
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_GIT_BASH_PATH",
+        ];
+        for (key, _) in std::env::vars_os() {
+            let k = key.to_string_lossy();
+            let session = k.starts_with("CLAUDE_CODE_") || k == "CLAUDECODE" || k == "CLAUDE_PID" || k == "CLAUDE_EFFORT";
+            if session && !KEEP.contains(&k.as_ref()) {
+                cmd.env_remove(&key);
+            }
+        }
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         cmd
@@ -918,6 +964,47 @@ mod live {
     async fn outdated_claude_updates() {
         let _ = ROOT.set(PathBuf::from(std::env::var("CLI_TEST_ROOT").expect("CLI_TEST_ROOT")));
         println!("{:?}", update_outdated(Cli::Claude).await);
+    }
+
+    /// Two agent steps in a row: the second reads the first one's history
+    /// from Claude's prompt cache instead of paying it again.
+    #[tokio::test]
+    #[ignore]
+    async fn claude_history_is_cached_between_steps() {
+        let _ = ROOT.set(PathBuf::from(std::env::var("CLI_TEST_ROOT").expect("CLI_TEST_ROOT")));
+        let salt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let doc = |n: usize| (0..600).map(|i| format!("row {n}-{i}: value {}", (i * 7 + n) % 13)).collect::<Vec<_>>().join("; ");
+        let tool = rig_agent::core::completion::ToolDefinition {
+            name: "read_file".into(),
+            description: "Reads a file of the user's project".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        };
+        let call = |path: &str| Message::assistant(format!("<tool_call>{{\"name\": \"read_file\", \"arguments\": {{\"path\": \"{path}\"}}}}</tool_call>"));
+        let result = |n: usize| Message::user(format!("<tool_result name=\"read_file\">\n{}\n</tool_result>", doc(n)));
+        let mut history = vec![Message::user(format!("[{salt}] Read a.txt and b.txt, then tell me the value of row 1-5. {}", doc(0)))];
+        history.push(call("a.txt"));
+        history.push(result(1));
+        for step in 0..2 {
+            let req = CompletionRequest {
+                model: None,
+                preamble: Some("You are an agent.".into()),
+                chat_history: history.clone(),
+                documents: vec![],
+                tools: vec![tool.clone()],
+                temperature: None,
+                max_tokens: None,
+                tool_choice: None,
+                additional_params: None,
+                output_schema: None,
+                record_telemetry_content: false,
+            };
+            let mut s = CliModel::new(Cli::Claude, "claude-haiku-4-5-20251001", "low").stream(req).await.expect("open");
+            while s.next().await.is_some() {}
+            let u = s.response.as_ref().map(|r| r.usage).unwrap_or_default();
+            println!("step {step}: input {} (cache read {}, cache write {})", u.input_tokens, u.cached_input_tokens, u.cache_creation_input_tokens);
+            history.push(call("b.txt"));
+            history.push(result(2 + step));
+        }
     }
 
     /// Right after app start: nothing has listed the models yet.

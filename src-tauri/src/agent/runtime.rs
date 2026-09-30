@@ -1388,7 +1388,7 @@ fn with_worker(req: &AgentRequest) -> AgentRequest {
     if req.max_agents.clamp(1, MAX_AGENTS) > 1 && !req.subagents.iter().any(|s| s.name == WORKER) {
         req.subagents.push(SubagentDef {
             name: WORKER.into(),
-            description: "General-purpose helper for ANY self-contained part of the task: exploring or reading an area of the codebase, researching on the web, implementing a change confined to its own files, running and fixing tests. Give it everything it needs in `task`.".into(),
+            description: "General-purpose helper for a LARGE, independent part of the task: exploring a separate area of a big codebase, a long web research, a sizable change confined to its own files. It starts knowing nothing — give it everything it needs in `task`.".into(),
             prompt: "Work fast: batch independent tool calls into one turn.".into(),
         });
     }
@@ -1441,9 +1441,10 @@ fn preamble_sections(
     if has_helpers(req) {
         env.push_str(&format!(
             "\n\nHelper agents are available through the `delegate` tool — up to {parallel} work AT THE SAME TIME. \
-             Use them aggressively for throughput: split any task with independent parts (several files, modules, \
-             questions, searches) into self-contained sub-tasks and delegate them ALL IN ONE TURN so they run in parallel, \
-             then integrate their reports. Keep tightly coupled or tiny work for yourself."
+             A helper starts from zero: it knows nothing you have read and re-reads what it needs, so every delegation \
+             costs a whole new context. Delegate only large, independent parts (exploring separate areas of a big \
+             codebase, long self-contained implementations) — and then all of them in ONE turn so they run in parallel. \
+             Do small, single-file or tightly coupled work yourself, and never delegate what you have already read."
         ));
     }
     // Parallel tool calls: independent reads / searches / commands in one
@@ -1451,6 +1452,12 @@ fn preamble_sections(
     env.push_str(
         "\n\nSpeed: whenever several tool calls do not depend on each other (reading several files, several searches, \
          listing folders), issue them together in ONE turn — they run in parallel. Avoid one-call-per-turn crawling.",
+    );
+    // Earlier answers carry the list of what they did (the frontend adds it).
+    env.push_str(
+        "\n\nYour earlier answers in this chat end with a \"[Tool calls of this turn]\" list the app adds: what you \
+         already read, changed and ran. Build on it — do not redo that work unless something changed since. \
+         Never write such a list yourself.",
     );
     if !mcp.is_empty() && !mcp_deferred(req, mcp) {
         env.push_str(
@@ -1892,4 +1899,5 @@ mod mcp_defer_tests {
         assert!(cat.contains("- Browser: ") && cat.contains("- DevTools: "));
     }
 }
+
 

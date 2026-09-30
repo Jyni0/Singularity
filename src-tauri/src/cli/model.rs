@@ -266,6 +266,10 @@ impl Job {
                     "--tools",
                     "",
                     "--strict-mcp-config",
+                    // No CLAUDE.md, hooks or settings of the user's own Claude
+                    // Code: they cost tokens on every step and are not the app's.
+                    "--setting-sources",
+                    "",
                     "--disallowedTools",
                     "mcp__*",
                     "--system-prompt-file",
@@ -280,12 +284,25 @@ impl Job {
                 if let Some(e) = effort {
                     job.args.extend(["--effort".into(), e.into()]);
                 }
-                let mut content = vec![json!({ "type": "text", "text": r.prompt })];
+                // One block per turn, the newest marked for the cache: every
+                // agent step is a new process, and without the mark only the
+                // system prompt was reused — each step paid the whole history
+                // again (as a cache write). 1h, like Claude Code's own marks
+                // (a shorter one after them is rejected).
+                let mut content: Vec<Value> = r.turns.iter().map(|t| json!({ "type": "text", "text": t })).collect();
+                if !r.tail.is_empty() {
+                    if let Some(last) = content.last_mut() {
+                        last["cache_control"] = json!({ "type": "ephemeral", "ttl": "1h" });
+                    }
+                }
                 for img in &r.images {
                     content.push(json!({
                         "type": "image",
                         "source": { "type": "base64", "media_type": img.mime, "data": img.base64 },
                     }));
+                }
+                if !r.tail.is_empty() {
+                    content.push(json!({ "type": "text", "text": r.tail }));
                 }
                 job.stdin = format!(
                     "{}\n",
@@ -297,6 +314,17 @@ impl Job {
                     .iter()
                     .map(|s| s.to_string())
                     .collect();
+                // Codex's own base instructions (~3.5k tokens a call) replaced
+                // by one line: the app's instructions ride in the prompt.
+                let base = scratch().join("codex-base.md");
+                let line = "You answer the user of the Singularity desktop app. Follow the instructions in the user's message.";
+                if std::fs::read_to_string(&base).ok().as_deref() != Some(line) {
+                    let _ = std::fs::write(&base, line);
+                }
+                if base.is_file() {
+                    let p = base.display().to_string().replace('\\', "/");
+                    job.args.extend(["-c".into(), format!("model_instructions_file=\"{p}\"")]);
+                }
                 if let Some(model) = m.model_arg() {
                     job.args.extend(["-m".into(), model.into()]);
                 }
@@ -322,6 +350,10 @@ impl Job {
                     .iter()
                     .map(|s| s.to_string())
                     .collect();
+                // The app's lean agent: no agy prompt sections, no built-in tools.
+                if super::ensure_agy_agent().is_ok() {
+                    job.args.extend(["--agent".into(), super::AGY_AGENT.into()]);
+                }
                 // `--model` (and `--effort` when needed), picked in `open`.
                 job.args.extend(agy_args.iter().cloned());
                 job.args.extend(["-p".into(), String::new()]);

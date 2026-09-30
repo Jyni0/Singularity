@@ -190,7 +190,16 @@ fn tag_balance(text: &str) -> Vec<Problem> {
 /// pre-existing error that merely moved lines is not blamed on the edit).
 /// None = language unsupported.
 pub fn introduced(path: &Path, before: Option<&str>, after: &str) -> Option<Vec<Problem>> {
-    let now = check(path, after)?;
+    let mut now = check(path, after)?;
+    // Only the lines the edit touched (± a little) can hold its problems.
+    // A pre-existing error elsewhere is parsed a little differently after
+    // any edit (tree-sitter regroups its error node, so its message moves),
+    // and blaming it marked good edits as failed — the model then went
+    // back to re-reading and re-checking the whole project.
+    if let Some(b) = before {
+        let (first, last) = changed_lines(b, after);
+        now.retain(|p| p.line + 2 >= first && p.line <= last + 2);
+    }
     let old = before.and_then(|b| check(path, b)).unwrap_or_default();
     let mut budget: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for p in &old {
@@ -207,6 +216,18 @@ pub fn introduced(path: &Path, before: Option<&str>, after: &str) -> Option<Vec<
             })
             .collect(),
     )
+}
+
+/// 1-based first and last line of `after` that differ from `before`
+/// (common leading and trailing lines excluded). A pure deletion gives the
+/// line where the text was removed.
+fn changed_lines(before: &str, after: &str) -> (usize, usize) {
+    let (b, a): (Vec<&str>, Vec<&str>) = (before.lines().collect(), after.lines().collect());
+    let head = b.iter().zip(&a).take_while(|(x, y)| x == y).count();
+    let tail = b.iter().rev().zip(a.iter().rev()).take_while(|(x, y)| x == y).count().min(a.len().min(b.len()) - head);
+    let first = head + 1;
+    let last = (a.len() - tail).max(first);
+    (first, last)
 }
 
 /// The model-facing report of introduced problems, with the offending lines.
@@ -230,6 +251,19 @@ pub fn report(path_label: &str, text: &str, problems: &[Problem]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_errors_elsewhere_are_not_blamed_on_an_edit() {
+        let broken_below = "export const EMPTY = {\n  a: { os: string } | null;\n  b: string;\n};\n";
+        let before = format!("type T = {{\n  x?: string;\n  y?: string;\n}}\n\n\n\n\n{broken_below}");
+        let after = format!("type T = {{\n  x: string | null;\n}}\n\n\n\n\n{broken_below}");
+        assert_eq!(introduced(Path::new("a.ts"), Some(&before), &after).unwrap(), vec![]);
+        // An error IN the edited lines is still reported.
+        let bad = format!("type T = {{\n  x: string | null\n  (;\n}}\n\n\n\n\n{broken_below}");
+        assert!(!introduced(Path::new("a.ts"), Some(&before), &bad).unwrap().is_empty());
+        assert_eq!(changed_lines("a\nb\nc", "a\nc"), (2, 2));
+        assert_eq!(changed_lines("a\nb", "a\nb"), (3, 3));
+    }
 
     #[test]
     fn finds_unclosed_jsx_and_brackets() {

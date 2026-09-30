@@ -1066,7 +1066,10 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
                 out.push_str(&fuzzy.join("\n"));
             }
             if !errors.is_empty() {
-                out.push_str("\nFAILED:\n");
+                out.push_str(&format!(
+                    "\nThe {applied} applied hunk(s) are saved — do not redo them or re-read the project; \
+                     resend ONLY the failed hunk(s) below.\nFAILED:\n"
+                ));
                 out.push_str(&errors.join("\n"));
             }
             if !broken.is_empty() {

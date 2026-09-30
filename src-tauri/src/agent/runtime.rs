@@ -358,13 +358,17 @@ const GUARD_STOP: &str = "the model repeated the same action";
 /// CLEAR_TARGET_CHARS. The most recent results always stay. Clearing jumps
 /// in big steps and then holds still, so the prompt prefix stays byte-stable
 /// between jumps and the provider's prompt cache keeps hitting.
-const CLEAR_TRIGGER_CHARS: usize = 160_000;
-const CLEAR_TARGET_CHARS: usize = 80_000;
+/// (160k chars — ~40k tokens, a dozen files — cleared the reads a task
+/// was built on after two edits; the model re-read the project, cleared
+/// again, and never finished. Today's models hold 128k+ tokens.)
+const CLEAR_TRIGGER_CHARS: usize = 360_000;
+const CLEAR_TARGET_CHARS: usize = 220_000;
 /// Newest tool results that are never cleared.
-const CLEAR_KEEP_RECENT: usize = 6;
+const CLEAR_KEEP_RECENT: usize = 12;
 /// Results shorter than this are not worth clearing.
 const CLEAR_MIN_CHARS: usize = 600;
-const CLEARED_STUB: &str = "[older tool result cleared to save context — call the tool again if you still need it]";
+const CLEARED_STUB: &str = "[older tool result cleared to save context. Your notes and the recent results above still hold; \
+     read a file again only when you need its exact lines for the next edit — do not re-scan the project]";
 /// Pause between retries of a failed model request.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -893,7 +897,7 @@ fn model_text(res: &tools::ToolResult) -> String {
 /// Keyed by path and the requested line range: paging through a long file
 /// is not re-reading.
 #[allow(clippy::type_complexity)]
-struct ReadMemo(Arc<Mutex<HashMap<(PathBuf, String), (u64, usize)>>>);
+struct ReadMemo(Arc<Mutex<HashMap<(PathBuf, String), (u64, usize)>>>, Arc<Mutex<HashMap<String, usize>>>);
 
 /// Reads of one unchanged file before the result carries the nudge.
 const REREAD_NUDGE_AT: usize = 3;
@@ -901,6 +905,26 @@ const REREAD_NUDGE_AT: usize = 3;
 impl ReadMemo {
     fn forget(&self) {
         self.0.lock().unwrap().clear();
+        self.1.lock().unwrap().clear();
+    }
+
+    /// A look-around call (list_dir / find_files / grep) made again in this
+    /// task: its result gets a note to stop exploring. Models re-scanned the
+    /// whole project after every edit or two instead of doing the task.
+    fn look(&self, fingerprint: &str, mut res: tools::ToolResult) -> tools::ToolResult {
+        let n = {
+            let mut map = self.1.lock().unwrap();
+            let n = map.entry(fingerprint.to_string()).or_default();
+            *n += 1;
+            *n
+        };
+        if n >= 2 && res.ok {
+            res.output.push_str(
+                "\n[You already ran this exact search earlier in this task. Stop exploring the project: \
+                 work on the files the task is about and finish it.]",
+            );
+        }
+        res
     }
 
     /// An edit tool touched this file (applied or failed): its read count
@@ -909,6 +933,8 @@ impl ReadMemo {
         if let Ok(full) = tools::resolve(root, path) {
             self.0.lock().unwrap().retain(|(p, _), _| *p != full);
         }
+        // An edit can change what a search finds.
+        self.1.lock().unwrap().clear();
     }
 
     fn read(&self, root: &Path, args: &Value) -> tools::ToolResult {
@@ -1000,9 +1026,15 @@ fn fs_tools(ctx: &RunCtx, memo: &ReadMemo) -> Vec<DynamicTool> {
                                 }
                                 // Tools block (file IO, processes): keep the async
                                 // workers free so events keep flowing.
-                                tokio::task::spawn_blocking(move || tools::dispatch(&root, &tool_name, &args))
+                                let look = matches!(tool_name.as_str(), "list_dir" | "find_files" | "grep");
+                                let res = tokio::task::spawn_blocking(move || tools::dispatch(&root, &tool_name, &args))
                                     .await
-                                    .unwrap_or_else(|e| tools::ToolResult::err(format!("tool task failed: {e}")))
+                                    .unwrap_or_else(|e| tools::ToolResult::err(format!("tool task failed: {e}")));
+                                if look {
+                                    memo.look(&fp, res)
+                                } else {
+                                    res
+                                }
                             }
                         };
                         let text = model_text(&res);
@@ -2181,10 +2213,10 @@ mod tests {
                 .filter(|m| serde_json::to_string(m).unwrap().contains("older tool result cleared"))
                 .count()
         };
-        // 30 bulky results ≈ 300k chars: well past the trigger.
+        // 30 bulky results ≈ 600k chars: well past the trigger.
         let mut history = vec![Message::user("task")];
         for i in 0..30 {
-            history.push(Message::tool_result(format!("c{i}"), "read_file", "x".repeat(10_000)));
+            history.push(Message::tool_result(format!("c{i}"), "read_file", "x".repeat(20_000)));
         }
         history.push(Message::tool_result("d", "delegate", "y".repeat(10_000)));
         let mut cleared = 0;
@@ -2322,6 +2354,11 @@ mod read_memo_tests {
         // An edit starts the count over.
         memo.forget_path(&dir, "a.ts");
         assert!(!memo.read(&dir, &args).output.contains("Stop reading it"));
+        // A repeated search gets the note, a new one does not.
+        let ok = || tools::ToolResult::ok("src/a.ts");
+        assert!(!memo.look("list_dir({})", ok()).output.contains("Stop exploring"));
+        assert!(memo.look("list_dir({})", ok()).output.contains("Stop exploring"));
+        assert!(!memo.look("grep({})", ok()).output.contains("Stop exploring"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

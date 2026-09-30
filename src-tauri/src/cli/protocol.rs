@@ -190,6 +190,9 @@ fn tool_protocol(req: &CompletionRequest) -> String {
 #[derive(Debug, PartialEq)]
 pub enum Piece {
     Text(String),
+    /// The next part of a call still being written (its raw JSON text), so
+    /// the app can show it live — an edit's file taking shape.
+    CallDelta(String),
     Call { name: String, arguments: Value },
 }
 
@@ -199,6 +202,8 @@ pub enum Piece {
 pub struct ToolTagFilter {
     buf: String,
     in_call: bool,
+    /// Bytes of the open call's body already passed on as CallDelta.
+    sent: usize,
 }
 
 impl ToolTagFilter {
@@ -207,9 +212,18 @@ impl ToolTagFilter {
         let mut out = Vec::new();
         loop {
             if self.in_call {
-                let Some(end) = self.buf.find(CLOSE) else { break };
+                let Some(end) = self.buf.find(CLOSE) else {
+                    // Pass on what arrived, minus a possible partial "</tool_ca".
+                    let upto = self.buf.len() - partial_suffix(&self.buf, CLOSE);
+                    if upto > self.sent {
+                        out.push(Piece::CallDelta(self.buf[self.sent..upto].to_string()));
+                        self.sent = upto;
+                    }
+                    break;
+                };
                 let body: String = self.buf.drain(..end + CLOSE.len()).collect();
                 self.in_call = false;
+                self.sent = 0;
                 out.push(parse_call(&body[..end]));
             } else if let Some(start) = self.buf.find(OPEN) {
                 let text: String = self.buf.drain(..start + OPEN.len()).collect();
@@ -235,12 +249,13 @@ impl ToolTagFilter {
             // An unterminated call is still a call when its JSON is complete.
             match parse_call(&rest) {
                 p @ Piece::Call { .. } => out.push(p),
-                Piece::Text(_) => push_text(&mut out, &format!("{OPEN}{rest}")),
+                _ => push_text(&mut out, &format!("{OPEN}{rest}")),
             }
         } else {
             push_text(&mut out, &rest);
         }
         self.in_call = false;
+        self.sent = 0;
         out
     }
 }
@@ -287,6 +302,16 @@ mod tests {
             all.extend(f.push(chunk));
         }
         all.extend(f.finish());
+        // The call's text streamed as deltas first — without the closing tag.
+        let deltas: String = all
+            .iter()
+            .filter_map(|p| match p {
+                Piece::CallDelta(d) => Some(d.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, "{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}}");
+        all.retain(|p| !matches!(p, Piece::CallDelta(_)));
         assert_eq!(
             all,
             vec![

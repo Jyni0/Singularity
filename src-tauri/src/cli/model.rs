@@ -13,7 +13,7 @@ use rig_agent::core::completion::{
 };
 use rig_agent::core::streaming::{
     MintKind, RawStreamingChoice, RawStreamingToolCall, StreamFinal, StreamPartId,
-    StreamingCompletionResponse,
+    StreamingCompletionResponse, ToolCallDeltaContent,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -644,6 +644,14 @@ fn nudge(denied: &[String]) -> String {
 
 /* ---------- Rig stream items ---------- */
 
+/// The tool name of a call whose JSON is still being written.
+fn call_name(body: &str) -> Option<String> {
+    let at = body.find("\"name\"")? + 6;
+    let rest = body[at..].trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string()).filter(|n| !n.is_empty())
+}
+
 /// Text → tool-call filter → Rig items on the channel.
 struct Emitter {
     tx: mpsc::Sender<Item>,
@@ -651,11 +659,15 @@ struct Emitter {
     calls: usize,
     /// Anything (text or call) reached the consumer.
     produced: bool,
+    /// The call being written: its id, its text so far, whether its name
+    /// went out. Its deltas and the finished call share the id, so Rig
+    /// keeps them one call (one card).
+    open: Option<(String, String, bool)>,
 }
 
 impl Emitter {
     fn new(tx: mpsc::Sender<Item>) -> Self {
-        Self { tx, filter: ToolTagFilter::default(), calls: 0, produced: false }
+        Self { tx, filter: ToolTagFilter::default(), calls: 0, produced: false, open: None }
     }
 
     /// False when the consumer is gone.
@@ -688,14 +700,42 @@ impl Emitter {
         for p in pieces {
             let item = match p {
                 Piece::Text(t) => RawStreamingChoice::Message(t),
+                Piece::CallDelta(fragment) => {
+                    if self.open.is_none() {
+                        self.calls += 1;
+                        self.open = Some((format!("call_{}_{}", self.calls, uid()), String::new(), false));
+                    }
+                    let Some((id, body, named)) = self.open.as_mut() else { continue };
+                    body.push_str(&fragment);
+                    let wire = StreamPartId::wire(id.clone());
+                    if !*named {
+                        if let Some(name) = call_name(body) {
+                            *named = true;
+                            let item = RawStreamingChoice::ToolCallDelta { id: wire.clone(), content: ToolCallDeltaContent::Name(name) };
+                            if self.tx.send(Ok(item)).await.is_err() {
+                                return false;
+                            }
+                        }
+                    }
+                    RawStreamingChoice::ToolCallDelta { id: wire, content: ToolCallDeltaContent::Delta(fragment) }
+                }
                 Piece::Call { name, arguments } => {
-                    self.calls += 1;
-                    let id = format!("call_{}_{}", self.calls, uid());
+                    let id = match self.open.take() {
+                        Some((id, _, _)) => id,
+                        None => {
+                            self.calls += 1;
+                            format!("call_{}_{}", self.calls, uid())
+                        }
+                    };
                     RawStreamingChoice::ToolCall(
                         RawStreamingToolCall::new(StreamPartId::wire(id.clone()), name, arguments).with_call_id(id),
                     )
                 }
             };
+            if matches!(item, RawStreamingChoice::Message(_)) {
+                // A call that did not parse came back as text: it is over.
+                self.open = None;
+            }
             self.produced = true;
             if self.tx.send(Ok(item)).await.is_err() {
                 return false;

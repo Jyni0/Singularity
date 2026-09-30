@@ -864,6 +864,7 @@ impl ReadMemo {
     }
 
     fn read(&self, root: &Path, args: &Value) -> tools::ToolResult {
+        // Files the user changed since are read for real (their hash moved).
         let line = |k: &str| args.get(k).and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok())).map(|n| n as usize);
         let (start, end) = (line("start_line"), line("end_line"));
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -887,7 +888,7 @@ impl ReadMemo {
                 .is_some_and(|reads| reads.iter().any(|&(h, a, b)| h == *hash && a <= *from && b >= *to));
             if covered && from <= to {
                 return tools::ToolResult::ok(format!(
-                    "{path} (lines {from}-{to}) has not changed since you read it earlier in this task — \
+                    "{path} (lines {from}-{to}) has not changed since you read it earlier in this conversation — \
                      its content is already above in this conversation; use that instead of reading it again."
                 ));
             }
@@ -1479,13 +1480,11 @@ async fn run_with_retry(
     parallel: usize,
     to_ui: bool,
     carry: Option<&Mutex<Option<Vec<Message>>>>,
+    memo: ReadMemo,
     mut on_text: impl FnMut(&str),
 ) -> Result<String, String> {
     let snapshot: Snapshot = Arc::default();
     let finished: Finished = Arc::default();
-    // One per agent history: a retry resumes the same history, so the reads
-    // it remembers are still in it.
-    let memo = ReadMemo::default();
     let mut text = String::new();
     let mut attempt = 0usize;
     loop {
@@ -1573,7 +1572,7 @@ async fn run_subagent(ctx: &RunCtx, def: &SubagentDef, task: &str, card: Option<
     // Helpers batch their own independent tool calls too (several reads /
     // searches in one turn run side by side).
     let parallel = ctx.req.max_agents.clamp(1, 8);
-    let result = run_with_retry(ctx, &preamble, |memo| fs_tools(ctx, memo), Some(&def.name), Message::user(task), Vec::new(), parallel, false, None, |t| {
+    let result = run_with_retry(ctx, &preamble, |memo| fs_tools(ctx, memo), Some(&def.name), Message::user(task), Vec::new(), parallel, false, None, ReadMemo::default(), |t| {
         partial.push_str(t);
         // Live progress in the delegate card, throttled.
         if let Some(idx) = card {
@@ -1808,7 +1807,11 @@ pub(super) async fn run(
     // The previous answer of this very chat, as the model saw it (tool calls
     // and results included): the request then starts with exactly the bytes
     // the last one sent, and the provider's cache covers all of it.
-    if let Some(carried) = carry_take(req, full) {
+    // One per agent history (a retry resumes the same history); a carried
+    // history brings the reads that are in it.
+    let mut memo = ReadMemo::default();
+    if let Some((carried, reads)) = carry_take(req, full) {
+        memo = reads;
         if let Some(p) = parts.iter_mut().find(|p| p.group == "messages") {
             let mut items: Vec<ContextItem> = carried.iter().map(message_item).collect();
             items.push(message_item(&prompt));
@@ -1822,7 +1825,8 @@ pub(super) async fn run(
     // reads, several delegations); at least a handful even with one helper.
     let tool_parallel = parallel.max(8);
     let mut text =
-        run_with_retry(&ctx, &preamble, &tools, None, prompt, history, tool_parallel, true, Some(&carry_out), |_| {}).await?;
+        run_with_retry(&ctx, &preamble, &tools, None, prompt, history, tool_parallel, true, Some(&carry_out), memo.clone(), |_| {})
+            .await?;
     // A tool call written as plain text ("functions.read_file:0{…}") is no
     // call: nothing ran and the run ended mid-task. Point it out and go on.
     for _ in 0..TEXT_CALL_NUDGES {
@@ -1847,12 +1851,13 @@ pub(super) async fn run(
         );
         emit_text(app, run_id, "\n\n".to_string());
         let more =
-            run_with_retry(&ctx, &preamble, &tools, None, nudge, messages, tool_parallel, true, Some(&carry_out), |_| {}).await?;
+            run_with_retry(&ctx, &preamble, &tools, None, nudge, messages, tool_parallel, true, Some(&carry_out), memo.clone(), |_| {})
+                .await?;
         text.push_str("\n\n");
         text.push_str(&more);
     }
     if let Some(messages) = carry_out.into_inner().unwrap() {
-        carry_put(req, full, messages);
+        carry_put(req, full, messages, memo);
     }
     if text.trim().is_empty() && ctx.counter.load(Ordering::SeqCst) == 0 {
         return Err(
@@ -1904,7 +1909,7 @@ const CARRY_KEEP: usize = 8;
 /// shorter history — a different prompt, which the provider's cache could
 /// not serve past the system prompt: 30-60% cache while Claude Code, which
 /// keeps the conversation as sent, stays above 90%.
-static CARRY: Mutex<Vec<(u64, Vec<Message>)>> = Mutex::new(Vec::new());
+static CARRY: Mutex<Vec<(u64, Vec<Message>, ReadMemo)>> = Mutex::new(Vec::new());
 
 /// Identifies a chat state on one provider + model: the turns the run got.
 fn carry_key(req: &AgentRequest, turns: &[crate::chat::ChatTurn]) -> u64 {
@@ -1938,7 +1943,7 @@ fn carry_cap(req: &AgentRequest) -> usize {
 /// The carried history when this run continues the chat of a finished one:
 /// the turns are that run's turns + its answer + one new prompt. An edited,
 /// resent, regenerated or compacted chat, or another model, starts afresh.
-fn carry_take(req: &AgentRequest, full: &[crate::chat::ChatTurn]) -> Option<Vec<Message>> {
+fn carry_take(req: &AgentRequest, full: &[crate::chat::ChatTurn]) -> Option<(Vec<Message>, ReadMemo)> {
     if !carries(req) {
         return None;
     }
@@ -1949,10 +1954,10 @@ fn carry_take(req: &AgentRequest, full: &[crate::chat::ChatTurn]) -> Option<Vec<
     }
     let key = carry_key(req, &full[..n - 2]);
     let mut store = CARRY.lock().unwrap();
-    let at = store.iter().position(|(k, _)| *k == key)?;
-    let (_, messages) = store.remove(at);
+    let at = store.iter().position(|(k, _, _)| *k == key)?;
+    let (_, messages, memo) = store.remove(at);
     let size: usize = messages.iter().map(|m| serde_json::to_string(m).map(|j| j.len()).unwrap_or(0)).sum();
-    (size <= carry_cap(req)).then_some(messages)
+    (size <= carry_cap(req)).then_some((messages, memo))
 }
 
 /// The carried history the next message of this chat would continue from
@@ -1963,7 +1968,7 @@ fn carry_peek(req: &AgentRequest, full: &[crate::chat::ChatTurn]) -> Option<Vec<
         return None;
     }
     let key = carry_key(req, &full[..n - 1]);
-    CARRY.lock().unwrap().iter().find(|(k, _)| *k == key).map(|(_, m)| m.clone())
+    CARRY.lock().unwrap().iter().find(|(k, _, _)| *k == key).map(|(_, m, _)| m.clone())
 }
 
 /// One carried message for the context view: who, and its text.
@@ -2010,14 +2015,14 @@ fn message_item(m: &Message) -> ContextItem {
     item(format!("{label} · {}", snippet(&text)), &text)
 }
 
-fn carry_put(req: &AgentRequest, full: &[crate::chat::ChatTurn], messages: Vec<Message>) {
+fn carry_put(req: &AgentRequest, full: &[crate::chat::ChatTurn], messages: Vec<Message>, memo: ReadMemo) {
     if !carries(req) {
         return;
     }
     let key = carry_key(req, full);
     let mut store = CARRY.lock().unwrap();
-    store.retain(|(k, _)| *k != key);
-    store.push((key, messages));
+    store.retain(|(k, _, _)| *k != key);
+    store.push((key, messages, memo));
     if store.len() > CARRY_KEEP {
         store.remove(0);
     }

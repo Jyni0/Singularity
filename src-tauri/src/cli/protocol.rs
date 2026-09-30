@@ -202,12 +202,18 @@ pub enum Piece {
 
 /// Streams text through while cutting `<tool_call>…</tool_call>` blocks out
 /// of it. A tag split across chunks is held back until it is complete.
+/// Models often leave out `</tool_call>` (several `<tool_call>{…}` lines in
+/// a row): a call also ends where its JSON object closes, or where the next
+/// `<tool_call>` starts.
 #[derive(Default)]
 pub struct ToolTagFilter {
     buf: String,
     in_call: bool,
     /// Bytes of the open call's body already passed on as CallDelta.
     sent: usize,
+    /// A call just ended on its JSON: a `</tool_call>` that follows is its
+    /// closing tag, not text.
+    skip_close: bool,
 }
 
 impl ToolTagFilter {
@@ -216,19 +222,39 @@ impl ToolTagFilter {
         let mut out = Vec::new();
         loop {
             if self.in_call {
-                let Some(end) = self.buf.find(CLOSE) else {
-                    // Pass on what arrived, minus a possible partial "</tool_ca".
-                    let upto = self.buf.len() - partial_suffix(&self.buf, CLOSE);
-                    if upto > self.sent {
-                        out.push(Piece::CallDelta(self.buf[self.sent..upto].to_string()));
-                        self.sent = upto;
+                let close = self.buf.find(CLOSE);
+                let json_end = json_object_end(&self.buf).filter(|&e| close.is_none_or(|c| e <= c));
+                let next_open = self.buf.find(OPEN).filter(|&o| close.is_none_or(|c| o < c));
+                let (end, skip) = match (json_end, close, next_open) {
+                    (Some(e), _, _) => (e, 0),
+                    (None, Some(c), _) => (c, CLOSE.len()),
+                    (None, None, Some(o)) => (o, 0),
+                    (None, None, None) => {
+                        // Pass on what arrived, minus a possible partial "</tool_ca".
+                        let upto = self.buf.len() - partial_suffix(&self.buf, CLOSE);
+                        if upto > self.sent {
+                            out.push(Piece::CallDelta(self.buf[self.sent..upto].to_string()));
+                            self.sent = upto;
+                        }
+                        break;
                     }
-                    break;
                 };
-                let body: String = self.buf.drain(..end + CLOSE.len()).collect();
+                let body: String = self.buf.drain(..end + skip).collect();
                 self.in_call = false;
                 self.sent = 0;
+                self.skip_close = json_end.is_some();
                 out.push(parse_call(&body[..end]));
+            } else if self.skip_close {
+                // Drop the closing tag of a call that ended on its JSON.
+                let rest = self.buf.trim_start();
+                if rest.is_empty() || (CLOSE.starts_with(rest) && rest.len() < CLOSE.len()) {
+                    break; // wait: the tag may still be coming
+                }
+                if rest.starts_with(CLOSE) {
+                    let cut = self.buf.len() - rest.len() + CLOSE.len();
+                    self.buf.drain(..cut);
+                }
+                self.skip_close = false;
             } else if let Some(start) = self.buf.find(OPEN) {
                 let text: String = self.buf.drain(..start + OPEN.len()).collect();
                 push_text(&mut out, &text[..start]);
@@ -255,13 +281,49 @@ impl ToolTagFilter {
                 p @ Piece::Call { .. } => out.push(p),
                 _ => push_text(&mut out, &format!("{OPEN}{rest}")),
             }
-        } else {
+        } else if !(self.skip_close && CLOSE.starts_with(rest.trim())) {
             push_text(&mut out, &rest);
         }
         self.in_call = false;
         self.sent = 0;
+        self.skip_close = false;
         out
     }
+}
+
+/// End (byte index after the closing `}`) of the JSON object `s` starts
+/// with, when it is complete and parses — strings and escapes respected.
+/// A body that does not parse this way ends at a tag instead.
+fn json_object_end(s: &str) -> Option<usize> {
+    let lead = s.len() - s.trim_start().len();
+    if !s[lead..].starts_with('{') {
+        return None;
+    }
+    let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+    for (i, c) in s[lead..].char_indices() {
+        if in_str {
+            match (esc, c) {
+                (true, _) => esc = false,
+                (false, '\\') => esc = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = lead + i + 1;
+                    return serde_json::from_str::<Value>(&s[..end]).is_ok().then_some(end);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn push_text(out: &mut Vec<Piece>, s: &str) {
@@ -395,7 +457,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(deltas, "{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}}");
+        // The call ends as soon as its JSON closes; what streamed before
+        // is its beginning.
+        assert!("{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}}".starts_with(&deltas) && !deltas.is_empty());
         all.retain(|p| !matches!(p, Piece::CallDelta(_)));
         assert_eq!(
             all,
@@ -433,6 +497,44 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn calls_without_closing_tags() {
+        let text = "Fixing.\n<tool_call>{\"name\":\"apply_patch\",\"arguments\":{\"path\":\"a.ts\",\"diff\":\"x}\"}}\n<tool_call>{\"name\":\"run_command\",\"arguments\":{\"command\":\"npm run typecheck\"}}\n";
+        // Any chunking gives the same two calls and no leftover tags.
+        for size in [1, 3, 7, 1000] {
+            let mut f = ToolTagFilter::default();
+            let mut all = Vec::new();
+            let chars: Vec<char> = text.chars().collect();
+            for chunk in chars.chunks(size) {
+                all.extend(f.push(&chunk.iter().collect::<String>()));
+            }
+            all.extend(f.finish());
+            all.retain(|p| !matches!(p, Piece::CallDelta(_)));
+            let calls: Vec<&str> = all
+                .iter()
+                .filter_map(|p| match p {
+                    Piece::Call { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(calls, ["apply_patch", "run_command"], "chunk {size}: {all:?}");
+            let text: String = all
+                .iter()
+                .filter_map(|p| match p {
+                    Piece::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(!text.contains("tool_call"), "chunk {size}: {text:?}");
+        }
+        // With the closing tags it still works, and the tag is not text.
+        let mut f = ToolTagFilter::default();
+        let mut all = f.push("<tool_call>{\"name\":\"read_file\",\"arguments\":{}}</tool_call>ok");
+        all.extend(f.finish());
+        all.retain(|p| !matches!(p, Piece::CallDelta(_)));
+        assert_eq!(all, vec![Piece::Call { name: "read_file".into(), arguments: serde_json::json!({}) }, Piece::Text("ok".into())]);
     }
 
     #[test]

@@ -269,65 +269,6 @@ fn take_result(fingerprint: &str) -> Option<tools::ToolResult> {
     res
 }
 
-/* ---------- Context editing ---------- */
-
-/// Text size of one tool result.
-fn result_chars(r: &rig_agent::core::completion::message::ToolResult) -> usize {
-    use rig_agent::core::completion::message::ToolResultContent;
-    r.content
-        .iter()
-        .map(|c| match c {
-            ToolResultContent::Text(t) => t.text.len(),
-            ToolResultContent::Json { value } => value.to_string().len(),
-            ToolResultContent::Image(_) => 1_000,
-        })
-        .sum()
-}
-
-/// Returns the history to send with the oldest bulky tool results stubbed
-/// (None = send it unchanged). `cleared` is the hook's watermark: it only
-/// ever moves forward, and only when the history outgrew the trigger.
-fn clear_old_results(history: &[Message], cleared: &mut usize) -> Option<Vec<Message>> {
-    use rig_agent::core::completion::message::ToolResultContent;
-    // Clearable results in order: (message, content index, size). A helper's
-    // report and loaded skill instructions are the agent's working notes —
-    // they are never cleared.
-    let mut results = Vec::new();
-    for (mi, m) in history.iter().enumerate() {
-        if let Message::User { content } = m {
-            for (ci, c) in content.iter().enumerate() {
-                if let UserContent::ToolResult(r) = c {
-                    let size = result_chars(r);
-                    if size >= CLEAR_MIN_CHARS && r.name != "delegate" && r.name != "skill" {
-                        results.push((mi, ci, size));
-                    }
-                }
-            }
-        }
-    }
-    let clearable = results.len().saturating_sub(CLEAR_KEEP_RECENT);
-    *cleared = (*cleared).min(clearable);
-    let total: usize = history.iter().map(|m| serde_json::to_string(m).map(|j| j.len()).unwrap_or(0)).sum();
-    let freed = |n: usize| results[..n].iter().map(|r| r.2.saturating_sub(CLEARED_STUB.len())).sum::<usize>();
-    if total.saturating_sub(freed(*cleared)) > CLEAR_TRIGGER_CHARS {
-        while *cleared < clearable && total.saturating_sub(freed(*cleared)) > CLEAR_TARGET_CHARS {
-            *cleared += 1;
-        }
-    }
-    if *cleared == 0 {
-        return None;
-    }
-    let mut out = history.to_vec();
-    for &(mi, ci, _) in &results[..*cleared] {
-        if let Message::User { content } = &mut out[mi] {
-            if let Some(UserContent::ToolResult(r)) = content.get_mut(ci) {
-                r.content = vec![ToolResultContent::text(CLEARED_STUB)];
-            }
-        }
-    }
-    Some(out)
-}
-
 /* ---------- Hook: live cards, approvals, guard, limiter ---------- */
 
 /// Arguments of a call still streaming, for the live card.
@@ -352,23 +293,6 @@ const REPEAT_SKIP_AT: usize = 3;
 const REPEAT_STOP_AT: usize = 5;
 /// Marker of the repeat guard's stop — deliberate, never retried.
 const GUARD_STOP: &str = "the model repeated the same action";
-/// Context editing — the client-side twin of Anthropic's `clear_tool_uses`:
-/// once the conversation inside a run grows past CLEAR_TRIGGER_CHARS, the
-/// OLDEST bulky tool results are replaced by a stub until it is back under
-/// CLEAR_TARGET_CHARS. The most recent results always stay. Clearing jumps
-/// in big steps and then holds still, so the prompt prefix stays byte-stable
-/// between jumps and the provider's prompt cache keeps hitting.
-/// (160k chars — ~40k tokens, a dozen files — cleared the reads a task
-/// was built on after two edits; the model re-read the project, cleared
-/// again, and never finished. Today's models hold 128k+ tokens.)
-const CLEAR_TRIGGER_CHARS: usize = 360_000;
-const CLEAR_TARGET_CHARS: usize = 220_000;
-/// Newest tool results that are never cleared.
-const CLEAR_KEEP_RECENT: usize = 12;
-/// Results shorter than this are not worth clearing.
-const CLEAR_MIN_CHARS: usize = 600;
-const CLEARED_STUB: &str = "[older tool result cleared to save context. Your notes and the recent results above still hold; \
-     read a file again only when you need its exact lines for the next edit — do not re-scan the project]";
 /// Pause between retries of a failed model request.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -386,16 +310,12 @@ struct UiHook {
     permit: Mutex<Option<crate::limiter::Permit>>,
     live: Mutex<HashMap<String, LiveCall>>,
     last_call: Mutex<(String, usize)>,
-    /// How many of the clearable tool results (oldest first) are stubbed.
-    cleared: Mutex<usize>,
-    /// Files this agent has read; forgotten when old results get stubbed.
-    memo: ReadMemo,
     /// What the model answered in its latest finished turn.
     finished: Finished,
 }
 
 impl UiHook {
-    fn new(ctx: RunCtx, label: Option<&str>, snapshot: Snapshot, memo: ReadMemo, finished: Finished) -> Self {
+    fn new(ctx: RunCtx, label: Option<&str>, snapshot: Snapshot, finished: Finished) -> Self {
         Self {
             ctx,
             snapshot,
@@ -403,8 +323,6 @@ impl UiHook {
             permit: Mutex::new(None),
             live: Mutex::new(HashMap::new()),
             last_call: Mutex::new((String::new(), 0)),
-            cleared: Mutex::new(0),
-            memo,
             finished,
         }
     }
@@ -427,17 +345,9 @@ impl AgentHook for UiHook {
         let key = if req.provider_id.is_empty() { req.base_url.clone() } else { req.provider_id.clone() };
         let permit = crate::limiter::acquire(&key, req.rate_limit_rpm, req.concurrency, &self.ctx.run_id).await;
         *self.permit.lock().unwrap() = Some(permit);
-        let mut cleared = self.cleared.lock().unwrap();
-        let before = *cleared;
-        let patched = clear_old_results(event.history, &mut cleared);
-        if *cleared != before {
-            // Earlier file contents may be stubs now: reading again is real.
-            self.memo.forget();
-        }
-        match patched {
-            Some(history) => CompletionCallAction::patch(rig_agent::agent::RequestPatch::new().history(history)),
-            None => CompletionCallAction::Continue,
-        }
+        // The history goes out as it is: nothing is cleared automatically —
+        // the user compacts with /compact when they want to.
+        CompletionCallAction::Continue
     }
 
     /// The provider slot is free once the stream ends — tools and approval
@@ -893,19 +803,51 @@ fn model_text(res: &tools::ToolResult) -> String {
 /// already" stub instead of the text left models re-reading in a circle and
 /// never editing. Reading the same unchanged file over and over gets a
 /// nudge appended to the real content instead; any edit resets the count.
-#[derive(Clone, Default)]
 /// Keyed by path and the requested line range: paging through a long file
-/// is not re-reading.
-#[allow(clippy::type_complexity)]
-struct ReadMemo(Arc<Mutex<HashMap<(PathBuf, String), (u64, usize)>>>, Arc<Mutex<HashMap<String, usize>>>);
+/// is not re-reading. Also remembers the searches and commands of the task.
+#[derive(Clone, Default)]
+struct ReadMemo {
+    reads: Arc<Mutex<HashMap<(PathBuf, String), (u64, usize)>>>,
+    looks: Arc<Mutex<HashMap<String, usize>>>,
+    /// Commands run since the last file edit → their output.
+    commands: Arc<Mutex<HashMap<String, tools::ToolResult>>>,
+}
 
 /// Reads of one unchanged file before the result carries the nudge.
 const REREAD_NUDGE_AT: usize = 3;
 
 impl ReadMemo {
-    fn forget(&self) {
-        self.0.lock().unwrap().clear();
-        self.1.lock().unwrap().clear();
+    /// The same command again with no file changed since: the model gets
+    /// the earlier output instead of a second run. Models re-ran the same
+    /// `npm run typecheck` over and over between no edits at all.
+    fn rerun(&self, key: &str) -> Option<tools::ToolResult> {
+        let prev = self.commands.lock().unwrap().get(key).cloned()?;
+        let mut res = tools::ToolResult {
+            output: format!(
+                "NOT RUN AGAIN: you already ran this exact command in this task and no file has changed since, \
+                 so its result is the same. Do not run it again — fix what it reports (or finish). \
+                 Its earlier output:\n{}",
+                prev.output
+            ),
+            ..prev
+        };
+        res.ok = false;
+        Some(res)
+    }
+
+    /// A command ran. Any command may change files (formatters, codegen,
+    /// installs), so only this one is remembered.
+    fn ran(&self, key: String, res: &tools::ToolResult) {
+        let mut map = self.commands.lock().unwrap();
+        map.clear();
+        map.insert(key, res.clone());
+    }
+
+    /// Something outside the file tools may have changed the project
+    /// (git, a remote command, a background task): nothing is remembered.
+    fn changed(&self) {
+        self.looks.lock().unwrap().clear();
+        self.commands.lock().unwrap().clear();
     }
 
     /// A look-around call (list_dir / find_files / grep) made again in this
@@ -913,7 +855,7 @@ impl ReadMemo {
     /// whole project after every edit or two instead of doing the task.
     fn look(&self, fingerprint: &str, mut res: tools::ToolResult) -> tools::ToolResult {
         let n = {
-            let mut map = self.1.lock().unwrap();
+            let mut map = self.looks.lock().unwrap();
             let n = map.entry(fingerprint.to_string()).or_default();
             *n += 1;
             *n
@@ -931,10 +873,11 @@ impl ReadMemo {
     /// starts over.
     fn forget_path(&self, root: &Path, path: &str) {
         if let Ok(full) = tools::resolve(root, path) {
-            self.0.lock().unwrap().retain(|(p, _), _| *p != full);
+            self.reads.lock().unwrap().retain(|(p, _), _| *p != full);
         }
-        // An edit can change what a search finds.
-        self.1.lock().unwrap().clear();
+        // An edit can change what a search finds and what a command says.
+        self.looks.lock().unwrap().clear();
+        self.commands.lock().unwrap().clear();
     }
 
     fn read(&self, root: &Path, args: &Value) -> tools::ToolResult {
@@ -953,7 +896,7 @@ impl ReadMemo {
             return res;
         };
         let count = {
-            let mut map = self.0.lock().unwrap();
+            let mut map = self.reads.lock().unwrap();
             let range = format!("{}-{}", args.get("start_line").unwrap_or(&Value::Null), args.get("end_line").unwrap_or(&Value::Null));
             let entry = map.entry((full, range)).or_insert((hash, 0));
             if entry.0 != hash {
@@ -1001,7 +944,10 @@ fn fs_tools(ctx: &RunCtx, memo: &ReadMemo) -> Vec<DynamicTool> {
                         let fp = fingerprint(&tool_name, &args);
                         let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let res = match tool_name.as_str() {
-                            "ssh_exec" => run_ssh_tool(&c.app, &c.req, &args).await,
+                            "ssh_exec" => {
+                                memo.changed();
+                                run_ssh_tool(&c.app, &c.req, &args).await
+                            }
                             "web_search" => {
                                 let max = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
                                 crate::web::search(&get("query"), max).await
@@ -1024,12 +970,28 @@ fn fs_tools(ctx: &RunCtx, memo: &ReadMemo) -> Vec<DynamicTool> {
                                     memo.forget_path(&root, &get("path"));
                                     memo.forget_path(&root, &get("to"));
                                 }
+                                if matches!(tool_name.as_str(), "git" | "background") {
+                                    memo.changed();
+                                }
+                                // Same command, same folder, no edit since: not run again.
+                                let command = (tool_name == "run_command"
+                                    && !args.get("background").and_then(|v| v.as_bool()).unwrap_or(false))
+                                .then(|| format!("{}\u{1}{}\u{1}{}", root.display(), get("cwd").trim(), get("command").trim()));
+                                if let Some(prev) = command.as_deref().and_then(|k| memo.rerun(k)) {
+                                    let text = model_text(&prev);
+                                    stash_result(fp, &prev);
+                                    tctx.insert_result(prev);
+                                    return Ok(ToolOutput::text(text));
+                                }
                                 // Tools block (file IO, processes): keep the async
                                 // workers free so events keep flowing.
                                 let look = matches!(tool_name.as_str(), "list_dir" | "find_files" | "grep");
                                 let res = tokio::task::spawn_blocking(move || tools::dispatch(&root, &tool_name, &args))
                                     .await
                                     .unwrap_or_else(|e| tools::ToolResult::err(format!("tool task failed: {e}")));
+                                if let Some(key) = command {
+                                    memo.ran(key, &res);
+                                }
                                 if look {
                                     memo.look(&fp, res)
                                 } else {
@@ -1573,7 +1535,7 @@ async fn run_with_retry(
             .max_turns(MAX_TURNS)
             // Several delegate calls in one turn run side by side.
             .tool_concurrency(parallel)
-            .add_hook(UiHook::new(ctx.clone(), label, snapshot.clone(), memo.clone(), finished.clone()))
+            .add_hook(UiHook::new(ctx.clone(), label, snapshot.clone(), finished.clone()))
             .await;
         let (part, err) = drive(ctx, stream, &seen, to_ui, &mut on_text).await;
         text.push_str(&part);
@@ -2074,7 +2036,7 @@ fn category(label: &str, group: &'static str, mut items: Vec<ContextItem>) -> Co
 /// What the NEXT agent request of this conversation would send, measured
 /// category by category — the same preamble, tool list and trimmed,
 /// expanded history the run builds. (Inside a run the history then grows
-/// with tool calls and results; context editing trims those.)
+/// with tool calls and results until the user compacts with /compact.)
 pub(super) async fn context_info(
     app: &AppHandle,
     req: &AgentRequest,
@@ -2207,36 +2169,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn old_tool_results_are_cleared_in_steps() {
-        let stub_count = |h: &[Message]| {
-            h.iter()
-                .filter(|m| serde_json::to_string(m).unwrap().contains("older tool result cleared"))
-                .count()
-        };
-        // 30 bulky results ≈ 600k chars: well past the trigger.
-        let mut history = vec![Message::user("task")];
-        for i in 0..30 {
-            history.push(Message::tool_result(format!("c{i}"), "read_file", "x".repeat(20_000)));
-        }
-        history.push(Message::tool_result("d", "delegate", "y".repeat(10_000)));
-        let mut cleared = 0;
-        let out = clear_old_results(&history, &mut cleared).expect("history over the trigger is edited");
-        assert!(cleared > 0 && cleared <= 30 - CLEAR_KEEP_RECENT);
-        assert_eq!(stub_count(&out), cleared);
-        // The newest results and the helper's report stay verbatim.
-        assert!(serde_json::to_string(&out[30]).unwrap().contains("xxxx"));
-        assert!(serde_json::to_string(out.last().unwrap()).unwrap().contains("yyyy"));
-        // Next turn with one more small result: the watermark holds (cache-stable).
-        history.push(Message::tool_result("e", "list_dir", "z"));
-        let before = cleared;
-        clear_old_results(&history, &mut cleared);
-        assert_eq!(cleared, before);
-        // Small histories are sent untouched.
-        let mut zero = 0;
-        assert!(clear_old_results(&history[..3], &mut zero).is_none());
-    }
-
-    #[test]
     fn today_is_a_date() {
         let t = today();
         assert_eq!(t.len(), 10);
@@ -2359,6 +2291,16 @@ mod read_memo_tests {
         assert!(!memo.look("list_dir({})", ok()).output.contains("Stop exploring"));
         assert!(memo.look("list_dir({})", ok()).output.contains("Stop exploring"));
         assert!(!memo.look("grep({})", ok()).output.contains("Stop exploring"));
+        // A command is not run twice between edits.
+        assert!(memo.rerun("npm run typecheck").is_none());
+        memo.ran("npm run typecheck".into(), &tools::ToolResult::err("error TS1005"));
+        let again = memo.rerun("npm run typecheck").expect("second run is answered from memory");
+        assert!(!again.ok && again.output.contains("NOT RUN AGAIN") && again.output.contains("error TS1005"));
+        // Another command in between may have changed files.
+        memo.ran("npm run format".into(), &tools::ToolResult::ok("done"));
+        assert!(memo.rerun("npm run typecheck").is_none());
+        memo.forget_path(&dir, "a.ts");
+        assert!(memo.rerun("npm run format").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

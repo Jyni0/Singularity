@@ -14,6 +14,7 @@ import { computeDiff } from "../utils/diff.u";
 import type * as db from "../core/db.r";
 import { BgTaskView } from "./BackgroundTasks.c";
 import { OverlayScroll, IconButton } from "../components";
+import { CopyPathButton } from "./copyPath.c";
 
 /** Renders a file's diff, reused by the file tab. */
 function FileDiffBody({ step }: { step: db.AgentStepEvent }) {
@@ -55,6 +56,15 @@ function FileDiffBody({ step }: { step: db.AgentStepEvent }) {
   );
 }
 
+/** The file a read/list/edit call names (its input, minus the "(12–40)"
+ *  range and a helper's "[name] " prefix). */
+function toolPath(step: db.AgentStepEvent): string | null {
+  if (!["read_file", "write_file", "edit_file", "apply_patch", "list_dir"].includes(step.name)) return null;
+  const rest = step.input.replace(/^\[[^\]]+\] /, "");
+  const sp = rest.search(/ [(…]/);
+  return (sp >= 0 ? rest.slice(0, sp) : rest).trim() || null;
+}
+
 /** Small icon button used in the panel header. */
 
 /** Icon per tab type. */
@@ -88,10 +98,11 @@ function TabBody({ tab, msgs }: { tab: PanelTabSpec; msgs: Msg[] }) {
   }
 
   if (tab.type === "file") {
-    // Latest change of the file wins - the tab shows the net result.
+    // Latest change of the file wins - the tab shows the net result, and an
+    // edit still being written shows live as it grows.
     let step: db.AgentStepEvent | undefined;
     for (const s of steps) {
-      if (s.path === tab.path && s.done && s.ok && s.new_text !== undefined) step = s;
+      if (s.path === tab.path && (!s.done || s.ok) && s.new_text !== undefined) step = s;
     }
     if (!step) {
       return (
@@ -106,6 +117,8 @@ function TabBody({ tab, msgs }: { tab: PanelTabSpec; msgs: Msg[] }) {
           <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--text-main)]" title={step.path}>
             {step.path}
           </span>
+          {!step.done && <span className="shrink-0 animate-pulse text-[10.5px] text-[var(--accent)]">writing…</span>}
+          {step.path && <CopyPathButton path={step.path} />}
         </div>
         <div className="flex min-h-0 flex-1 flex-col">
           <FileDiffBody step={step} />
@@ -141,11 +154,15 @@ function TabBody({ tab, msgs }: { tab: PanelTabSpec; msgs: Msg[] }) {
   }
 
   // Generic tool output: read/list/grep etc. - the full result, verbatim.
+  const path = step.path ?? toolPath(step);
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <code className="block shrink-0 truncate border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 py-1.5 font-mono text-[11px] text-[var(--text-main)]" title={step.input}>
-        {step.name}: {step.input}
-      </code>
+      <div className="flex shrink-0 items-center gap-1.5 border-b border-[var(--border)] bg-[var(--bg-surface)] px-3 py-1.5">
+        <code className="block min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--text-main)]" title={step.input}>
+          {step.name}: {step.input}
+        </code>
+        {path && <CopyPathButton path={path} />}
+      </div>
       <OverlayScroll wrapperClassName="min-h-0 flex-1" className="h-full overflow-auto bg-[var(--bg-app)]">
         <pre className="whitespace-pre-wrap break-all px-3 py-2 font-mono text-[11px] leading-relaxed text-[var(--text-muted)]">
           {step.done ? step.result : "running\u2026"}

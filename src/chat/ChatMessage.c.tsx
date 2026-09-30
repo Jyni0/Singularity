@@ -208,8 +208,8 @@ function StepGroup({
       {open && (
         <div className="ml-2 mt-0.5 flex flex-col border-l border-[var(--border-soft)] pl-2">
           {steps.map((s) => (
+            <Fragment key={s.key}>
             <ToolCall
-              key={s.key}
               call={{
                 name: s.step.name,
                 input: s.step.input,
@@ -220,9 +220,46 @@ function StepGroup({
                 onInspect: () => onInspectStep?.(s.step),
               }}
             />
+            {streaming && !s.step.done && s.step.new_text !== undefined && (
+              <LiveEdit before={s.step.old_text ?? ""} after={s.step.new_text} />
+            )}
+            </Fragment>
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+/** Lines of a live edit shown under its row. */
+const LIVE_EDIT_LINES = 12;
+
+/**
+ * The part of a file an edit is writing right now, while the model is still
+ * streaming it: the lines between what stays the same at the start and at
+ * the end, newest at the bottom. Linear time — it re-renders many times a
+ * second, so no full diff here (the side panel has that).
+ */
+function LiveEdit({ before, after }: { before: string; after: string }) {
+  let start = 0;
+  const max = Math.min(before.length, after.length);
+  while (start < max && before.charCodeAt(start) === after.charCodeAt(start)) start++;
+  let end = 0;
+  while (end < max - start && before.charCodeAt(before.length - 1 - end) === after.charCodeAt(after.length - 1 - end)) end++;
+  const lineStart = after.lastIndexOf("\n", start - 1) + 1;
+  const lines = after.slice(lineStart, after.length - end).split("\n");
+  const shown = lines.slice(-LIVE_EDIT_LINES);
+  if (!shown.some((l) => l.trim())) return null;
+  return (
+    <div className="my-0.5 ml-5 overflow-hidden rounded-md border border-[var(--border-soft)] bg-[var(--bg-app)] font-mono text-[11px] leading-[1.5]">
+      {lines.length > shown.length && (
+        <div className="px-2 text-[var(--text-dim)]">⋯ {lines.length - shown.length} more lines</div>
+      )}
+      {shown.map((l, i) => (
+        <div key={i} className="diff-line--add truncate whitespace-pre px-2">
+          {l || " "}
+        </div>
+      ))}
     </div>
   );
 }

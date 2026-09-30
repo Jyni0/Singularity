@@ -129,15 +129,16 @@ pub fn push_event(run_id: &str, ev: RunEvent) {
                 *last = ev;
                 return;
             }
-            // Live card updates of a call still streaming its arguments
-            // replace the previous update instead of stacking up.
-            if let (
-                RunEvent::Step { index, done: false, .. },
-                Some(last @ RunEvent::Step { done: false, .. }),
-            ) = (&ev, slot.events.last_mut())
-            {
-                if matches!(last, RunEvent::Step { index: i, .. } if i == index) {
-                    *last = ev;
+            // A card's newer state replaces its unfinished one instead of
+            // stacking up — wherever it is: parallel calls interleave, and a
+            // live edit carries the whole file each time.
+            if let RunEvent::Step { index, .. } = &ev {
+                let open = slot
+                    .events
+                    .iter()
+                    .rposition(|e| matches!(e, RunEvent::Step { index: i, done: false, .. } if i == index));
+                if let Some(at) = open {
+                    slot.events[at] = ev;
                     return;
                 }
             }

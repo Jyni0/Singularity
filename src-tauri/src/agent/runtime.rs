@@ -30,7 +30,7 @@ use rig_agent::agent::{
     MultiTurnStreamItem, ObservationAction, StreamResponseFinish, ToolCall, ToolCallAction,
     ToolCallDelta, ToolResultAction, ToolResultEvent,
 };
-use rig_agent::core::completion::message::{ImageMediaType, Message, UserContent};
+use rig_agent::core::completion::message::{AssistantContent, ImageMediaType, Message, UserContent};
 use rig_agent::core::streaming::StreamedAssistantContent;
 use rig_agent::core::tool::{ToolExecutionError, ToolOutput};
 use rig_agent::core::wasm_compat::WasmBoxedFuture;
@@ -303,10 +303,16 @@ struct LiveCall {
     name: String,
     args: String,
     shown: usize,
+    /// When the card was last updated (edits update on a timer).
+    at: Option<std::time::Instant>,
+    /// An edit's target as it is on disk (read once): (path, content).
+    before: Option<(String, Option<String>)>,
 }
 
 /// Argument growth (chars) between two live card updates.
 const LIVE_ARGS_STEP: usize = 400;
+/// Pause between two live previews of an edit being written.
+const LIVE_EDIT_EVERY: std::time::Duration = std::time::Duration::from_millis(90);
 /// Identical consecutive tool calls tolerated before they are skipped.
 const REPEAT_SKIP_AT: usize = 3;
 /// …and before the run is stopped outright.
@@ -337,6 +343,8 @@ const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 /// The latest model request of one logical run — (prompt, history) exactly
 /// as Rig is about to send it. After a failure the run resumes from here.
 type Snapshot = Arc<Mutex<Option<(Message, Vec<Message>)>>>;
+/// The assistant content of the latest finished model turn.
+type Finished = Arc<Mutex<Option<Vec<AssistantContent>>>>;
 
 struct UiHook {
     ctx: RunCtx,
@@ -350,10 +358,12 @@ struct UiHook {
     cleared: Mutex<usize>,
     /// Files this agent has read; forgotten when old results get stubbed.
     memo: ReadMemo,
+    /// What the model answered in its latest finished turn.
+    finished: Finished,
 }
 
 impl UiHook {
-    fn new(ctx: RunCtx, label: Option<&str>, snapshot: Snapshot, memo: ReadMemo) -> Self {
+    fn new(ctx: RunCtx, label: Option<&str>, snapshot: Snapshot, memo: ReadMemo, finished: Finished) -> Self {
         Self {
             ctx,
             snapshot,
@@ -363,6 +373,7 @@ impl UiHook {
             last_call: Mutex::new((String::new(), 0)),
             cleared: Mutex::new(0),
             memo,
+            finished,
         }
     }
 
@@ -379,7 +390,6 @@ impl AgentHook for UiHook {
         if is_cancelled(&self.ctx.run_id) {
             return CompletionCallAction::Stop(crate::cancel::STOPPED.to_string());
         }
-        *self.snapshot.lock().unwrap() = Some((event.prompt.clone(), event.history.to_vec()));
         let req = &self.ctx.req;
         let key = if req.provider_id.is_empty() { req.base_url.clone() } else { req.provider_id.clone() };
         let permit = crate::limiter::acquire(&key, req.rate_limit_rpm, req.concurrency, &self.ctx.run_id).await;
@@ -392,6 +402,10 @@ impl AgentHook for UiHook {
             // Earlier file contents may be stubs now: reading again is real.
             self.memo.forget();
         }
+        // The history exactly as it goes out (stubs included): a retry and
+        // the next message continue from these bytes, so the cache holds.
+        let sent = patched.clone().unwrap_or_else(|| event.history.to_vec());
+        *self.snapshot.lock().unwrap() = Some((event.prompt.clone(), sent));
         match patched {
             Some(history) => CompletionCallAction::patch(rig_agent::agent::RequestPatch::new().history(history)),
             None => CompletionCallAction::Continue,
@@ -400,8 +414,9 @@ impl AgentHook for UiHook {
 
     /// The provider slot is free once the stream ends — tools and approval
     /// banners must not hold it.
-    async fn on_stream_response_finish(&self, _ctx: &HookContext, _event: StreamResponseFinish<'_>) -> ObservationAction {
+    async fn on_stream_response_finish(&self, _ctx: &HookContext, event: StreamResponseFinish<'_>) -> ObservationAction {
         self.permit.lock().unwrap().take();
+        *self.finished.lock().unwrap() = Some(event.content.clone());
         ObservationAction::Continue
     }
 
@@ -418,16 +433,30 @@ impl AgentHook for UiHook {
             }
             call.args.push_str(event.delta);
             let first = call.shown == 0;
-            if call.name.is_empty() || (!first && call.args.len() < call.shown + LIVE_ARGS_STEP) {
+            let edit = matches!(call.name.as_str(), "write_file" | "apply_patch");
+            // An edit shows the file taking shape as the model writes it —
+            // on a short timer; other cards only every few hundred chars.
+            let due = if edit {
+                call.args.len() > call.shown && call.at.is_none_or(|t| t.elapsed() >= LIVE_EDIT_EVERY)
+            } else {
+                call.args.len() >= call.shown + LIVE_ARGS_STEP
+            };
+            if call.name.is_empty() || (!first && !due) {
                 None
             } else {
                 call.shown = call.args.len().max(1);
-                Some((call.name.clone(), live_summary(&call.name, &call.args)))
+                call.at = Some(std::time::Instant::now());
+                let preview = if edit { live_edit(call, &self.ctx.cwd()) } else { None };
+                Some((call.name.clone(), live_summary(&call.name, &call.args), preview))
             }
         };
-        if let Some((name, input)) = update {
+        if let Some((name, input, preview)) = update {
             let idx = self.ctx.live_step(event.internal_call_id);
-            self.step(idx, &name, input, false, &tools::ToolResult::ok(""));
+            let res = match preview {
+                Some((path, old, new)) => tools::ToolResult::ok("").with_change(&path, old, new),
+                None => tools::ToolResult::ok(""),
+            };
+            self.step(idx, &name, input, false, &res);
         }
         ObservationAction::Continue
     }
@@ -688,6 +717,93 @@ fn live_summary(name: &str, args: &str) -> String {
     } else {
         format!("{head} … ({} chars)", args.len())
     }
+}
+
+/// The file an edit is writing, as it will look once the arguments that
+/// arrived so far are applied: (path, before, after). write_file shows its
+/// content so far; apply_patch its finished SEARCH/REPLACE blocks plus the
+/// one being written. None until the path is complete.
+fn live_edit(call: &mut LiveCall, cwd: &Path) -> Option<(String, Option<String>, String)> {
+    let path = json_string(&call.args, "path", false)?;
+    if path.trim().is_empty() {
+        return None;
+    }
+    if call.before.as_ref().is_none_or(|(p, _)| *p != path) {
+        let text = tools::resolve(cwd, &path).ok().and_then(|f| std::fs::read_to_string(f).ok());
+        call.before = Some((path.clone(), text));
+    }
+    let before = call.before.as_ref().and_then(|(_, t)| t.clone());
+    let after = if call.name == "write_file" {
+        json_string(&call.args, "content", true)?
+    } else {
+        preview_patch(before.as_deref().unwrap_or(""), &json_string(&call.args, "diff", true)?)
+    };
+    Some((path, before, after))
+}
+
+/// `text` with the SEARCH/REPLACE blocks of a (possibly unfinished) diff
+/// applied — exact matches only; it is a preview, the tool decides.
+fn preview_patch(text: &str, diff: &str) -> String {
+    let mut out = text.to_string();
+    let mut swap = |search: &str, replace: &str| {
+        if search.trim().is_empty() {
+            out = replace.to_string();
+        } else if let Some(at) = out.find(search) {
+            out.replace_range(at..at + search.len(), replace);
+        }
+    };
+    for (search, replace) in tools::parse_patch(diff) {
+        swap(&search, &replace);
+    }
+    // The block still being written: its SEARCH is complete once the
+    // ======= line arrived; the REPLACE side so far takes its place.
+    let lines: Vec<&str> = diff.lines().collect();
+    let open = lines.iter().rposition(|l| l.trim_start().starts_with("<<<<<<<"));
+    if let Some(open) = open {
+        let rest = &lines[open + 1..];
+        if !rest.iter().any(|l| l.trim_start().starts_with(">>>>>>>")) {
+            if let Some(mid) = rest.iter().position(|l| l.trim() == "=======") {
+                swap(&rest[..mid].join("\n"), &rest[mid + 1..].join("\n"));
+            }
+        }
+    }
+    out
+}
+
+/// A string field of a possibly truncated JSON object, unescaped. `open`:
+/// accept a value still being written (no closing quote yet).
+fn json_string(json: &str, key: &str, open: bool) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let at = json.find(&pat)? + pat.len();
+    let rest = json[at..].trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                'b' => out.push('\u{8}'),
+                'f' => out.push('\u{c}'),
+                'u' => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    let mut code = u32::from_str_radix(&hex, 16).ok()?;
+                    // A surrogate pair: the low half follows as \uXXXX.
+                    if (0xD800..0xDC00).contains(&code) {
+                        let tail: String = chars.by_ref().take(6).collect();
+                        let low = tail.strip_prefix("\\u").and_then(|h| u32::from_str_radix(h, 16).ok())?;
+                        code = 0x10000 + ((code - 0xD800) << 10) + (low.wrapping_sub(0xDC00) & 0x3FF);
+                    }
+                    out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                }
+                other => out.push(other),
+            },
+            c => out.push(c),
+        }
+    }
+    open.then_some(out)
 }
 
 /// Reads a string field out of a possibly truncated JSON object.
@@ -1362,9 +1478,11 @@ async fn run_with_retry(
     mut history: Vec<Message>,
     parallel: usize,
     to_ui: bool,
+    carry: Option<&Mutex<Option<Vec<Message>>>>,
     mut on_text: impl FnMut(&str),
 ) -> Result<String, String> {
     let snapshot: Snapshot = Arc::default();
+    let finished: Finished = Arc::default();
     // One per agent history: a retry resumes the same history, so the reads
     // it remembers are still in it.
     let memo = ReadMemo::default();
@@ -1377,11 +1495,22 @@ async fn run_with_retry(
             .max_turns(MAX_TURNS)
             // Several delegate calls in one turn run side by side.
             .tool_concurrency(parallel)
-            .add_hook(UiHook::new(ctx.clone(), label, snapshot.clone(), memo.clone()))
+            .add_hook(UiHook::new(ctx.clone(), label, snapshot.clone(), memo.clone(), finished.clone()))
             .await;
         let (part, err) = drive(ctx, stream, &seen, to_ui, &mut on_text).await;
         text.push_str(&part);
         let Some(err) = err else {
+            // The whole conversation as the model saw it: the last request
+            // plus the answer it gave to it.
+            if let (Some(out), Some((p, mut h)), Some(answer)) =
+                (carry, snapshot.lock().unwrap().take(), finished.lock().unwrap().take())
+            {
+                h.push(p);
+                if !answer.is_empty() {
+                    h.push(Message::Assistant { id: None, content: answer });
+                }
+                *out.lock().unwrap() = Some(h);
+            }
             return Ok(text);
         };
         if err.starts_with(crate::cancel::STOPPED) || is_cancelled(&ctx.run_id) {
@@ -1444,7 +1573,7 @@ async fn run_subagent(ctx: &RunCtx, def: &SubagentDef, task: &str, card: Option<
     // Helpers batch their own independent tool calls too (several reads /
     // searches in one turn run side by side).
     let parallel = ctx.req.max_agents.clamp(1, 8);
-    let result = run_with_retry(ctx, &preamble, |memo| fs_tools(ctx, memo), Some(&def.name), Message::user(task), Vec::new(), parallel, false, |t| {
+    let result = run_with_retry(ctx, &preamble, |memo| fs_tools(ctx, memo), Some(&def.name), Message::user(task), Vec::new(), parallel, false, None, |t| {
         partial.push_str(t);
         // Live progress in the delegate card, throttled.
         if let Some(idx) = card {
@@ -1611,6 +1740,7 @@ pub(super) async fn run(
     system: &str,
     root: &Path,
     turns: Vec<crate::chat::ChatTurn>,
+    full: &[crate::chat::ChatTurn],
 ) -> Result<String, String> {
     let parallel = req.max_agents.clamp(1, MAX_AGENTS);
     let req = &with_worker(req);
@@ -1675,17 +1805,102 @@ pub(super) async fn run(
     let turns = expand_turns(skills.clone(), root, turns).await?;
     ctx.usage.lock().unwrap().first_est =
         measure(req, system, root, &skills, &mcp, &turns, None).iter().map(|p| p.tokens as u64).sum();
-    let (history, prompt) = to_messages(req, &turns);
+    let (mut history, prompt) = to_messages(req, &turns);
+    // The previous answer of this very chat, as the model saw it (tool calls
+    // and results included): the request then starts with exactly the bytes
+    // the last one sent, and the provider's cache covers all of it.
+    if let Some(carried) = carry_take(req, full) {
+        history = carried;
+    }
+    let carry_out = Mutex::new(None);
     // The main agent may run many tool calls of one turn at once (parallel
     // reads, several delegations); at least a handful even with one helper.
     let tool_parallel = parallel.max(8);
-    let text = run_with_retry(&ctx, &preamble, tools, None, prompt, history, tool_parallel, true, |_| {}).await?;
+    let text = run_with_retry(&ctx, &preamble, tools, None, prompt, history, tool_parallel, true, Some(&carry_out), |_| {}).await?;
+    if let Some(messages) = carry_out.into_inner().unwrap() {
+        carry_put(req, full, messages);
+    }
     if text.trim().is_empty() && ctx.counter.load(Ordering::SeqCst) == 0 {
         return Err(
             "the model returned an empty answer — its output may have been reasoning-only; retry, or try another model/effort level".into(),
         );
     }
     Ok(text)
+}
+
+/* ---------- Carried conversation ---------- */
+
+/// Conversations kept at once (one per recently used chat).
+const CARRY_KEEP: usize = 8;
+
+/// The model-level history of recently finished runs, by the chat they
+/// continue. The chat itself only keeps each answer's text (and a list of
+/// its tool calls), so the next message used to start from a rebuilt,
+/// shorter history — a different prompt, which the provider's cache could
+/// not serve past the system prompt: 30-60% cache while Claude Code, which
+/// keeps the conversation as sent, stays above 90%.
+static CARRY: Mutex<Vec<(u64, Vec<Message>)>> = Mutex::new(Vec::new());
+
+/// Identifies a chat state on one provider + model: the turns the run got.
+fn carry_key(req: &AgentRequest, turns: &[crate::chat::ChatTurn]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (&req.kind, &req.provider_id, &req.base_url, &req.model, &req.workspace, &req.effort, &req.disabled_tools).hash(&mut h);
+    for t in turns {
+        (&t.role, &t.text).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Whether the provider serves a repeated prefix from a cache (Anthropic,
+/// OpenAI, Gemini, DeepSeek, the subscription CLIs…). A local model has a
+/// small window and no discount: there the longer history would only cost.
+fn carries(req: &AgentRequest) -> bool {
+    let url = req.base_url.to_lowercase();
+    req.kind != "ollama" && !["localhost", "127.0.0.1", "0.0.0.0", "[::1]"].iter().any(|h| url.contains(h))
+}
+
+/// Largest carried history (serialized chars); beyond it the next message
+/// starts from the chat's own compact history again.
+fn carry_cap(req: &AgentRequest) -> usize {
+    if req.model.to_lowercase().contains("claude") {
+        CLEAR_TRIGGER_CHARS_CLAUDE * 2
+    } else {
+        CLEAR_TRIGGER_CHARS * 2
+    }
+}
+
+/// The carried history when this run continues the chat of a finished one:
+/// the turns are that run's turns + its answer + one new prompt. An edited,
+/// resent, regenerated or compacted chat, or another model, starts afresh.
+fn carry_take(req: &AgentRequest, full: &[crate::chat::ChatTurn]) -> Option<Vec<Message>> {
+    if !carries(req) {
+        return None;
+    }
+    let n = full.len();
+    let is_agent = |r: &str| r == "agent" || r == "assistant";
+    if n < 3 || !is_agent(&full[n - 2].role) || is_agent(&full[n - 1].role) {
+        return None;
+    }
+    let key = carry_key(req, &full[..n - 2]);
+    let mut store = CARRY.lock().unwrap();
+    let at = store.iter().position(|(k, _)| *k == key)?;
+    let (_, messages) = store.remove(at);
+    let size: usize = messages.iter().map(|m| serde_json::to_string(m).map(|j| j.len()).unwrap_or(0)).sum();
+    (size <= carry_cap(req)).then_some(messages)
+}
+
+fn carry_put(req: &AgentRequest, full: &[crate::chat::ChatTurn], messages: Vec<Message>) {
+    if !carries(req) {
+        return;
+    }
+    let key = carry_key(req, full);
+    let mut store = CARRY.lock().unwrap();
+    store.retain(|(k, _)| *k != key);
+    store.push((key, messages));
+    if store.len() > CARRY_KEEP {
+        store.remove(0);
+    }
 }
 
 /* ---------- Context view ---------- */
@@ -1951,6 +2166,30 @@ mod tests {
         let a: Value = serde_json::from_str(r#"{ "agent": "X",  "task": "t" }"#).unwrap();
         let b: Value = serde_json::from_str(r#"{"agent":"X","task":"t"}"#).unwrap();
         assert_eq!(canonical(&a), canonical(&b));
+    }
+}
+
+#[cfg(test)]
+mod live_edit_tests {
+    use super::*;
+
+    #[test]
+    fn json_string_reads_open_and_escaped_values() {
+        let args = r#"{"path": "src/a.ts", "content": "line1\nПри\"вет\u00e9\ud83d\ude00 and mo"#;
+        assert_eq!(json_string(args, "path", false).as_deref(), Some("src/a.ts"));
+        assert_eq!(json_string(args, "content", false), None);
+        assert_eq!(json_string(args, "content", true).as_deref(), Some("line1\nПри\"ветé😀 and mo"));
+        // A dangling escape at the very end is simply not there yet.
+        assert_eq!(json_string(r#"{"path": "a\"#, "path", true), None);
+    }
+
+    #[test]
+    fn patch_preview_applies_finished_and_running_blocks() {
+        let text = "a\nb\nc\nd";
+        let diff = "<<<<<<< SEARCH\nb\n=======\nB\n>>>>>>> REPLACE\n<<<<<<< SEARCH\nd\n=======\nD1\nD";
+        assert_eq!(preview_patch(text, diff), "a\nB\nc\nD1\nD");
+        // SEARCH still being written: nothing to place yet.
+        assert_eq!(preview_patch(text, "<<<<<<< SEARCH\nc"), text);
     }
 }
 

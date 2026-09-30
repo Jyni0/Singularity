@@ -329,9 +329,10 @@ pub async fn run_agent(
 
     // Only the recent conversation goes on the wire, with old answers
     // clipped — the whole chat history used to ride along on every round.
+    let full = turns.clone();
     let turns = context::trim_history(turns);
 
-    let result = runtime::run(&app, &run_id, &req, &system, &root, turns).await;
+    let result = runtime::run(&app, &run_id, &req, &system, &root, turns, &full).await;
 
     crate::cancel::clear(&run_id);
 

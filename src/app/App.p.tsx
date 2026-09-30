@@ -34,6 +34,7 @@ import { ScheduleModal } from "../settings/ScheduleModal.c";
 import { SettingsModal } from "../settings/SettingsModal.c";
 import type { SettingsSection } from "../settings/SettingsModal.c";
 import { ScrollArea, Button, cx } from "../components";
+import { WorkspaceContext } from "../chat/copyPath.c";
 
 /** Loose chats (no folder). Kept as a real entry so every row action just works. */
 const NO_PROJECT_ENTRY: Project = {
@@ -970,6 +971,7 @@ export default function App() {
   }, []);
 
   return (
+    <WorkspaceContext.Provider value={workspaceOf(activeConv?.project ?? newChatProject)}>
     <div className="flex h-full flex-col">
       <TitleBar
         mode={mode}
@@ -1554,6 +1556,7 @@ export default function App() {
         </AnimatePresence>
       </div>
     </div>
+    </WorkspaceContext.Provider>
   );
 }
 

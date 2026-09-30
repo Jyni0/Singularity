@@ -9,6 +9,7 @@
  */
 import { useState, type ReactNode } from "react";
 import { Bot, Brain, Check, Copy, Eye, FileDiff, FilePlus2, FolderOpen, Pencil, Search, Server, Terminal, Wrench, ChevronRight, Sparkles, Plug, FileSearch, CornerDownRight, FolderCog, GitBranch, Globe, Link2, Activity } from "lucide-react";
+import { CopyPathButton } from "./copyPath.c";
 import { ScrollBox, FileIcon, baseName, dirName, Spinner } from "../components";
 
 /* ---------- Inline formatting ---------- */
@@ -509,6 +510,9 @@ export function ToolCall({ call }: { call: ToolCallView }) {
         <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-[var(--text-dim)]">{extra}</span>
       )}
       <span className="flex-1" />
+      {path !== null && FILE_TOOLS.has(call.name) && (
+        <CopyPathButton path={path} className="opacity-0 group-hover/tool:opacity-100" />
+      )}
       {!running && !ok && (
         <span className="shrink-0 text-[10.5px] text-[var(--diff-del)]">failed</span>
       )}

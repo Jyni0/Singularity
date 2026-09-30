@@ -171,9 +171,13 @@ fn tool_protocol(req: &CompletionRequest) -> String {
          yourself: my app runs them for you when your reply contains a request line. Do not use \
          your own built-in tools for this work. The request line format is exactly:\n\
          <tool_call>{\"name\": \"TOOL_NAME\", \"arguments\": { ... }}</tool_call>\n\
-         The arguments must be valid JSON matching the tool's schema. You may write several \
-         request lines in one reply. After them, STOP writing: my app runs them and sends the \
-         results back as <tool_result> blocks. Never invent a result.\n\n## Tools\n",
+         The arguments must be valid JSON matching the tool's schema: inside a string write a line \
+         break as \\n, a quote as \\\" and a backslash as \\\\ (a diff or file body is ONE JSON \
+         string). You may write several request lines in one reply. After them, STOP writing: my \
+         app runs them and sends the results back as <tool_result> blocks. Never invent a result.\n\
+         Your own built-in tools (shell, apply_patch, file edits) run in a read-only sandbox here: \
+         they cannot change my files, and an edit made with them is lost. Every change to my files \
+         goes through my app's apply_patch / write_file request lines.\n\n## Tools\n",
     );
     for t in &req.tools {
         out.push_str(&format!(
@@ -276,18 +280,99 @@ fn partial_suffix(s: &str, tag: &str) -> usize {
 
 fn parse_call(body: &str) -> Piece {
     let json = body.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
-    match serde_json::from_str::<Value>(json) {
+    // Strict first; then the usual slips of a model writing JSON by hand —
+    // raw line breaks and bare quotes inside a diff, `C:\path` backslashes,
+    // trailing commas. A call that still does not parse reaches the agent
+    // as a call carrying the parse error, so the model is told exactly what
+    // to fix — as plain text it was "a tool call written as text" and the
+    // model went round in circles.
+    let parsed = serde_json::from_str::<Value>(json).or_else(|e| serde_json::from_str::<Value>(&repair_json(json)).map_err(|_| e));
+    match parsed {
         Ok(v) if v.get("name").and_then(Value::as_str).is_some() => {
             let name = v["name"].as_str().unwrap_or_default().to_string();
             let arguments = match v.get("arguments").or_else(|| v.get("parameters")) {
-                Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Object(Default::default())),
+                Some(Value::String(s)) => serde_json::from_str(s)
+                    .or_else(|_| serde_json::from_str(&repair_json(s)))
+                    .unwrap_or_else(|e| serde_json::json!({ INVALID_JSON: e.to_string() })),
                 Some(a) if a.is_object() => a.clone(),
                 _ => Value::Object(Default::default()),
             };
             Piece::Call { name, arguments }
         }
+        Err(e) => match call_name(json) {
+            Some(name) => Piece::Call { name, arguments: serde_json::json!({ INVALID_JSON: e.to_string() }) },
+            None => Piece::Text(format!("{OPEN}{body}{CLOSE}")),
+        },
         _ => Piece::Text(format!("{OPEN}{body}{CLOSE}")),
     }
+}
+
+/// Argument key of a call whose JSON could not be read; the agent answers
+/// such a call with the error instead of running the tool.
+pub const INVALID_JSON: &str = "__invalid_json";
+
+/// The tool name of a request line whose JSON is broken.
+fn call_name(json: &str) -> Option<String> {
+    static NAME: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#""name"\s*:\s*"([A-Za-z_][\w.-]*)""#).unwrap());
+    NAME.captures(json).map(|c| c[1].to_string())
+}
+
+/// Best-effort repair of hand-written JSON: inside strings, raw control
+/// characters are escaped, a backslash before a non-escape char is doubled,
+/// and a quote not followed by `, } ] :` (or the end) is taken as part of
+/// the text; outside strings, trailing commas go.
+fn repair_json(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut in_str = false;
+    let next_solid = |from: usize| chars[from..].iter().find(|c| !c.is_whitespace()).copied();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if !in_str {
+            match c {
+                '"' => in_str = true,
+                ',' if matches!(next_solid(i + 1), Some('}' | ']')) => {
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match c {
+            '\\' => match chars.get(i + 1) {
+                Some(n @ ('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't')) => {
+                    out.push('\\');
+                    out.push(*n);
+                    i += 2;
+                    continue;
+                }
+                Some('u') if chars.get(i + 2..i + 6).is_some_and(|h| h.iter().all(|c| c.is_ascii_hexdigit())) => {
+                    out.push('\\');
+                }
+                _ => out.push_str("\\\\"),
+            },
+            '"' => {
+                if matches!(next_solid(i + 1), None | Some(',' | '}' | ']' | ':')) {
+                    in_str = false;
+                    out.push('"');
+                } else {
+                    out.push_str("\\\"");
+                }
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -320,6 +405,34 @@ mod tests {
                 Piece::Text("done".into()),
             ]
         );
+    }
+
+    #[test]
+    fn hand_written_json_is_repaired() {
+        let call = |body: &str| parse_call(body);
+        // Raw line breaks, bare quotes and a Windows path inside strings.
+        let body = "{\"name\": \"apply_patch\", \"arguments\": {\"path\": \"C:\\src\\a.ts\", \"diff\": \"<<<<<<< SEARCH\nconst a = \"x\";\n=======\nconst a = \"y\";\n>>>>>>> REPLACE\",}}";
+        match call(body) {
+            Piece::Call { name, arguments } => {
+                assert_eq!(name, "apply_patch");
+                assert_eq!(arguments["path"], "C:\\src\\a.ts");
+                assert_eq!(arguments["diff"], "<<<<<<< SEARCH\nconst a = \"x\";\n=======\nconst a = \"y\";\n>>>>>>> REPLACE");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Valid JSON is untouched.
+        assert_eq!(
+            call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\\\"b\"}}"),
+            Piece::Call { name: "read_file".into(), arguments: serde_json::json!({"path": "a\"b"}) }
+        );
+        // Beyond repair: still a call, carrying the error for the model.
+        match call("{\"name\": \"write_file\", \"arguments\": {\"path\": [}}") {
+            Piece::Call { name, arguments } => {
+                assert_eq!(name, "write_file");
+                assert!(arguments[INVALID_JSON].is_string());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

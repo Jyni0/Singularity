@@ -13,7 +13,7 @@
 
 mod install;
 mod model;
-mod protocol;
+pub(crate) mod protocol;
 mod usage;
 
 pub use model::CliModel;

@@ -499,6 +499,17 @@ impl AgentHook for UiHook {
         if event.tool_name == "delegate" {
             self.ctx.delegate_cards.lock().unwrap().insert(canonical(&args), idx);
         }
+        // A CLI model's request line whose JSON could not be read: nothing
+        // runs, the model gets the parser's error and how to write it.
+        if let Some(err) = args.get(crate::cli::protocol::INVALID_JSON).and_then(|v| v.as_str()) {
+            self.step(idx, event.tool_name, summary, true, &tools::ToolResult::err(format!("invalid call JSON: {err}")));
+            return ToolCallAction::Skip(format!(
+                "ERROR: this {} request line was not valid JSON ({err}), so nothing ran. Send it again as ONE line of valid JSON: \
+                 inside strings write line breaks as \\n, quotes as \\\" and backslashes as \\\\. \
+                 For a long change prefer several small apply_patch calls.",
+                event.tool_name
+            ));
+        }
 
         // Stuck-loop guard: the same call over and over gets skipped with a
         // nudge, then ends the run with what exists.
@@ -1875,7 +1886,14 @@ pub(super) async fn run(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let nudge = if is_text_tool_call(&said) {
+        let cli = crate::cli::Cli::from_kind(&req.kind).is_some();
+        let nudge = if is_text_tool_call(&said) && cli {
+            // CLI models call tools BY writing request lines; one that is
+            // left in the text was not a readable line.
+            "[Singularity] Your last message has a <tool_call> request line my app could not read, so nothing ran. \
+             Write each request line exactly as <tool_call>{\"name\": \"…\", \"arguments\": {…}}</tool_call> with valid JSON \
+             (inside strings: line breaks as \\n, quotes as \\\"), then stop and wait for the result."
+        } else if is_text_tool_call(&said) {
             "[Singularity] Your last message wrote a tool call as plain text, so nothing ran. \
              Call the tool through the tool-calling interface (not in your reply text) and continue the task."
         } else if announces_next_step(&reply) {

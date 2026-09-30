@@ -235,7 +235,7 @@ export type ProviderKind =
   | "google-cli";
 
 /** Provider kinds that authenticate through a vendor CLI (Codex, Claude Code, Antigravity CLI). */
-export const CLI_KINDS: ProviderKind[] = ["openai-cli", "anthropic-cli", "google-cli"];
+const CLI_KINDS: ProviderKind[] = ["openai-cli", "anthropic-cli", "google-cli"];
 
 export function isCliKind(kind: ProviderKind): boolean {
   return CLI_KINDS.includes(kind);
@@ -246,7 +246,7 @@ export type ProviderStatus = "ready" | "disconnected" | "error" | "checking";
 /** Reasoning effort requested from the model, where the provider supports it. */
 export type Effort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "ultracode";
 
-export const EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max", "ultra", "ultracode"];
+const EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max", "ultra", "ultracode"];
 
 /**
  * Effort levels a model accepts, lowest first. The provider sets the range:

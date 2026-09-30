@@ -63,7 +63,7 @@ const fromDraft = (d: Draft): db.McpServer => ({
 const EMPTY: Draft = { id: "", name: "", transport: "stdio", command: "npx", args: "-y\n", env: "", url: "", headers: "", enabled: true };
 
 /** `{"mcpServers": {...}}` (Claude Desktop / Cursor / VS Code style) → servers. */
-export function parseMcpJson(text: string): db.McpServer[] {
+function parseMcpJson(text: string): db.McpServer[] {
   const root = JSON.parse(text) as Record<string, unknown>;
   const map = (root.mcpServers ?? root.servers ?? root) as Record<string, Record<string, unknown>>;
   if (!map || typeof map !== "object" || Array.isArray(map)) throw new Error("Expected an object of servers");

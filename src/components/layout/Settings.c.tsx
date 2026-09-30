@@ -34,10 +34,3 @@ export function SettingsCard({ children, className }: { children: React.ReactNod
 export function Sep() {
   return <div className="h-px bg-[var(--border-soft)]" />;
 }
-
-/** Small uppercase heading over a group of cards. */
-export function SectionHeading({ children, className }: { children: React.ReactNode; className?: string }) {
-  return (
-    <div className={cx("px-1 text-[11px] font-medium uppercase tracking-wide text-[var(--text-dim)]", className)}>{children}</div>
-  );
-}

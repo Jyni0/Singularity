@@ -19,7 +19,7 @@ const EFFORT_LABEL: Record<Effort, string> = {
 const OPENAI_LABEL: Partial<Record<Effort, string>> = { low: "Light", xhigh: "Extra High" };
 
 /** Label of a level for this provider — Anthropic calls xhigh "Extra". */
-export function effortLabel(level: Effort, kind?: ProviderKind): string {
+function effortLabel(level: Effort, kind?: ProviderKind): string {
   if (kind === "openai-cli" && OPENAI_LABEL[level]) return OPENAI_LABEL[level]!;
   if (level === "xhigh" && kind === "anthropic-cli") return "Extra";
   return EFFORT_LABEL[level];
@@ -29,7 +29,7 @@ export function effortLabel(level: Effort, kind?: ProviderKind): string {
  * The effort section of the model menu: just the levels the selected
  * provider and model accept, one short row each.
  */
-export function EffortMenu({
+function EffortMenu({
   current,
   kind,
   meta,

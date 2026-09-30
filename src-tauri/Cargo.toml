@@ -47,6 +47,9 @@ aes-gcm = "0.11.1"
 # for a Russian locale), never UTF-8 — decoding it as UTF-8 produced the
 # "кириллица выглядит как мусор" bug.
 encoding_rs = "0.8"
+# Not imported directly (code goes through rig_agent::core), but rig-agent
+# pulls rig-core without default features: this line turns on its reqwest
+# client with rustls/http2/system proxy that cachenet.rs sends through.
 rig-core = "0.42"
 rig-agent = "0.42"
 # Unpacking the vendor CLIs' npm tarballs (cli/install.rs).

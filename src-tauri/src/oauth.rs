@@ -44,14 +44,6 @@ pub struct Tokens {
     pub scope: String,
 }
 
-impl Tokens {
-    /// Treats a token as expired 60s early to avoid racing the clock.
-    #[allow(dead_code)]
-    pub fn is_expired(&self) -> bool {
-        self.access_token.is_empty() || self.expires_at - 60 <= now()
-    }
-}
-
 pub fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

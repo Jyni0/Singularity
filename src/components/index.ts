@@ -18,9 +18,9 @@ export { RowMenu } from "./ui/RowMenu.c";
 export { ScrollArea, ScrollBox, OverlayScroll } from "./ui/ScrollArea.c";
 export { Thumb } from "./ui/Thumb.c";
 
-export { SettingRow, SettingsCard, Sep, SectionHeading } from "./layout/Settings.c";
+export { SettingRow, SettingsCard, Sep } from "./layout/Settings.c";
 export { NavItem, RowActions } from "./layout/Nav.c";
 
 export { FileIcon, baseName, dirName } from "./icons/FileIcon.c";
 export { OsLogo } from "./icons/OsLogo.c";
-export { ProviderLogo, GoogleMark, OpenAIMark, AnthropicMark } from "./icons/ProviderLogo.c";
+export { ProviderLogo, GoogleMark } from "./icons/ProviderLogo.c";

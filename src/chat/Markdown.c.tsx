@@ -410,7 +410,7 @@ const TOOL_META: Record<string, { icon: typeof Terminal; label: string }> = {
 };
 
 /** `mcp__github__create_issue` → "github · create_issue". */
-export function mcpLabel(name: string): string | null {
+function mcpLabel(name: string): string | null {
   const m = /^mcp__(.+?)__(.+)$/.exec(name);
   return m ? `${m[1]} · ${m[2]}` : null;
 }

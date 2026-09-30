@@ -24,14 +24,14 @@ import { storedToMsg } from "../chat/message.u";
 
 /** Opens a compacted history: the summary rides in front of the first
  *  message after it (also recognised by the Rust history trimmer). */
-export const COMPACT_MARKER = "[Summary of the earlier conversation — older messages were compacted]";
+const COMPACT_MARKER = "[Summary of the earlier conversation — older messages were compacted]";
 
 /**
  * The history as the model receives it. After a /compact, the latest
  * summary replaces everything before it: it is prefixed to the first user
  * message that follows (roles keep alternating for every provider).
  */
-export function modelTurns(history: Msg[]): db.ChatTurn[] {
+function modelTurns(history: Msg[]): db.ChatTurn[] {
   const at = history.map((m) => m.role).lastIndexOf("compact");
   const plain = (list: Msg[]) =>
     list

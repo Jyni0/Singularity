@@ -8,7 +8,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 /// Largest file we will read into the model context.
@@ -1110,6 +1110,7 @@ impl Shell {
 /// then next to a git.exe on PATH. (NOT System32\bash.exe — that is WSL.)
 #[cfg(windows)]
 pub fn git_bash() -> Option<PathBuf> {
+    use std::sync::OnceLock;
     static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
     FOUND
         .get_or_init(|| {
@@ -1241,6 +1242,7 @@ fn quiet_env(c: &mut Command) {
 
 /// `a && b` for Windows PowerShell 5.1, which has no `&&`: `a; if ($?) { b }`.
 /// Only for commands without quotes — inside a string `&&` is text.
+#[cfg(any(windows, test))]
 fn ps_and_chain(command: &str) -> String {
     if !command.contains("&&") || command.contains(['"', '\'']) {
         return command.to_string();

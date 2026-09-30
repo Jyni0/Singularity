@@ -3,3 +3,5 @@ dist
 src-tauri/target
 *.local
 .DS_Store
+*.tsbuildinfo
+vite.config.ts.timestamp-*

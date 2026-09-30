@@ -193,11 +193,6 @@ pub struct AgentRequest {
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
-    /// Kept for parity with the chat request shape; the agent authenticates the
-    /// same way (`bearer` for OpenAI-shaped APIs, `x-api-key` for Anthropic).
-    #[serde(default = "default_auth")]
-    #[allow(dead_code)]
-    pub auth: String,
     pub model: String,
     #[serde(default)]
     pub system: String,
@@ -278,10 +273,6 @@ pub struct SshUnitRef {
     /// Server row id — ssh_exec maps name → id with this.
     #[serde(default)]
     pub id: String,
-}
-
-fn default_auth() -> String {
-    "key".to_string()
 }
 
 /// What the next request of a conversation would carry, part by part

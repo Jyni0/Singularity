@@ -972,7 +972,7 @@ export interface CliUsage {
   windows: CliUsageWindow[];
 }
 
-export async function cliUsage(kind: string): Promise<CliUsage> {
+async function cliUsage(kind: string): Promise<CliUsage> {
   if (!inTauri) throw new Error("Needs the desktop shell");
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<CliUsage>("cli_usage", { kind });
@@ -2183,11 +2183,6 @@ export async function sshShellClose(sessionId: string): Promise<void> {
 }
 
 /** Live shells as [sessionId, serverId] pairs — attach instead of reopening. */
-export async function sshShellList(): Promise<[string, string][]> {
-  if (!inTauri) return [];
-  return sshInvoke<[string, string][]>("ssh_shell_list");
-}
-
 /* ---------- base64 helpers (binary-safe IPC) ---------- */
 
 function base64FromBytes(bytes: Uint8Array): string {

@@ -1,5 +1,3 @@
-import { cx } from "./cx.u";
-
 /* ==========================================================================
    Design tokens — the ONE place sizes, radii and control styles live.
 
@@ -28,7 +26,7 @@ export const CONTROL_RADIUS: Record<ControlSize, string> = {
 
 /** The one fill every control shares, and its hover. */
 export const CONTROL_FILL = "bg-[var(--bg-input)]";
-export const CONTROL_FILL_HOVER = "hover:bg-[var(--bg-elevated)]";
+const CONTROL_FILL_HOVER = "hover:bg-[var(--bg-elevated)]";
 
 /** Height + padding + text + radius of a control per size. */
 export const CONTROL_SIZE: Record<ControlSize, string> = {
@@ -38,7 +36,7 @@ export const CONTROL_SIZE: Record<ControlSize, string> = {
 };
 
 /** Square icon-only control per size. */
-export const ICON_SIZE: Record<ControlSize, string> = {
+const ICON_SIZE: Record<ControlSize, string> = {
   xs: "h-6 w-6 rounded-lg",
   sm: "h-7 w-7 rounded-lg",
   md: "h-9 w-9 rounded-xl",
@@ -56,10 +54,6 @@ export const BUTTON_VARIANT: Record<ButtonVariant, string> = {
   danger: "bg-[var(--diff-del)] font-medium text-white hover:opacity-90",
   "danger-ghost": "text-[var(--diff-del)] hover:bg-[var(--diff-del)]/10",
 };
-
-/** Class string of a button — for the rare element that cannot be <Button>. */
-export const button = (variant: ButtonVariant = "secondary", size: ControlSize = "md") =>
-  `${BUTTON_BASE} ${CONTROL_SIZE[size]} ${BUTTON_VARIANT[variant]}`;
 
 /** Icon-only button (toolbar / row actions). */
 export const iconButton = (size: ControlSize = "sm", variant: "ghost" | "secondary" = "ghost") =>
@@ -90,9 +84,6 @@ export const FIELD_LABEL = "mb-1.5 block text-[11px] font-medium text-[var(--tex
 /** Small uppercase heading over a group of cards / rows. */
 export const SECTION_HEADING = "px-1 text-[11px] font-medium uppercase tracking-wide text-[var(--text-dim)]";
 
-/** Width of the right-hand control column in settings rows. */
-export const CONTROL_W = "w-[240px]";
-
 /* ---------- Layout rows (sidebar, titlebar, menus) ---------- */
 
 /** Sidebar / titlebar row: h 32px, padding 0 8px, radius 12px, gap 10px — prefer <NavItem> */
@@ -108,25 +99,13 @@ export const ROW_HOVER =
 /** Active row: background highlight only (no other changes) */
 export const ROW_ACTIVE = "bg-[var(--hover-bg)]";
 
-/** Chip in prompt box: h 28px, padding 0 10px, radius 6px, 12px */
-export const CHIP =
-  "inline-flex h-7 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-2.5 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
-
 /** Chip in the prompt lip (model, effort): small and quiet. */
 export const LIP_CHIP =
   "inline-flex h-7 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-2 text-[12px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
 
-/** Context chip: h 24px, padding 0 8px, 11px */
-export const CHIP_CTX =
-  "inline-flex h-6 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-2 text-[11px] text-[var(--text-dim)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text-main)]";
-
 /* Settings controls share ONE geometry: h-9 (36px) tall, 240px wide in the
    right-hand control column — selects (Combobox), inputs and buttons all
    line up. */
-
-/** Settings button / input — kept for existing call sites; prefer <Button> / <Input>. */
-export const SBUTTON = button("secondary", "md");
-export const SINPUT = cx(input("md"), CONTROL_W);
 
 /** Tiny icon button revealed on row hover (⋮, +, pin).
  *  Hover paints a solid grey pill instead of a faint translucent wash. */
@@ -165,8 +144,5 @@ export const popMotion = (up = true) => ({
   exit: { opacity: 0, y: up ? 6 : -6, scale: 0.98 },
   transition: { duration: 0.13, ease: "easeOut" as const },
 });
-
-export const MENU_ITEM =
-  "flex h-8 w-full items-center gap-2 rounded-xl px-2 text-left text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]";
 
 /* ---------- Model selector (gateways → submenu flies right) ---------- */

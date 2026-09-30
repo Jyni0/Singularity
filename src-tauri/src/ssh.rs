@@ -1006,16 +1006,6 @@ pub async fn shell_close(session_id: &str) -> Result<(), String> {
     res
 }
 
-/// Every live shell: (session_id, server_id) — the frontend attaches to
-/// the one belonging to its server instead of opening a duplicate.
-pub async fn shell_list() -> Vec<(String, String)> {
-    let guard = SHELLS.lock().await;
-    guard
-        .as_ref()
-        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.server_id.clone())).collect())
-        .unwrap_or_default()
-}
-
 /// Kills every shell riding a server connection (called on disconnect).
 async fn close_shells(server_id: &str) {
     let ids: Vec<String> = {
@@ -2049,11 +2039,6 @@ pub async fn ssh_shell_snapshot(session_id: String) -> Result<String, String> {
 #[tauri::command]
 pub async fn ssh_shell_close(session_id: String) -> Result<(), String> {
     shell_close(&session_id).await
-}
-
-#[tauri::command]
-pub async fn ssh_shell_list() -> Vec<(String, String)> {
-    shell_list().await
 }
 
 #[tauri::command]

@@ -379,7 +379,6 @@ pub fn run() {
             ssh::ssh_shell_resize,
             ssh::ssh_shell_snapshot,
             ssh::ssh_shell_close,
-            ssh::ssh_shell_list,
             ssh::ssh_sftp_list,
             ssh::ssh_sftp_home,
             ssh::ssh_sftp_download,

@@ -12,7 +12,7 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 export const WorkspaceContext = createContext("");
 
 /** `src/a.ts` + `C:\proj` → `C:\proj\src\a.ts`; absolute paths stay. */
-export function absolutePath(path: string, workspace: string): string {
+function absolutePath(path: string, workspace: string): string {
   const p = path.trim();
   if (!workspace || /^([a-zA-Z]:[\\/]|[\\/]|~)/.test(p)) return p;
   const win = /^[a-zA-Z]:/.test(workspace) || workspace.includes("\\");
@@ -22,7 +22,7 @@ export function absolutePath(path: string, workspace: string): string {
 }
 
 /** System clipboard through the Tauri plugin; the WebView API as fallback. */
-export function copyText(text: string): Promise<void> {
+function copyText(text: string): Promise<void> {
   return writeText(text).catch(() => navigator.clipboard?.writeText(text));
 }
 

@@ -44,7 +44,7 @@ function parseField(src: string, [label, min, max]: [string, number, number]): S
   return out;
 }
 
-export function parseCron(expr: string): Cron {
+function parseCron(expr: string): Cron {
   const parts = expr.trim().split(/\s+/);
   if (parts.length !== 5) throw new Error("Cron needs 5 fields: minute hour day month weekday");
   const [minute, hour, dom, month, dow] = parts.map((p, i) => parseField(p, FIELDS[i]));

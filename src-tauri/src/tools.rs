@@ -780,21 +780,32 @@ fn parse_unified(diff: &str) -> Vec<(String, String)> {
     let mut hunks = Vec::new();
     let (mut old, mut new): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
     let mut inside = false;
-    let mut flush = |old: &mut Vec<&str>, new: &mut Vec<&str>| {
-        if old.iter().any(|l| !l.trim().is_empty()) && old != new {
+    // `*** Add File:` (Codex's apply_patch format): the whole body is new.
+    let mut adding = false;
+    let mut flush = |old: &mut Vec<&str>, new: &mut Vec<&str>, adding: bool| {
+        let fresh = adding && old.is_empty() && !new.is_empty();
+        if fresh || (old.iter().any(|l| !l.trim().is_empty()) && old != new) {
             hunks.push((old.join("\n"), new.join("\n")));
         }
         old.clear();
         new.clear();
     };
     for line in diff.lines() {
+        // Codex's format: `*** Update File: p` opens hunks that may come
+        // without any `@@` line; `*** Begin/End Patch` only frame them.
+        if line.starts_with("*** Update File:") || line.starts_with("*** Add File:") {
+            flush(&mut old, &mut new, adding);
+            inside = true;
+            adding = line.starts_with("*** Add File:");
+            continue;
+        }
         if line.starts_with("@@") {
-            flush(&mut old, &mut new);
+            flush(&mut old, &mut new, adding);
             inside = true;
             continue;
         }
         if line.starts_with("---") || line.starts_with("+++") || line.starts_with("diff ") || line.starts_with("index ") {
-            flush(&mut old, &mut new);
+            flush(&mut old, &mut new, adding);
             inside = false;
             continue;
         }
@@ -814,11 +825,11 @@ fn parse_unified(diff: &str) -> Vec<(String, String)> {
         } else if line.starts_with('\\') {
             // "\ No newline at end of file"
         } else {
-            flush(&mut old, &mut new);
+            flush(&mut old, &mut new, adding);
             inside = false;
         }
     }
-    flush(&mut old, &mut new);
+    flush(&mut old, &mut new, adding);
     hunks
 }
 
@@ -2180,9 +2191,17 @@ pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult
         "edit_file" => edit_file(root, s("path"), s("old_text"), s("new_text")),
         "apply_patch" => apply_patch(
             root,
-            s("path"),
+            // Codex's format names the file inside the diff.
+            match s("path").trim() {
+                "" => s("diff")
+                    .lines()
+                    .find_map(|l| l.strip_prefix("*** Update File:").or_else(|| l.strip_prefix("*** Add File:")))
+                    .map(str::trim)
+                    .unwrap_or(""),
+                p => p,
+            },
             s("diff"),
-            args.get("create").and_then(|v| v.as_bool()).unwrap_or(false),
+            args.get("create").and_then(|v| v.as_bool()).unwrap_or(false) || s("diff").contains("*** Add File:"),
         ),
         "list_dir" => list_dir(root, s("path")),
         "grep" => grep(root, s("pattern"), args.get("path").and_then(|v| v.as_str())),
@@ -2210,6 +2229,23 @@ pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult
 }
 
 /* ---------- Tests ---------- */
+
+#[cfg(test)]
+mod codex_patch_tests {
+    use super::parse_patch;
+
+    #[test]
+    fn update_file_hunks_without_at_lines() {
+        let diff = "*** Begin Patch\n*** Update File: src/a.ts\n const a = 1;\n-const b = 2;\n+const b = 3;\n*** End Patch";
+        assert_eq!(parse_patch(diff), vec![("const a = 1;\nconst b = 2;".to_string(), "const a = 1;\nconst b = 3;".to_string())]);
+    }
+
+    #[test]
+    fn add_file_is_one_create_hunk() {
+        let diff = "*** Begin Patch\n*** Add File: src/new.ts\n+export const x = 1;\n+export const y = 2;\n*** End Patch";
+        assert_eq!(parse_patch(diff), vec![(String::new(), "export const x = 1;\nexport const y = 2;".to_string())]);
+    }
+}
 
 #[cfg(test)]
 mod lenient_patch_tests {

@@ -178,12 +178,47 @@ struct CallCard {
 /// Arguments as an object: some providers send them as a JSON *string*
 /// (`"{\"command\":…}"`), which the hook and the tool then saw differently.
 fn norm_args(args: &Value) -> Value {
-    match args {
+    let mut v = match args {
         Value::String(s) => serde_json::from_str::<Value>(s)
             .ok()
             .filter(|v| v.is_object())
             .unwrap_or_else(|| args.clone()),
         _ => args.clone(),
+    };
+    coerce_types(&mut v);
+    v
+}
+
+/// Integer parameters of the built-in tools.
+const INT_ARGS: &[&str] = &["start_line", "end_line", "timeout_secs", "max_results", "start", "id", "max_chars"];
+/// Boolean parameters of the built-in tools.
+const BOOL_ARGS: &[&str] = &["create", "background"];
+
+/// Models often send numbers and booleans as strings (`"start_line": "2001"`)
+/// or floats (`2001.0`). The tools read them strictly, so such a value was
+/// silently ignored — read_file then returned line 1 onward again and again
+/// while the model asked for the next part: a read loop with no edit.
+fn coerce_types(args: &mut Value) {
+    let Value::Object(map) = args else { return };
+    for (k, v) in map.iter_mut() {
+        if INT_ARGS.contains(&k.as_str()) {
+            let n = match &*v {
+                Value::String(s) => s.trim().parse::<f64>().ok(),
+                Value::Number(n) if n.as_u64().is_none() => n.as_f64(),
+                _ => None,
+            };
+            if let Some(n) = n.filter(|n| n.is_finite() && *n >= 0.0) {
+                *v = json!(n.round() as u64);
+            }
+        } else if BOOL_ARGS.contains(&k.as_str()) {
+            if let Value::String(s) = &*v {
+                match s.trim().to_ascii_lowercase().as_str() {
+                    "true" | "yes" | "1" => *v = json!(true),
+                    "false" | "no" | "0" | "" => *v = json!(false),
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
@@ -1832,13 +1867,27 @@ pub(super) async fn run(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        if !is_text_tool_call(&said) || is_cancelled(run_id) {
+        let reply: String = content
+            .iter()
+            .filter_map(|c| match c {
+                AssistantContent::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let nudge = if is_text_tool_call(&said) {
+            "[Singularity] Your last message wrote a tool call as plain text, so nothing ran. \
+             Call the tool through the tool-calling interface (not in your reply text) and continue the task."
+        } else if announces_next_step(&reply) {
+            "[Singularity] Your last message announced a next step but ended without doing it — no tool was called. \
+             Do that step now with a tool call and continue until the task is done."
+        } else {
+            break;
+        };
+        if is_cancelled(run_id) {
             break;
         }
-        let nudge = Message::user(
-            "[Singularity] Your last message wrote a tool call as plain text, so nothing ran. \
-             Call the tool through the tool-calling interface (not in your reply text) and continue the task.",
-        );
+        let nudge = Message::user(nudge);
         emit_text(app, run_id, "\n\n".to_string());
         let more =
             run_with_retry(&ctx, &preamble, &tools, None, nudge, messages, tool_parallel, true, Some(&final_messages), memo.clone(), |_| {})
@@ -1883,6 +1932,37 @@ fn is_text_tool_call(text: &str) -> bool {
         t[start..].to_string()
     };
     CALL.is_match(&tail)
+}
+
+/// Whether an answer stops on an announcement of work it never did:
+/// "Now I'll update the handler:", "Сейчас исправлю файл…". A final summary
+/// ends on a statement, not on a colon or a "let me".
+fn announces_next_step(text: &str) -> bool {
+    use std::sync::LazyLock;
+    static NEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)^(let me|let's|now,? i('ll| will| am going to)|i('ll| will) now|next,? i('ll| will)|i('m| am) going to|сейчас|теперь (я )?(исправ|измен|обнов|добав|удал|перепиш|внес|сдела|посмотр|прочит|провер|созда|запущ)|далее|давай(те)?|приступаю|начну|перейду)",
+        )
+        .unwrap()
+    });
+    let t = text.trim_end();
+    if t.is_empty() {
+        return false;
+    }
+    let last = t.lines().last().unwrap_or("").trim();
+    if last.ends_with(':') || last.ends_with("...") || last.ends_with('…') {
+        return true;
+    }
+    // The last sentence of the last line.
+    let sentence = last
+        .trim_end_matches(['.', '!'])
+        .rsplit(['.', '!', '?'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches(['*', '-', ' ']);
+    // "Let me know if…" closes an answer, it announces nothing.
+    NEXT.is_match(sentence) && !sentence.to_lowercase().starts_with("let me know")
 }
 
 /* ---------- Context view ---------- */
@@ -2168,6 +2248,37 @@ mod text_call_tests {
         assert!(is_text_tool_call(r#"Reading it now: read_file({"path": "a"})"#));
         assert!(!is_text_tool_call("Done — I changed read_file handling in tools.rs and the build passes."));
         assert!(!is_text_tool_call("Use `functions` in JS as shown."));
+    }
+
+    #[test]
+    fn abandoned_announcements_are_seen() {
+        use super::announces_next_step as next;
+        assert!(next("I found the bug in the handler. Now I'll fix it:"));
+        assert!(next("Нашёл ошибку. Сейчас исправлю провайдер"));
+        assert!(next("Теперь обновлю компонент."));
+        assert!(next("Let me check the config..."));
+        assert!(!next("Готово: исправил обработчик в src/a.ts, сборка проходит."));
+        assert!(!next("Теперь всё работает."));
+        assert!(!next("Done. The build passes."));
+        assert!(!next("Fixed it. Let me know if you want more."));
+        assert!(!next("Какой вариант выбрать?"));
+        assert!(!next(""));
+    }
+}
+
+#[cfg(test)]
+mod coerce_tests {
+    use super::*;
+
+    #[test]
+    fn string_and_float_numbers_become_integers() {
+        let v = norm_args(&json!({ "path": "a", "start_line": "2001", "end_line": 2500.0, "create": "true", "background": "false" }));
+        assert_eq!(v, json!({ "path": "a", "start_line": 2001, "end_line": 2500, "create": true, "background": false }));
+        // Arguments sent as a JSON string get the same treatment.
+        let v = norm_args(&json!("{\"start_line\":\"7\"}"));
+        assert_eq!(v["start_line"], 7);
+        // Unknown keys and junk are left alone.
+        assert_eq!(norm_args(&json!({ "start_line": "abc", "command": "1" })), json!({ "start_line": "abc", "command": "1" }));
     }
 }
 

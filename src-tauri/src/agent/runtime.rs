@@ -852,6 +852,16 @@ impl ReadMemo {
         self.0.lock().unwrap().clear();
     }
 
+    /// An edit tool touched this file (applied or failed): the next read of
+    /// it is always real. A failed patch says "read the file again" — a
+    /// "you read it already" note there left the model rebuilding SEARCH
+    /// from memory, and missing again.
+    fn forget_path(&self, root: &Path, path: &str) {
+        if let Ok(full) = tools::resolve(root, path) {
+            self.0.lock().unwrap().remove(&full);
+        }
+    }
+
     fn read(&self, root: &Path, args: &Value) -> tools::ToolResult {
         // Files the user changed since are read for real (their hash moved).
         let line = |k: &str| args.get(k).and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok())).map(|n| n as usize);
@@ -939,9 +949,13 @@ fn fs_tools(ctx: &RunCtx, memo: &ReadMemo) -> Vec<DynamicTool> {
                                     .unwrap_or_else(|e| tools::ToolResult::err(format!("tool task failed: {e}")))
                             }
                             _ => {
+                                let root = c.cwd();
+                                if matches!(tool_name.as_str(), "apply_patch" | "write_file" | "edit_file" | "file_op") {
+                                    memo.forget_path(&root, &get("path"));
+                                    memo.forget_path(&root, &get("to"));
+                                }
                                 // Tools block (file IO, processes): keep the async
                                 // workers free so events keep flowing.
-                                let root = c.cwd();
                                 tokio::task::spawn_blocking(move || tools::dispatch(&root, &tool_name, &args))
                                     .await
                                     .unwrap_or_else(|e| tools::ToolResult::err(format!("tool task failed: {e}")))

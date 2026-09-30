@@ -292,6 +292,9 @@ pub fn locate(hay: &str, needle: &str, replace: &str) -> Result<(usize, usize, S
         let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
         hits = find(&|a, b| squash(a) == squash(b));
     }
+    if hits.is_empty() {
+        return locate_ignoring_blank_lines(&lines, &want, replace);
+    }
     if hits.len() != 1 {
         return Err(hits.len());
     }
@@ -318,6 +321,54 @@ pub fn locate(hay: &str, needle: &str, replace: &str) -> Result<(usize, usize, S
             .join("\n")
     };
     Ok((start, end, replace))
+}
+
+/// Last lenient pass of `locate`: blank lines dropped on both sides (models
+/// often lose or add one inside SEARCH), whitespace ignored. The match spans
+/// from the first to the last matched line of the file.
+fn locate_ignoring_blank_lines(lines: &[(usize, &str)], want: &[&str], replace: &str) -> Result<(usize, usize, String), usize> {
+    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let want: Vec<String> = want.iter().map(|l| squash(l)).filter(|l| !l.is_empty()).collect();
+    let body: Vec<(usize, String)> =
+        lines.iter().enumerate().map(|(i, (_, l))| (i, squash(l))).filter(|(_, l)| !l.is_empty()).collect();
+    if want.is_empty() || body.len() < want.len() {
+        return Err(0);
+    }
+    let hits: Vec<usize> =
+        (0..=body.len() - want.len()).filter(|&k| (0..want.len()).all(|j| body[k + j].1 == want[j])).collect();
+    if hits.len() != 1 {
+        return Err(hits.len());
+    }
+    let (first, last) = (body[hits[0]].0, body[hits[0] + want.len() - 1].0);
+    let indent = |l: &str| l[..l.len() - l.trim_start().len()].to_string();
+    let (have, real) = (indent(replace.lines().find(|l| !l.trim().is_empty()).unwrap_or("")), indent(lines[first].1));
+    let replace = if have == real || have.is_empty() && replace.trim().is_empty() {
+        replace.to_string()
+    } else {
+        replace
+            .split('\n')
+            .map(|l| match l.strip_prefix(have.as_str()) {
+                Some(rest) if !l.trim().is_empty() => format!("{real}{rest}"),
+                _ => l.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok((lines[first].0, lines[last].0 + lines[last].1.len(), replace))
+}
+
+/// Where a SEARCH that matched nowhere was probably aimed: the lines around
+/// its most distinctive line (the longest one) that still exists in the
+/// file, so the model sees the current text instead of guessing again.
+fn anchor_excerpt(file: &str, needle: &str) -> Option<String> {
+    let lines: Vec<&str> = file.lines().collect();
+    let mut candidates: Vec<&str> = needle.lines().map(str::trim).filter(|l| l.len() >= 12).collect();
+    candidates.sort_by_key(|l| std::cmp::Reverse(l.len()));
+    let at = candidates.iter().find_map(|c| lines.iter().position(|l| l.trim() == *c || l.contains(c)))?;
+    let from = at.saturating_sub(12);
+    let to = (at + 13).min(lines.len());
+    let body: String = (from..to).map(|n| format!("{:>5}  {}\n", n + 1, lines[n])).collect();
+    Some(format!(" The lines around where it was aimed, as they are NOW ({}-{}):\n{body}", from + 1, to))
 }
 
 /// Brings SEARCH/REPLACE text to the file's line endings (a CRLF file never
@@ -945,8 +996,8 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
                 }
                 Some((at, len, score, _)) if score >= 0.5 => {
                     let lines: Vec<&str> = current.lines().collect();
-                    let from = at.saturating_sub(2);
-                    let to = (at + len + 2).min(lines.len());
+                    let from = at.saturating_sub(6);
+                    let to = (at + len + 6).min(lines.len());
                     let snippet: String = (from..to).map(|n| format!("{:>5}  {}\n", n + 1, lines[n])).collect();
                     errors.push(format!(
                         "hunk {i}: SEARCH text not found in {path}. The closest part of the file ({:.0}% similar) is lines {}-{} — copy SEARCH from it EXACTLY (without the line numbers):\n{snippet}",
@@ -962,6 +1013,8 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
                     let now = if lines.len() <= 150 {
                         let body: String = lines.iter().enumerate().map(|(n, l)| format!("{:>5}  {l}\n", n + 1)).collect();
                         format!(" The file as it is NOW ({} lines):\n{body}", lines.len())
+                    } else if let Some(excerpt) = anchor_excerpt(&current, &needle) {
+                        excerpt
                     } else {
                         format!(" It has {} lines now — read_file the part you mean (its content may have changed since you read it).", lines.len())
                     };
@@ -2155,6 +2208,31 @@ pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult
 }
 
 /* ---------- Tests ---------- */
+
+#[cfg(test)]
+mod lenient_patch_tests {
+    use super::{anchor_excerpt, locate};
+
+    #[test]
+    fn blank_lines_inside_search_do_not_matter() {
+        let file = "fn a() {\n    let x = 1;\n\n    let y = 2;\n}\n";
+        // The model dropped the blank line (and re-spaced a line).
+        let (s, e, r) = locate(file, "    let x = 1;\n    let y=2;", "    let x = 1;\n    let y = 3;").unwrap();
+        let out = format!("{}{}{}", &file[..s], r, &file[e..]);
+        assert_eq!(out, "fn a() {\n    let x = 1;\n    let y = 3;\n}\n");
+        // An extra blank line in SEARCH is fine too.
+        assert!(locate(file, "let x = 1;\n\n\nlet y = 2;", "z").is_ok());
+    }
+
+    #[test]
+    fn a_missed_search_shows_where_it_was_aimed() {
+        let file: String = (1..=300).map(|i| format!("line {i} with some text\n")).collect();
+        let needle = "stale line that is gone\nline 150 with some text\nanother stale line";
+        let ex = anchor_excerpt(&file, needle).unwrap();
+        assert!(ex.contains("  150  line 150 with some text"), "{ex}");
+        assert!(anchor_excerpt(&file, "nothing\nof this\nexists anywhere here").is_none());
+    }
+}
 
 #[cfg(test)]
 mod similar_path_tests {

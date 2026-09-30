@@ -107,7 +107,10 @@ fn build_model(req: &AgentRequest) -> Result<ModelSetup, String> {
             // across rounds, so repeat rounds read them from Anthropic's cache.
             // Plus explicit breakpoints on tools + system, so that layer stays
             // cached across turns while the automatic one follows the history.
-            let model = client.completion_model(&req.model).with_automatic_caching().with_prompt_caching();
+            // 1-hour TTL, as Claude Code uses: with the 5-minute default a
+            // pause between messages (or a long Allow/Deny wait) dropped the
+            // whole cache and the next step paid the full prompt again.
+            let model = client.completion_model(&req.model).with_automatic_caching_1h().with_prompt_caching();
             let thinking = anthropic_thinking(effort);
             Ok(ModelSetup {
                 handle: ModelHandle::new(model),

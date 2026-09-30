@@ -252,7 +252,9 @@ fn result_chars(r: &rig_agent::core::completion::message::ToolResult) -> usize {
 /// Returns the history to send with the oldest bulky tool results stubbed
 /// (None = send it unchanged). `cleared` is the hook's watermark: it only
 /// ever moves forward, and only when the history outgrew the trigger.
-fn clear_old_results(history: &[Message], cleared: &mut usize) -> Option<Vec<Message>> {
+fn clear_old_results(history: &[Message], cleared: &mut usize, large: bool) -> Option<Vec<Message>> {
+    let (trigger, target) =
+        if large { (CLEAR_TRIGGER_CHARS_CLAUDE, CLEAR_TARGET_CHARS_CLAUDE) } else { (CLEAR_TRIGGER_CHARS, CLEAR_TARGET_CHARS) };
     use rig_agent::core::completion::message::ToolResultContent;
     // Clearable results in order: (message, content index, size). A helper's
     // report and loaded skill instructions are the agent's working notes —
@@ -274,8 +276,8 @@ fn clear_old_results(history: &[Message], cleared: &mut usize) -> Option<Vec<Mes
     *cleared = (*cleared).min(clearable);
     let total: usize = history.iter().map(|m| serde_json::to_string(m).map(|j| j.len()).unwrap_or(0)).sum();
     let freed = |n: usize| results[..n].iter().map(|r| r.2.saturating_sub(CLEARED_STUB.len())).sum::<usize>();
-    if total.saturating_sub(freed(*cleared)) > CLEAR_TRIGGER_CHARS {
-        while *cleared < clearable && total.saturating_sub(freed(*cleared)) > CLEAR_TARGET_CHARS {
+    if total.saturating_sub(freed(*cleared)) > trigger {
+        while *cleared < clearable && total.saturating_sub(freed(*cleared)) > target {
             *cleared += 1;
         }
     }
@@ -319,6 +321,11 @@ const GUARD_STOP: &str = "the model repeated the same action";
 /// between jumps and the provider's prompt cache keeps hitting.
 const CLEAR_TRIGGER_CHARS: usize = 160_000;
 const CLEAR_TARGET_CHARS: usize = 80_000;
+/// Claude (200k+ window): every clearing rewrites the prompt after the first
+/// stubbed result — a cache miss on all of it — while a cache read costs a
+/// tenth of fresh input, so it clears later and less often.
+const CLEAR_TRIGGER_CHARS_CLAUDE: usize = 400_000;
+const CLEAR_TARGET_CHARS_CLAUDE: usize = 200_000;
 /// Newest tool results that are never cleared.
 const CLEAR_KEEP_RECENT: usize = 6;
 /// Results shorter than this are not worth clearing.
@@ -379,7 +386,8 @@ impl AgentHook for UiHook {
         *self.permit.lock().unwrap() = Some(permit);
         let mut cleared = self.cleared.lock().unwrap();
         let before = *cleared;
-        let patched = clear_old_results(event.history, &mut cleared);
+        let large = req.model.to_lowercase().contains("claude");
+        let patched = clear_old_results(event.history, &mut cleared, large);
         if *cleared != before {
             // Earlier file contents may be stubs now: reading again is real.
             self.memo.forget();
@@ -1881,7 +1889,7 @@ mod tests {
         }
         history.push(Message::tool_result("d", "delegate", "y".repeat(10_000)));
         let mut cleared = 0;
-        let out = clear_old_results(&history, &mut cleared).expect("history over the trigger is edited");
+        let out = clear_old_results(&history, &mut cleared, false).expect("history over the trigger is edited");
         assert!(cleared > 0 && cleared <= 30 - CLEAR_KEEP_RECENT);
         assert_eq!(stub_count(&out), cleared);
         // The newest results and the helper's report stay verbatim.
@@ -1890,11 +1898,11 @@ mod tests {
         // Next turn with one more small result: the watermark holds (cache-stable).
         history.push(Message::tool_result("e", "list_dir", "z"));
         let before = cleared;
-        clear_old_results(&history, &mut cleared);
+        clear_old_results(&history, &mut cleared, false);
         assert_eq!(cleared, before);
         // Small histories are sent untouched.
         let mut zero = 0;
-        assert!(clear_old_results(&history[..3], &mut zero).is_none());
+        assert!(clear_old_results(&history[..3], &mut zero, false).is_none());
     }
 
     #[test]

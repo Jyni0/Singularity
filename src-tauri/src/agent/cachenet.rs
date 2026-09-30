@@ -13,6 +13,15 @@
 //!   cached_tokens`, Anthropic's `cache_read_input_tokens`, DeepSeek's
 //!   `prompt_cache_hit_tokens`); Rig reads only the first. The streamed
 //!   usage is sniffed so the HUD shows real hits.
+//! * Breakpoints ask for the 1-hour cache (as Claude Code does): with the
+//!   5-minute default everything was gone after a pause between messages
+//!   or a long Allow/Deny wait, and the next step paid the whole prompt
+//!   again. A gateway that refuses `ttl` gets plain 5-minute marks.
+//! * Responses streams from gateways often leave out fields Rig requires
+//!   (`sequence_number`, `output_index`, the item's `status`/`id`…) — one
+//!   such frame failed the whole request with "data did not match any
+//!   variant of untagged enum StreamingCompletionChunk". Frames are
+//!   repaired on the way in (see [`FrameFixer`]).
 
 use bytes::Bytes;
 use rig_agent::core::http_client::{self, HttpClientExt, LazyBody, MultipartForm, ReqwestClient, Request, Response, StreamingResponse};
@@ -23,6 +32,16 @@ use std::sync::{Arc, Mutex};
 
 /// Gateways (by host) that refused the breakpoints — never marked again.
 static REFUSED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Gateways (by host) that refused the 1-hour `ttl` — marked with 5 minutes.
+static NO_TTL: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn listed(set: &Mutex<Option<HashSet<String>>>, host: &str) -> bool {
+    set.lock().unwrap().as_ref().is_some_and(|s| s.contains(host))
+}
+
+fn list(set: &Mutex<Option<HashSet<String>>>, host: &str) {
+    set.lock().unwrap().get_or_insert_with(HashSet::new).insert(host.to_string());
+}
 
 /// Cache numbers read from the provider's own usage report.
 #[derive(Debug, Clone, Copy, Default)]
@@ -48,14 +67,23 @@ impl CacheClient {
     }
 
     fn refused(host: &str) -> bool {
-        REFUSED.lock().unwrap().as_ref().is_some_and(|s| s.contains(host))
+        listed(&REFUSED, host)
+    }
+}
+
+/// The breakpoint itself: 1-hour or the 5-minute default.
+fn cache_control(long: bool) -> Value {
+    if long {
+        json!({ "type": "ephemeral", "ttl": "1h" })
+    } else {
+        json!({ "type": "ephemeral" })
     }
 }
 
 /// Puts a cache breakpoint on a message: string content becomes one text
 /// part carrying `cache_control`; for part lists the last text part gets it.
-fn mark_message(msg: &mut Value) -> bool {
-    let cc = json!({ "type": "ephemeral" });
+fn mark_message(msg: &mut Value, long: bool) -> bool {
+    let cc = cache_control(long);
     match msg.get_mut("content") {
         Some(Value::String(s)) if !s.is_empty() => {
             let text = std::mem::take(s);
@@ -79,7 +107,7 @@ fn mark_message(msg: &mut Value) -> bool {
 
 /// Adds breakpoints to a chat/completions or /responses body; None = nothing
 /// to change.
-pub fn add_breakpoints(body: &[u8]) -> Option<Vec<u8>> {
+pub fn add_breakpoints(body: &[u8], long: bool) -> Option<Vec<u8>> {
     let mut v: Value = serde_json::from_slice(body).ok()?;
     // Responses: `instructions` is a plain string (no place for a mark), the
     // conversation is `input`. One mark on the newest user text or tool
@@ -90,8 +118,8 @@ pub fn add_breakpoints(body: &[u8]) -> Option<Vec<u8>> {
         })?;
         if last["type"] == "function_call_output" {
             let text = last["output"].as_str().unwrap_or("").to_string();
-            last["output"] = json!([{ "type": "input_text", "text": text, "cache_control": { "type": "ephemeral" } }]);
-        } else if !mark_message(last) {
+            last["output"] = json!([{ "type": "input_text", "text": text, "cache_control": cache_control(long) }]);
+        } else if !mark_message(last, long) {
             return None;
         }
         return serde_json::to_vec(&v).ok();
@@ -99,10 +127,10 @@ pub fn add_breakpoints(body: &[u8]) -> Option<Vec<u8>> {
     let msgs = v.get_mut("messages")?.as_array_mut()?;
     let mut changed = false;
     if let Some(sys) = msgs.iter_mut().find(|m| matches!(m["role"].as_str(), Some("system") | Some("developer"))) {
-        changed |= mark_message(sys);
+        changed |= mark_message(sys, long);
     }
     if let Some(last) = msgs.iter_mut().rev().find(|m| matches!(m["role"].as_str(), Some("user") | Some("tool"))) {
-        changed |= mark_message(last);
+        changed |= mark_message(last, long);
     }
     if !changed {
         return None;
@@ -167,18 +195,38 @@ impl HttpClientExt for CacheClient {
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
         let host = parts.uri.host().unwrap_or("").to_string();
-        let marked = (self.mark && !Self::refused(&host)).then(|| add_breakpoints(&body)).flatten();
+        let responses = parts.uri.path().trim_end_matches('/').ends_with("/responses");
+        let mark = self.mark && !Self::refused(&host);
+        let long = !listed(&NO_TTL, &host);
+        let marked = mark.then(|| add_breakpoints(&body, long)).flatten();
+        let short = (mark && long).then(|| add_breakpoints(&body, false)).flatten();
         let inner = self.inner.clone();
         let seen = self.seen.clone();
         async move {
             *seen.lock().unwrap() = None;
-            let first = Request::from_parts(parts.clone(), marked.clone().map(Bytes::from).unwrap_or_else(|| body.clone()));
-            let resp = match inner.send_streaming(first).await {
+            let send = |b: Bytes| inner.send_streaming(Request::from_parts(parts.clone(), b));
+            let rejected = |e: &http_client::Error| e.to_string().contains("400");
+            let resp = match send(marked.clone().map(Bytes::from).unwrap_or_else(|| body.clone())).await {
                 Ok(r) => r,
-                Err(e) if marked.is_some() && e.to_string().contains("400") => {
-                    // The gateway did not take the breakpoints: plain request, and never again.
-                    REFUSED.lock().unwrap().get_or_insert_with(HashSet::new).insert(host);
-                    inner.send_streaming(Request::from_parts(parts, body)).await?
+                Err(e) if marked.is_some() && rejected(&e) => {
+                    // The gateway did not take the 1-hour marks: 5-minute
+                    // ones, and if those fail too, a plain request — each
+                    // remembered, so the refused form is never sent again.
+                    let retry = match short {
+                        Some(b) => {
+                            list(&NO_TTL, &host);
+                            send(Bytes::from(b)).await
+                        }
+                        None => Err(e),
+                    };
+                    match retry {
+                        Ok(r) => r,
+                        Err(e) if rejected(&e) => {
+                            list(&REFUSED, &host);
+                            send(body.clone()).await?
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(e) => return Err(e),
             };
@@ -191,8 +239,261 @@ impl HttpClientExt for CacheClient {
                 }
                 chunk
             });
+            if responses {
+                return Ok(Response::from_parts(parts, Box::pin(fix_frames(sniffed)) as _));
+            }
             Ok(Response::from_parts(parts, Box::pin(sniffed) as _))
         }
+    }
+}
+
+/* ---------- Responses stream repair ---------- */
+
+/// Rewrites the `data:` lines of a Responses SSE stream through
+/// [`repair_frame`]; everything else passes unchanged. Works on bytes, so a
+/// UTF-8 character split across chunks is never mangled.
+#[derive(Default)]
+pub struct FrameFixer {
+    buf: Vec<u8>,
+    seq: u64,
+}
+
+impl FrameFixer {
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(nl) = self.buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=nl).collect();
+            self.line(&line, &mut out);
+        }
+        out
+    }
+
+    /// End of stream: a last line without a newline.
+    pub fn finish(&mut self) -> Vec<u8> {
+        let rest = std::mem::take(&mut self.buf);
+        let mut out = Vec::new();
+        if !rest.is_empty() {
+            self.line(&rest, &mut out);
+        }
+        out
+    }
+
+    fn line(&mut self, line: &[u8], out: &mut Vec<u8>) {
+        let text = String::from_utf8_lossy(line);
+        let Some(data) = text.trim_end_matches(['\r', '\n']).strip_prefix("data:") else {
+            out.extend_from_slice(line);
+            return;
+        };
+        if let Some(fixed) = repair_frame(data.trim(), &mut self.seq) {
+            out.extend_from_slice(b"data: ");
+            out.extend_from_slice(fixed.as_bytes());
+            out.push(b'\n');
+        }
+    }
+}
+
+fn fix_frames<S, E>(inner: S) -> impl futures_util::Stream<Item = Result<Bytes, E>>
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    use futures_util::StreamExt;
+    futures_util::stream::unfold((inner, FrameFixer::default(), false), |(mut inner, mut fixer, done)| async move {
+        if done {
+            return None;
+        }
+        match inner.next().await {
+            Some(Ok(bytes)) => Some((Ok(Bytes::from(fixer.push(&bytes))), (inner, fixer, false))),
+            Some(Err(e)) => Some((Err(e), (inner, fixer, false))),
+            None => Some((Ok(Bytes::from(fixer.finish())), (inner, fixer, true))),
+        }
+    })
+    // Chunks that held only part of a line.
+    .filter(|r| futures_util::future::ready(!matches!(r, Ok(b) if b.is_empty())))
+}
+
+/// Events whose payload is a whole `response` object.
+const RESPONSE_EVENTS: [&str; 5] =
+    ["response.created", "response.in_progress", "response.completed", "response.failed", "response.incomplete"];
+
+/// The one `data:` payload, with the fields Rig requires filled in. None =
+/// drop the frame (it cannot be a Responses event at all).
+pub fn repair_frame(data: &str, seq: &mut u64) -> Option<String> {
+    use rig_agent::core::providers::openai::responses_api::streaming::StreamingCompletionChunk;
+    let Ok(Value::Object(mut v)) = serde_json::from_str::<Value>(data) else {
+        // `[DONE]`, keep-alives, non-objects: Rig skips them itself.
+        return Some(data.to_string());
+    };
+    let Some(kind) = v.get("type").and_then(Value::as_str).map(str::to_string) else {
+        // No event type: an error object becomes an error event (Rig then
+        // shows its message); anything else (a chat/completions chunk from
+        // a confused gateway) is not something this stream can use.
+        return v.get("error").map(|e| json!({ "type": "error", "error": e }).to_string());
+    };
+    if !kind.starts_with("response.") {
+        return Some(data.to_string());
+    }
+    match v.get("sequence_number").and_then(Value::as_u64) {
+        Some(n) => *seq = n + 1,
+        None => {
+            v.insert("sequence_number".into(), json!(*seq));
+            *seq += 1;
+        }
+    }
+    let mut v = Value::Object(v);
+    if RESPONSE_EVENTS.contains(&kind.as_str()) {
+        let status = match kind.as_str() {
+            "response.completed" => "completed",
+            "response.failed" => "failed",
+            "response.incomplete" => "incomplete",
+            _ => "in_progress",
+        };
+        if !v["response"].is_object() {
+            v["response"] = json!({});
+        }
+        repair_response(&mut v["response"], status);
+    } else {
+        let default = |v: &mut Value, key: &str, val: Value| {
+            if v.get(key).is_none_or(Value::is_null) {
+                v[key] = val;
+            }
+        };
+        default(&mut v, "output_index", json!(0));
+        if kind.contains("output_text") || kind.contains("refusal") || kind.contains("content_part") {
+            default(&mut v, "content_index", json!(0));
+        }
+        if kind.contains("reasoning_summary") {
+            default(&mut v, "summary_index", json!(0));
+        }
+        if kind.ends_with(".delta") {
+            default(&mut v, "delta", json!(""));
+        }
+        if kind == "response.output_text.done" || kind == "response.reasoning_text.done" {
+            default(&mut v, "text", json!(""));
+        }
+        if kind == "response.function_call_arguments.done" {
+            default(&mut v, "arguments", json!(""));
+        }
+        if kind.starts_with("response.output_item.") {
+            if !v["item"].is_object() {
+                return None;
+            }
+            let status = if kind.ends_with(".done") { "completed" } else { "in_progress" };
+            repair_item(&mut v["item"], status);
+        }
+    }
+    if let Err(e) = serde_json::from_value::<StreamingCompletionChunk>(v.clone()) {
+        // Still not decodable: frames Rig can do without are dropped; the
+        // text, tool-call and final ones go on and fail with the reason.
+        let optional = matches!(
+            kind.as_str(),
+            "response.created" | "response.in_progress" | "response.output_item.added"
+        ) || kind.starts_with("response.content_part.")
+            || kind.starts_with("response.reasoning_summary_part.");
+        eprintln!("[responses] frame {kind} does not decode ({e}): {}", super::context::one_line(data, 300));
+        if optional {
+            return None;
+        }
+    }
+    Some(v.to_string())
+}
+
+/// A `response` object with Rig's required fields.
+fn repair_response(r: &mut Value, status: &str) {
+    let set = |r: &mut Value, key: &str, val: Value| {
+        if r.get(key).is_none_or(Value::is_null) {
+            r[key] = val;
+        }
+    };
+    set(r, "id", json!(""));
+    set(r, "object", json!("response"));
+    set(r, "created_at", json!(0));
+    set(r, "status", json!(status));
+    set(r, "model", json!(""));
+    if r.get("instructions").is_some_and(|i| !i.is_string() && !i.is_null()) {
+        r["instructions"] = Value::Null;
+    }
+    let item_status = if status == "in_progress" { "in_progress" } else { "completed" };
+    let items: Vec<Value> = match r.get_mut("output").map(Value::take) {
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .filter_map(|mut item| {
+                if !item.is_object() {
+                    return None;
+                }
+                repair_item(&mut item, item_status);
+                Some(item)
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    r["output"] = Value::Array(items);
+    if let Some(u) = r.get_mut("usage").filter(|u| u.is_object()) {
+        let n = |u: &Value, k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let (input, output) = (n(u, "input_tokens").max(n(u, "prompt_tokens")), n(u, "output_tokens").max(n(u, "completion_tokens")));
+        u["input_tokens"] = json!(input);
+        u["output_tokens"] = json!(output);
+        if u.get("total_tokens").and_then(Value::as_u64).is_none() {
+            u["total_tokens"] = json!(input + output);
+        }
+        let cached = u.pointer("/input_tokens_details/cached_tokens").and_then(Value::as_u64).unwrap_or(0);
+        u["input_tokens_details"] = json!({ "cached_tokens": cached });
+        let reasoning = u.pointer("/output_tokens_details/reasoning_tokens").and_then(Value::as_u64).unwrap_or(0);
+        u["output_tokens_details"] = json!({ "reasoning_tokens": reasoning });
+    } else if r.get("usage").is_some() {
+        r["usage"] = Value::Null;
+    }
+}
+
+/// An output item (message / function call / reasoning) with Rig's
+/// required fields.
+fn repair_item(item: &mut Value, status: &str) {
+    let set = |v: &mut Value, key: &str, val: Value| {
+        if v.get(key).is_none_or(Value::is_null) {
+            v[key] = val;
+        }
+    };
+    match item.get("type").and_then(Value::as_str).unwrap_or("") {
+        "message" => {
+            set(item, "id", json!(""));
+            set(item, "role", json!("assistant"));
+            set(item, "status", json!(status));
+            let parts: Vec<Value> = match item.get_mut("content").map(Value::take) {
+                Some(Value::Array(parts)) => parts
+                    .into_iter()
+                    .filter_map(|mut p| {
+                        let kind = p.get("type").and_then(Value::as_str).unwrap_or("text").to_string();
+                        match kind.as_str() {
+                            "output_text" | "text" => {
+                                p["type"] = json!("output_text");
+                                set(&mut p, "text", json!(""));
+                                Some(p)
+                            }
+                            "refusal" => {
+                                set(&mut p, "refusal", json!(""));
+                                Some(p)
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect(),
+                Some(Value::String(text)) => vec![json!({ "type": "output_text", "text": text })],
+                _ => Vec::new(),
+            };
+            item["content"] = Value::Array(parts);
+        }
+        "function_call" => {
+            let id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            set(item, "call_id", json!(id));
+            set(item, "name", json!(""));
+            set(item, "arguments", json!(""));
+            set(item, "status", json!(status));
+        }
+        "reasoning" => {
+            set(item, "id", json!(""));
+            set(item, "summary", json!([]));
+        }
+        _ => {}
     }
 }
 
@@ -211,7 +512,7 @@ mod tests {
                 { "role": "tool", "tool_call_id": "1", "content": "result" }
             ]
         });
-        let out: Value = serde_json::from_slice(&add_breakpoints(body.to_string().as_bytes()).unwrap()).unwrap();
+        let out: Value = serde_json::from_slice(&add_breakpoints(body.to_string().as_bytes(), true).unwrap()).unwrap();
         assert_eq!(out["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(out["messages"][0]["content"][0]["text"], "You are an agent.");
         assert!(out["messages"][1]["content"].is_string(), "only the last user/tool turn is marked");
@@ -231,7 +532,7 @@ mod tests {
             "model": "claude-opus-4-6",
             "stream": true
         });
-        let out: Value = serde_json::from_slice(&add_breakpoints(body.to_string().as_bytes()).unwrap()).unwrap();
+        let out: Value = serde_json::from_slice(&add_breakpoints(body.to_string().as_bytes(), true).unwrap()).unwrap();
         assert_eq!(out["input"][2]["content"][0]["cache_control"]["type"], "ephemeral");
         assert!(out["input"][0]["content"][0].get("cache_control").is_none());
         assert_eq!(out["instructions"], "SYSTEM PROMPT");
@@ -239,7 +540,7 @@ mod tests {
         // Inside the tool loop the newest item is a tool result.
         let mut looped = body.clone();
         looped["input"].as_array_mut().unwrap().push(json!({ "call_id": "c1", "output": "listing", "type": "function_call_output" }));
-        let out: Value = serde_json::from_slice(&add_breakpoints(looped.to_string().as_bytes()).unwrap()).unwrap();
+        let out: Value = serde_json::from_slice(&add_breakpoints(looped.to_string().as_bytes(), true).unwrap()).unwrap();
         assert_eq!(out["input"][3]["output"][0]["text"], "listing");
         assert_eq!(out["input"][3]["output"][0]["cache_control"]["type"], "ephemeral");
         assert!(out["input"][2]["content"][0].get("cache_control").is_none());
@@ -263,4 +564,57 @@ mod tests {
         sniff(&mut buf, b"ens\":10,\"prompt_tokens_details\":{\"cached_tokens\":7}}}\n\n", &seen);
         assert_eq!(seen.lock().unwrap().unwrap().cached, 7);
     }
+
+    #[test]
+    fn marks_ask_for_one_hour_unless_refused() {
+        let body = json!({ "messages": [{ "role": "user", "content": "hi" }] }).to_string();
+        let long: Value = serde_json::from_slice(&add_breakpoints(body.as_bytes(), true).unwrap()).unwrap();
+        assert_eq!(long["messages"][0]["content"][0]["cache_control"]["ttl"], "1h");
+        let short: Value = serde_json::from_slice(&add_breakpoints(body.as_bytes(), false).unwrap()).unwrap();
+        assert!(short["messages"][0]["content"][0]["cache_control"].get("ttl").is_none());
+    }
+
+    /// Frames as sparse gateways send them decode after the repair.
+    #[test]
+    fn sparse_responses_frames_are_repaired() {
+        use rig_agent::core::providers::openai::responses_api::streaming::StreamingCompletionChunk;
+        let mut seq = 0;
+        let frames = [
+            r#"{"type":"response.created","response":{"id":"r1","model":"claude"}}"#,
+            r#"{"type":"response.output_item.added","item":{"type":"message","content":[]}}"#,
+            r#"{"type":"response.output_text.delta","delta":"При"}"#,
+            r#"{"type":"response.output_text.done","text":"Привет"}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_1","name":"read_file","arguments":"{}"}}"#,
+            r#"{"type":"response.completed","response":{"id":"r1","output":[{"type":"message","content":[{"type":"text","text":"Привет"}]}],"usage":{"input_tokens":10,"output_tokens":2}}}"#,
+        ];
+        for f in frames {
+            let fixed = repair_frame(f, &mut seq).expect("kept");
+            serde_json::from_str::<StreamingCompletionChunk>(&fixed).unwrap_or_else(|e| panic!("{f}\n→ {fixed}\n{e}"));
+        }
+        assert_eq!(seq, frames.len() as u64);
+    }
+
+    #[test]
+    fn untyped_frames_become_errors_or_are_dropped() {
+        let mut seq = 0;
+        let err = repair_frame(r#"{"error":{"message":"quota exceeded"}}"#, &mut seq).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&err).unwrap()["type"], "error");
+        assert!(repair_frame(r#"{"choices":[{"delta":{"content":"x"}}]}"#, &mut seq).is_none());
+        assert_eq!(repair_frame("[DONE]", &mut seq).as_deref(), Some("[DONE]"));
+    }
+
+    /// A Cyrillic character split between two chunks survives intact.
+    #[test]
+    fn fixer_keeps_split_utf8() {
+        let line = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Ж\"}\n\n".as_bytes();
+        let cut = line.iter().position(|b| *b >= 0x80).unwrap() + 1;
+        let mut fx = FrameFixer::default();
+        let mut out = fx.push(&line[..cut]);
+        out.extend(fx.push(&line[cut..]));
+        out.extend(fx.finish());
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"delta\":\"Ж\""), "{text}");
+        assert!(text.contains("sequence_number"));
+    }
+
 }

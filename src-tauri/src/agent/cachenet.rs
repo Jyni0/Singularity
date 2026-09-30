@@ -13,10 +13,6 @@
 //!   cached_tokens`, Anthropic's `cache_read_input_tokens`, DeepSeek's
 //!   `prompt_cache_hit_tokens`); Rig reads only the first. The streamed
 //!   usage is sniffed so the HUD shows real hits.
-//! * Breakpoints ask for the 1-hour cache (as Claude Code does): with the
-//!   5-minute default everything was gone after a pause between messages
-//!   or a long Allow/Deny wait, and the next step paid the whole prompt
-//!   again. A gateway that refuses `ttl` gets plain 5-minute marks.
 //! * Responses streams from gateways often leave out fields Rig requires
 //!   (`sequence_number`, `output_index`, the item's `status`/`id`…) — one
 //!   such frame failed the whole request with "data did not match any
@@ -26,55 +22,12 @@
 use bytes::Bytes;
 use rig_agent::core::http_client::{self, HttpClientExt, LazyBody, MultipartForm, ReqwestClient, Request, Response, StreamingResponse};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-/// The request extras a gateway (by host) accepts.
-#[derive(Clone, Copy, Debug)]
-struct Accepted {
-    /// `prompt_cache_key`.
-    key: bool,
-    /// The 1-hour `ttl` on breakpoints.
-    ttl: bool,
-    /// Anthropic breakpoints at all.
-    marks: bool,
-}
-
-/// Gateways that refused some extra — they never get it again.
-static ACCEPTED: Mutex<Option<HashMap<String, Accepted>>> = Mutex::new(None);
-
-fn accepted(host: &str) -> Accepted {
-    ACCEPTED
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|m| m.get(host).copied())
-        .unwrap_or(Accepted { key: true, ttl: true, marks: true })
-}
-
-/// A 400 that complains about a request field (not, say, a too long
-/// prompt): only then is an extra dropped and the request sent again.
-fn refuses_extra(err: &str) -> bool {
-    let e = err.to_lowercase();
-    e.contains("400")
-        && ["prompt_cache_key", "cache_control", "ttl", "unrecognized", "unknown", "extra", "not permitted", "not allowed", "additional propert"]
-            .iter()
-            .any(|w| e.contains(w))
-}
-
-/// The body with the extras added; None = nothing to add (send it as is).
-fn compose(body: &[u8], marks: bool, ttl: bool, key: Option<&str>) -> Option<Vec<u8>> {
-    let marked = marks.then(|| add_breakpoints(body, ttl)).flatten();
-    let Some(key) = key else { return marked };
-    let mut v: Value = serde_json::from_slice(marked.as_deref().unwrap_or(body)).ok()?;
-    let obj = v.as_object_mut()?;
-    if !(obj.contains_key("input") || obj.contains_key("messages")) || obj.contains_key("prompt_cache_key") {
-        return marked;
-    }
-    obj.insert("prompt_cache_key".into(), json!(key));
-    serde_json::to_vec(&v).ok()
-}
+/// Gateways (by host) that refused the breakpoints — never marked again.
+static REFUSED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// Cache numbers read from the provider's own usage report.
 #[derive(Debug, Clone, Copy, Default)]
@@ -91,38 +44,23 @@ pub struct CacheClient {
     mark: bool,
     /// Usage of the latest streamed response.
     pub seen: Arc<Mutex<Option<CacheSeen>>>,
-    /// `prompt_cache_key`: OpenAI routes requests with the same key to the
-    /// same cache — without it a repeated prefix often lands on a machine
-    /// that has never seen it, and a new message started at 0% cache.
-    cache_key: Option<String>,
 }
 
 impl CacheClient {
     pub fn new(model: &str) -> Self {
         let inner = ReqwestClient::new();
-        Self { inner, mark: model.to_lowercase().contains("claude"), seen: Arc::default(), cache_key: None }
+        Self { inner, mark: model.to_lowercase().contains("claude"), seen: Arc::default() }
     }
 
-    /// Requests of one workspace + model share their cache routing key.
-    pub fn with_cache_key(mut self, key: String) -> Self {
-        self.cache_key = Some(key);
-        self
-    }
-}
-
-/// The breakpoint itself: 1-hour or the 5-minute default.
-fn cache_control(long: bool) -> Value {
-    if long {
-        json!({ "type": "ephemeral", "ttl": "1h" })
-    } else {
-        json!({ "type": "ephemeral" })
+    fn refused(host: &str) -> bool {
+        REFUSED.lock().unwrap().as_ref().is_some_and(|s| s.contains(host))
     }
 }
 
 /// Puts a cache breakpoint on a message: string content becomes one text
 /// part carrying `cache_control`; for part lists the last text part gets it.
-fn mark_message(msg: &mut Value, long: bool) -> bool {
-    let cc = cache_control(long);
+fn mark_message(msg: &mut Value) -> bool {
+    let cc = json!({ "type": "ephemeral" });
     match msg.get_mut("content") {
         Some(Value::String(s)) if !s.is_empty() => {
             let text = std::mem::take(s);
@@ -146,7 +84,7 @@ fn mark_message(msg: &mut Value, long: bool) -> bool {
 
 /// Adds breakpoints to a chat/completions or /responses body; None = nothing
 /// to change.
-pub fn add_breakpoints(body: &[u8], long: bool) -> Option<Vec<u8>> {
+pub fn add_breakpoints(body: &[u8]) -> Option<Vec<u8>> {
     let mut v: Value = serde_json::from_slice(body).ok()?;
     // Responses: `instructions` is a plain string (no place for a mark), the
     // conversation is `input`. One mark on the newest user text or tool
@@ -157,8 +95,8 @@ pub fn add_breakpoints(body: &[u8], long: bool) -> Option<Vec<u8>> {
         })?;
         if last["type"] == "function_call_output" {
             let text = last["output"].as_str().unwrap_or("").to_string();
-            last["output"] = json!([{ "type": "input_text", "text": text, "cache_control": cache_control(long) }]);
-        } else if !mark_message(last, long) {
+            last["output"] = json!([{ "type": "input_text", "text": text, "cache_control": { "type": "ephemeral" } }]);
+        } else if !mark_message(last) {
             return None;
         }
         return serde_json::to_vec(&v).ok();
@@ -166,10 +104,10 @@ pub fn add_breakpoints(body: &[u8], long: bool) -> Option<Vec<u8>> {
     let msgs = v.get_mut("messages")?.as_array_mut()?;
     let mut changed = false;
     if let Some(sys) = msgs.iter_mut().find(|m| matches!(m["role"].as_str(), Some("system") | Some("developer"))) {
-        changed |= mark_message(sys, long);
+        changed |= mark_message(sys);
     }
     if let Some(last) = msgs.iter_mut().rev().find(|m| matches!(m["role"].as_str(), Some("user") | Some("tool"))) {
-        changed |= mark_message(last, long);
+        changed |= mark_message(last);
     }
     if !changed {
         return None;
@@ -235,35 +173,20 @@ impl HttpClientExt for CacheClient {
         let body: Bytes = body.into();
         let host = parts.uri.host().unwrap_or("").to_string();
         let responses = parts.uri.path().trim_end_matches('/').ends_with("/responses");
-        let (mark, key) = (self.mark, self.cache_key.clone());
+        let marked = (self.mark && !Self::refused(&host)).then(|| add_breakpoints(&body)).flatten();
         let inner = self.inner.clone();
         let seen = self.seen.clone();
         async move {
             *seen.lock().unwrap() = None;
-            let send = |b: Bytes| inner.send_streaming(Request::from_parts(parts.clone(), b));
-            // What this gateway accepts; each refusal (a 400) drops one
-            // extra — the one it names, else the key, then the 1-hour ttl,
-            // then the marks — and is remembered, never sent again.
-            let mut ok = accepted(&host);
-            let resp = loop {
-                let out = compose(&body, mark && ok.marks, ok.ttl, key.as_deref().filter(|_| ok.key));
-                let extra = out.is_some();
-                match send(out.map(Bytes::from).unwrap_or_else(|| body.clone())).await {
-                    Ok(r) => break r,
-                    Err(e) if extra && refuses_extra(&e.to_string()) => {
-                        let msg = e.to_string().to_lowercase();
-                        let has_key = key.is_some() && ok.key;
-                        if has_key && (msg.contains("prompt_cache_key") || !msg.contains("ttl")) {
-                            ok.key = false;
-                        } else if mark && ok.marks && ok.ttl {
-                            ok.ttl = false;
-                        } else {
-                            ok.marks = false;
-                        }
-                        ACCEPTED.lock().unwrap().get_or_insert_with(HashMap::new).insert(host.clone(), ok);
-                    }
-                    Err(e) => return Err(e),
+            let first = Request::from_parts(parts.clone(), marked.clone().map(Bytes::from).unwrap_or_else(|| body.clone()));
+            let resp = match inner.send_streaming(first).await {
+                Ok(r) => r,
+                Err(e) if marked.is_some() && e.to_string().contains("400") => {
+                    // The gateway did not take the breakpoints: plain request, and never again.
+                    REFUSED.lock().unwrap().get_or_insert_with(HashSet::new).insert(host);
+                    inner.send_streaming(Request::from_parts(parts, body)).await?
                 }
+                Err(e) => return Err(e),
             };
             use futures_util::StreamExt;
             let (parts, stream) = resp.into_parts();
@@ -554,7 +477,7 @@ mod tests {
                 { "role": "tool", "tool_call_id": "1", "content": "result" }
             ]
         });
-        let out: Value = serde_json::from_slice(&add_breakpoints(body.to_string().as_bytes(), true).unwrap()).unwrap();
+        let out: Value = serde_json::from_slice(&add_breakpoints(body.to_string().as_bytes()).unwrap()).unwrap();
         assert_eq!(out["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(out["messages"][0]["content"][0]["text"], "You are an agent.");
         assert!(out["messages"][1]["content"].is_string(), "only the last user/tool turn is marked");
@@ -574,7 +497,7 @@ mod tests {
             "model": "claude-opus-4-6",
             "stream": true
         });
-        let out: Value = serde_json::from_slice(&add_breakpoints(body.to_string().as_bytes(), true).unwrap()).unwrap();
+        let out: Value = serde_json::from_slice(&add_breakpoints(body.to_string().as_bytes()).unwrap()).unwrap();
         assert_eq!(out["input"][2]["content"][0]["cache_control"]["type"], "ephemeral");
         assert!(out["input"][0]["content"][0].get("cache_control").is_none());
         assert_eq!(out["instructions"], "SYSTEM PROMPT");
@@ -582,7 +505,7 @@ mod tests {
         // Inside the tool loop the newest item is a tool result.
         let mut looped = body.clone();
         looped["input"].as_array_mut().unwrap().push(json!({ "call_id": "c1", "output": "listing", "type": "function_call_output" }));
-        let out: Value = serde_json::from_slice(&add_breakpoints(looped.to_string().as_bytes(), true).unwrap()).unwrap();
+        let out: Value = serde_json::from_slice(&add_breakpoints(looped.to_string().as_bytes()).unwrap()).unwrap();
         assert_eq!(out["input"][3]["output"][0]["text"], "listing");
         assert_eq!(out["input"][3]["output"][0]["cache_control"]["type"], "ephemeral");
         assert!(out["input"][2]["content"][0].get("cache_control").is_none());
@@ -605,38 +528,6 @@ mod tests {
         assert!(seen.lock().unwrap().is_none());
         sniff(&mut buf, b"ens\":10,\"prompt_tokens_details\":{\"cached_tokens\":7}}}\n\n", &seen);
         assert_eq!(seen.lock().unwrap().unwrap().cached, 7);
-    }
-
-    #[test]
-    fn marks_ask_for_one_hour_unless_refused() {
-        let body = json!({ "messages": [{ "role": "user", "content": "hi" }] }).to_string();
-        let long: Value = serde_json::from_slice(&add_breakpoints(body.as_bytes(), true).unwrap()).unwrap();
-        assert_eq!(long["messages"][0]["content"][0]["cache_control"]["ttl"], "1h");
-        let short: Value = serde_json::from_slice(&add_breakpoints(body.as_bytes(), false).unwrap()).unwrap();
-        assert!(short["messages"][0]["content"][0]["cache_control"].get("ttl").is_none());
-    }
-
-    #[test]
-    fn only_field_complaints_drop_extras() {
-        assert!(refuses_extra("HTTP 400: Unrecognized request argument supplied: prompt_cache_key"));
-        assert!(refuses_extra("400 Bad Request: cache_control.ttl: Extra inputs are not permitted"));
-        assert!(!refuses_extra("400 Bad Request: prompt is too long: 250000 tokens > 200000 maximum"));
-        assert!(!refuses_extra("429 Too Many Requests"));
-    }
-
-    #[test]
-    fn cache_key_is_added_once_and_only_to_conversations() {
-        let chat = json!({ "model": "gpt-5", "messages": [{ "role": "user", "content": "hi" }] }).to_string();
-        let out: Value = serde_json::from_slice(&compose(chat.as_bytes(), false, true, Some("k1")).unwrap()).unwrap();
-        assert_eq!(out["prompt_cache_key"], "k1");
-        let resp = json!({ "input": [], "prompt_cache_key": "mine" }).to_string();
-        assert!(compose(resp.as_bytes(), false, true, Some("k1")).is_none());
-        assert!(compose(b"{\"x\":1}", false, true, Some("k1")).is_none());
-        // Marks and key together.
-        let claude = json!({ "messages": [{ "role": "user", "content": "hi" }] }).to_string();
-        let out: Value = serde_json::from_slice(&compose(claude.as_bytes(), true, false, Some("k")).unwrap()).unwrap();
-        assert_eq!(out["prompt_cache_key"], "k");
-        assert!(out["messages"][0]["content"][0]["cache_control"].get("ttl").is_none());
     }
 
     /// Frames as sparse gateways send them decode after the repair.

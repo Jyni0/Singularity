@@ -53,15 +53,6 @@ pub(super) fn agent_temperature(kind: &str, model: &str, t: f64) -> Option<f64> 
     Some((soft.min(cap) * 100.0).round() / 100.0)
 }
 
-/// `prompt_cache_key` for OpenAI-style providers: one per provider + model +
-/// workspace — the requests that share a system prompt and tools.
-fn cache_key(req: &AgentRequest) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    (&req.provider_id, &req.base_url, &req.model, &req.workspace).hash(&mut h);
-    format!("singularity-{:016x}", h.finish())
-}
-
 /// Builds the Rig model for this request's provider.
 pub(super) fn build(req: &AgentRequest) -> Result<ModelSetup, String> {
     let mut setup = build_model(req)?;
@@ -116,10 +107,7 @@ fn build_model(req: &AgentRequest) -> Result<ModelSetup, String> {
             // across rounds, so repeat rounds read them from Anthropic's cache.
             // Plus explicit breakpoints on tools + system, so that layer stays
             // cached across turns while the automatic one follows the history.
-            // 1-hour TTL, as Claude Code uses: with the 5-minute default a
-            // pause between messages (or a long Allow/Deny wait) dropped the
-            // whole cache and the next step paid the full prompt again.
-            let model = client.completion_model(&req.model).with_automatic_caching_1h().with_prompt_caching();
+            let model = client.completion_model(&req.model).with_automatic_caching().with_prompt_caching();
             let thinking = anthropic_thinking(effort);
             Ok(ModelSetup {
                 handle: ModelHandle::new(model),
@@ -155,7 +143,7 @@ fn build_model(req: &AgentRequest) -> Result<ModelSetup, String> {
         "openai-responses" => {
             // Same transport as chat/completions: Claude behind a Responses
             // gateway gets cache marks, and the HUD sees real cache hits.
-            let http = super::cachenet::CacheClient::new(&req.model).with_cache_key(cache_key(req));
+            let http = super::cachenet::CacheClient::new(&req.model);
             let seen = http.seen.clone();
             let client = openai::Client::builder()
                 .api_key(key)
@@ -175,7 +163,7 @@ fn build_model(req: &AgentRequest) -> Result<ModelSetup, String> {
         // OpenAI endpoint…: plain /chat/completions — what loosely shaped
         // gateways serve reliably (Rig decodes `response.*` events strictly).
         _ => {
-            let http = super::cachenet::CacheClient::new(&req.model).with_cache_key(cache_key(req));
+            let http = super::cachenet::CacheClient::new(&req.model);
             let seen = http.seen.clone();
             let client = openai::Client::builder()
                 .api_key(key)

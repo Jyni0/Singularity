@@ -317,17 +317,26 @@ export function ContextMeter({
                                 <ChevronRight size={12} className={`shrink-0 text-[var(--text-dim)] transition-transform ${isOpen ? "rotate-90" : ""}`} />
                                 <span className="min-w-0 flex-1 truncate text-left">{p.label}</span>
                                 <span className="w-[56px] shrink-0 text-right text-[12.5px] text-[var(--text-dim)]">{fmtTokens(p.tokens)}</span>
-                                <span className="w-[40px] shrink-0 text-right text-[12.5px] text-[var(--text-dim)]">{p.items.length}</span>
+                                <span className="w-[40px] shrink-0 text-right text-[12.5px] text-[var(--text-dim)]">{p.items.filter((it) => !it.note).length}</span>
                               </button>
                               {isOpen && (
                                 <div className="mb-1 ml-[26px]">
-                                  {p.items.map((it, i) => (
-                                    <div key={i} className="flex items-center gap-2 py-[2px] pr-2 text-[12px]">
-                                      <span className="min-w-0 flex-1 truncate text-[var(--text-muted)]" title={it.name}>{it.name}</span>
-                                      <span className="w-[56px] shrink-0 text-right text-[var(--text-dim)]">{fmtTokens(it.tokens)}</span>
-                                      <span className="w-[40px] shrink-0 text-right text-[var(--text-dim)]">{fmtPct(it.tokens, total)}</span>
-                                    </div>
-                                  ))}
+                                  {p.items.map((it, i) =>
+                                    it.note ? (
+                                      // Not in the request: what the history bound left out.
+                                      <div key={i} className="flex items-center gap-2 py-[2px] pr-2 text-[12px] italic">
+                                        <span className="min-w-0 flex-1 truncate text-[var(--text-dim)]" title={it.name}>{it.name}</span>
+                                        <span className="w-[56px] shrink-0 text-right text-[var(--text-dim)]">~{fmtTokens(it.tokens)}</span>
+                                        <span className="w-[40px] shrink-0 text-right text-[var(--text-dim)]">—</span>
+                                      </div>
+                                    ) : (
+                                      <div key={i} className="flex items-center gap-2 py-[2px] pr-2 text-[12px]">
+                                        <span className="min-w-0 flex-1 truncate text-[var(--text-muted)]" title={it.name}>{it.name}</span>
+                                        <span className="w-[56px] shrink-0 text-right text-[var(--text-dim)]">{fmtTokens(it.tokens)}</span>
+                                        <span className="w-[40px] shrink-0 text-right text-[var(--text-dim)]">{fmtPct(it.tokens, total)}</span>
+                                      </div>
+                                    )
+                                  )}
                                 </div>
                               )}
                             </div>

@@ -252,9 +252,7 @@ fn result_chars(r: &rig_agent::core::completion::message::ToolResult) -> usize {
 /// Returns the history to send with the oldest bulky tool results stubbed
 /// (None = send it unchanged). `cleared` is the hook's watermark: it only
 /// ever moves forward, and only when the history outgrew the trigger.
-fn clear_old_results(history: &[Message], cleared: &mut usize, large: bool) -> Option<Vec<Message>> {
-    let (trigger, target) =
-        if large { (CLEAR_TRIGGER_CHARS_CLAUDE, CLEAR_TARGET_CHARS_CLAUDE) } else { (CLEAR_TRIGGER_CHARS, CLEAR_TARGET_CHARS) };
+fn clear_old_results(history: &[Message], cleared: &mut usize) -> Option<Vec<Message>> {
     use rig_agent::core::completion::message::ToolResultContent;
     // Clearable results in order: (message, content index, size). A helper's
     // report and loaded skill instructions are the agent's working notes —
@@ -276,8 +274,8 @@ fn clear_old_results(history: &[Message], cleared: &mut usize, large: bool) -> O
     *cleared = (*cleared).min(clearable);
     let total: usize = history.iter().map(|m| serde_json::to_string(m).map(|j| j.len()).unwrap_or(0)).sum();
     let freed = |n: usize| results[..n].iter().map(|r| r.2.saturating_sub(CLEARED_STUB.len())).sum::<usize>();
-    if total.saturating_sub(freed(*cleared)) > trigger {
-        while *cleared < clearable && total.saturating_sub(freed(*cleared)) > target {
+    if total.saturating_sub(freed(*cleared)) > CLEAR_TRIGGER_CHARS {
+        while *cleared < clearable && total.saturating_sub(freed(*cleared)) > CLEAR_TARGET_CHARS {
             *cleared += 1;
         }
     }
@@ -327,11 +325,6 @@ const GUARD_STOP: &str = "the model repeated the same action";
 /// between jumps and the provider's prompt cache keeps hitting.
 const CLEAR_TRIGGER_CHARS: usize = 160_000;
 const CLEAR_TARGET_CHARS: usize = 80_000;
-/// Claude (200k+ window): every clearing rewrites the prompt after the first
-/// stubbed result — a cache miss on all of it — while a cache read costs a
-/// tenth of fresh input, so it clears later and less often.
-const CLEAR_TRIGGER_CHARS_CLAUDE: usize = 400_000;
-const CLEAR_TARGET_CHARS_CLAUDE: usize = 200_000;
 /// Newest tool results that are never cleared.
 const CLEAR_KEEP_RECENT: usize = 6;
 /// Results shorter than this are not worth clearing.
@@ -390,22 +383,18 @@ impl AgentHook for UiHook {
         if is_cancelled(&self.ctx.run_id) {
             return CompletionCallAction::Stop(crate::cancel::STOPPED.to_string());
         }
+        *self.snapshot.lock().unwrap() = Some((event.prompt.clone(), event.history.to_vec()));
         let req = &self.ctx.req;
         let key = if req.provider_id.is_empty() { req.base_url.clone() } else { req.provider_id.clone() };
         let permit = crate::limiter::acquire(&key, req.rate_limit_rpm, req.concurrency, &self.ctx.run_id).await;
         *self.permit.lock().unwrap() = Some(permit);
         let mut cleared = self.cleared.lock().unwrap();
         let before = *cleared;
-        let large = req.model.to_lowercase().contains("claude");
-        let patched = clear_old_results(event.history, &mut cleared, large);
+        let patched = clear_old_results(event.history, &mut cleared);
         if *cleared != before {
             // Earlier file contents may be stubs now: reading again is real.
             self.memo.forget();
         }
-        // The history exactly as it goes out (stubs included): a retry and
-        // the next message continue from these bytes, so the cache holds.
-        let sent = patched.clone().unwrap_or_else(|| event.history.to_vec());
-        *self.snapshot.lock().unwrap() = Some((event.prompt.clone(), sent));
         match patched {
             Some(history) => CompletionCallAction::patch(rig_agent::agent::RequestPatch::new().history(history)),
             None => CompletionCallAction::Continue,
@@ -888,7 +877,7 @@ impl ReadMemo {
                 .is_some_and(|reads| reads.iter().any(|&(h, a, b)| h == *hash && a <= *from && b >= *to));
             if covered && from <= to {
                 return tools::ToolResult::ok(format!(
-                    "{path} (lines {from}-{to}) has not changed since you read it earlier in this conversation — \
+                    "{path} (lines {from}-{to}) has not changed since you read it earlier in this task — \
                      its content is already above in this conversation; use that instead of reading it again."
                 ));
             }
@@ -1739,7 +1728,6 @@ pub(super) async fn run(
     system: &str,
     root: &Path,
     turns: Vec<crate::chat::ChatTurn>,
-    full: &[crate::chat::ChatTurn],
 ) -> Result<String, String> {
     let parallel = req.max_agents.clamp(1, MAX_AGENTS);
     let req = &with_worker(req);
@@ -1802,35 +1790,25 @@ pub(super) async fn run(
         t
     };
     let turns = expand_turns(skills.clone(), root, turns).await?;
-    let (mut history, prompt) = to_messages(req, &turns);
-    let mut parts = measure(req, system, root, &skills, &mcp, &turns, None);
-    // The previous answer of this very chat, as the model saw it (tool calls
-    // and results included): the request then starts with exactly the bytes
-    // the last one sent, and the provider's cache covers all of it.
-    // One per agent history (a retry resumes the same history); a carried
-    // history brings the reads that are in it.
-    let mut memo = ReadMemo::default();
-    if let Some((carried, reads)) = carry_take(req, full) {
-        memo = reads;
-        if let Some(p) = parts.iter_mut().find(|p| p.group == "messages") {
-            let mut items: Vec<ContextItem> = carried.iter().map(message_item).collect();
-            items.push(message_item(&prompt));
-            *p = category("Messages", "messages", items);
-        }
-        history = carried;
-    }
-    ctx.usage.lock().unwrap().first_est = parts.iter().map(|p| p.tokens as u64).sum();
-    let carry_out = Mutex::new(None);
+    ctx.usage.lock().unwrap().first_est =
+        measure(req, system, root, &skills, &mcp, &turns, None).iter().map(|p| p.tokens as u64).sum();
+    let (history, prompt) = to_messages(req, &turns);
+    // One per agent history: a retry resumes the same history, so the reads
+    // it remembers are still in it.
+    let memo = ReadMemo::default();
+    // The conversation as the model saw it at the end — the text-call check
+    // below continues from it.
+    let final_messages = Mutex::new(None);
     // The main agent may run many tool calls of one turn at once (parallel
     // reads, several delegations); at least a handful even with one helper.
     let tool_parallel = parallel.max(8);
     let mut text =
-        run_with_retry(&ctx, &preamble, &tools, None, prompt, history, tool_parallel, true, Some(&carry_out), memo.clone(), |_| {})
+        run_with_retry(&ctx, &preamble, &tools, None, prompt, history, tool_parallel, true, Some(&final_messages), memo.clone(), |_| {})
             .await?;
     // A tool call written as plain text ("functions.read_file:0{…}") is no
     // call: nothing ran and the run ended mid-task. Point it out and go on.
     for _ in 0..TEXT_CALL_NUDGES {
-        let Some(messages) = carry_out.lock().unwrap().clone() else { break };
+        let Some(messages) = final_messages.lock().unwrap().clone() else { break };
         let Some(Message::Assistant { content, .. }) = messages.last() else { break };
         // Reasoning counts: some models "call" from inside their thinking.
         let said: String = content
@@ -1851,13 +1829,10 @@ pub(super) async fn run(
         );
         emit_text(app, run_id, "\n\n".to_string());
         let more =
-            run_with_retry(&ctx, &preamble, &tools, None, nudge, messages, tool_parallel, true, Some(&carry_out), memo.clone(), |_| {})
+            run_with_retry(&ctx, &preamble, &tools, None, nudge, messages, tool_parallel, true, Some(&final_messages), memo.clone(), |_| {})
                 .await?;
         text.push_str("\n\n");
         text.push_str(&more);
-    }
-    if let Some(messages) = carry_out.into_inner().unwrap() {
-        carry_put(req, full, messages, memo);
     }
     if text.trim().is_empty() && ctx.counter.load(Ordering::SeqCst) == 0 {
         return Err(
@@ -1898,136 +1873,6 @@ fn is_text_tool_call(text: &str) -> bool {
     CALL.is_match(&tail)
 }
 
-/* ---------- Carried conversation ---------- */
-
-/// Conversations kept at once (one per recently used chat).
-const CARRY_KEEP: usize = 8;
-
-/// The model-level history of recently finished runs, by the chat they
-/// continue. The chat itself only keeps each answer's text (and a list of
-/// its tool calls), so the next message used to start from a rebuilt,
-/// shorter history — a different prompt, which the provider's cache could
-/// not serve past the system prompt: 30-60% cache while Claude Code, which
-/// keeps the conversation as sent, stays above 90%.
-static CARRY: Mutex<Vec<(u64, Vec<Message>, ReadMemo)>> = Mutex::new(Vec::new());
-
-/// Identifies a chat state on one provider + model: the turns the run got.
-fn carry_key(req: &AgentRequest, turns: &[crate::chat::ChatTurn]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    (&req.kind, &req.provider_id, &req.base_url, &req.model, &req.workspace, &req.disabled_tools).hash(&mut h);
-    for t in turns {
-        (&t.role, &t.text).hash(&mut h);
-    }
-    h.finish()
-}
-
-/// Whether the provider serves a repeated prefix from a cache (Anthropic,
-/// OpenAI, Gemini, DeepSeek, the subscription CLIs, local proxies to them…).
-/// Ollama runs the model itself with a small window: there the longer
-/// history would only cost.
-fn carries(req: &AgentRequest) -> bool {
-    req.kind != "ollama"
-}
-
-/// Largest carried history (serialized chars); beyond it the next message
-/// starts from the chat's own compact history again.
-fn carry_cap(req: &AgentRequest) -> usize {
-    if req.model.to_lowercase().contains("claude") {
-        CLEAR_TRIGGER_CHARS_CLAUDE * 2
-    } else {
-        CLEAR_TRIGGER_CHARS * 2
-    }
-}
-
-/// The carried history when this run continues the chat of a finished one:
-/// the turns are that run's turns + its answer + one new prompt. An edited,
-/// resent, regenerated or compacted chat, or another model, starts afresh.
-fn carry_take(req: &AgentRequest, full: &[crate::chat::ChatTurn]) -> Option<(Vec<Message>, ReadMemo)> {
-    if !carries(req) {
-        return None;
-    }
-    let n = full.len();
-    let is_agent = |r: &str| r == "agent" || r == "assistant";
-    if n < 3 || !is_agent(&full[n - 2].role) || is_agent(&full[n - 1].role) {
-        return None;
-    }
-    let key = carry_key(req, &full[..n - 2]);
-    let mut store = CARRY.lock().unwrap();
-    let at = store.iter().position(|(k, _, _)| *k == key)?;
-    let (_, messages, memo) = store.remove(at);
-    let size: usize = messages.iter().map(|m| serde_json::to_string(m).map(|j| j.len()).unwrap_or(0)).sum();
-    (size <= carry_cap(req)).then_some((messages, memo))
-}
-
-/// The carried history the next message of this chat would continue from
-/// (the chat as shown: ending with the last answer), without taking it.
-fn carry_peek(req: &AgentRequest, full: &[crate::chat::ChatTurn]) -> Option<Vec<Message>> {
-    let n = full.len();
-    if !carries(req) || n < 2 || !matches!(full[n - 1].role.as_str(), "agent" | "assistant") {
-        return None;
-    }
-    let key = carry_key(req, &full[..n - 1]);
-    CARRY.lock().unwrap().iter().find(|(k, _, _)| *k == key).map(|(_, m, _)| m.clone())
-}
-
-/// One carried message for the context view: who, and its text.
-fn message_item(m: &Message) -> ContextItem {
-    use rig_agent::core::completion::message::ToolResultContent;
-    let mut label = "";
-    let mut text = String::new();
-    match m {
-        Message::System { content } => {
-            label = "System";
-            text.push_str(content);
-        }
-        Message::User { content } => {
-            for c in content {
-                match c {
-                    UserContent::Text(t) => {
-                        label = "You";
-                        text.push_str(&t.text);
-                    }
-                    UserContent::ToolResult(r) => {
-                        label = "Tool result";
-                        for rc in r.content.iter() {
-                            match rc {
-                                ToolResultContent::Text(t) => text.push_str(&t.text),
-                                ToolResultContent::Json { value } => text.push_str(&value.to_string()),
-                                ToolResultContent::Image(_) => text.push_str(&" ".repeat(4_000)),
-                            }
-                        }
-                    }
-                    _ => {
-                        label = "You";
-                        text.push_str(&" ".repeat(4_000));
-                    }
-                }
-            }
-        }
-        Message::Assistant { content, .. } => {
-            label = "Agent";
-            for c in content {
-                text.push_str(&serde_json::to_string(c).unwrap_or_default());
-            }
-        }
-    }
-    item(format!("{label} · {}", snippet(&text)), &text)
-}
-
-fn carry_put(req: &AgentRequest, full: &[crate::chat::ChatTurn], messages: Vec<Message>, memo: ReadMemo) {
-    if !carries(req) {
-        return;
-    }
-    let key = carry_key(req, full);
-    let mut store = CARRY.lock().unwrap();
-    store.retain(|(k, _, _)| *k != key);
-    store.push((key, messages, memo));
-    if store.len() > CARRY_KEEP {
-        store.remove(0);
-    }
-}
-
 /* ---------- Context view ---------- */
 
 /// Rough token count: ~4 characters per token for ASCII (English, code),
@@ -2050,6 +1895,10 @@ pub(crate) fn est_tokens(text: &str) -> usize {
 pub struct ContextItem {
     pub name: String,
     pub tokens: usize,
+    /// Shown for information only — not part of the request (and not in
+    /// the category's total): what the history bound left out.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub note: bool,
 }
 
 /// One category of what the next request carries.
@@ -2063,7 +1912,7 @@ pub struct ContextPart {
 }
 
 fn item(name: impl Into<String>, text: &str) -> ContextItem {
-    ContextItem { name: name.into(), tokens: est_tokens(text) }
+    ContextItem { name: name.into(), tokens: est_tokens(text), note: false }
 }
 
 /// The first words of a message, on one line.
@@ -2090,7 +1939,6 @@ pub(super) async fn context_info(
     system: &str,
     root: &Path,
     turns: Vec<crate::chat::ChatTurn>,
-    full: &[crate::chat::ChatTurn],
 ) -> Result<Vec<ContextPart>, String> {
     let req = &with_worker(req);
     let counter = AtomicUsize::new(0);
@@ -2099,15 +1947,7 @@ pub(super) async fn context_info(
     // The latest prompt as typed: the rest of its expanded text is @files.
     let raw_last = turns.iter().rev().find(|t| t.role != "agent" && t.role != "assistant").map(|t| t.text.clone());
     let turns = expand_turns(skills.clone(), root, turns).await?;
-    let mut parts = measure(req, system, root, &skills, &mcp, &turns, raw_last.as_deref());
-    // The next message continues the model-level history of the last run
-    // (tool calls and results included) — that is what it will carry.
-    if let Some(carried) = carry_peek(req, full) {
-        if let Some(p) = parts.iter_mut().find(|p| p.group == "messages") {
-            *p = category("Messages", "messages", carried.iter().map(message_item).collect());
-        }
-    }
-    Ok(parts)
+    Ok(measure(req, system, root, &skills, &mcp, &turns, raw_last.as_deref()))
 }
 
 /// Estimated tokens per category of one request (see context_info). The
@@ -2142,7 +1982,7 @@ fn measure(
                 let files = est_tokens(&t.text).saturating_sub(typed.tokens);
                 msgs.push(typed);
                 if files > 0 {
-                    msgs.push(ContextItem { name: "Latest · attached @files".into(), tokens: files });
+                    msgs.push(ContextItem { name: "Latest · attached @files".into(), tokens: files, note: false });
                 }
             }
             None => msgs.push(item(format!("{who} · {}", snippet(&t.text)), &t.text)),
@@ -2238,7 +2078,7 @@ mod tests {
         }
         history.push(Message::tool_result("d", "delegate", "y".repeat(10_000)));
         let mut cleared = 0;
-        let out = clear_old_results(&history, &mut cleared, false).expect("history over the trigger is edited");
+        let out = clear_old_results(&history, &mut cleared).expect("history over the trigger is edited");
         assert!(cleared > 0 && cleared <= 30 - CLEAR_KEEP_RECENT);
         assert_eq!(stub_count(&out), cleared);
         // The newest results and the helper's report stay verbatim.
@@ -2247,11 +2087,11 @@ mod tests {
         // Next turn with one more small result: the watermark holds (cache-stable).
         history.push(Message::tool_result("e", "list_dir", "z"));
         let before = cleared;
-        clear_old_results(&history, &mut cleared, false);
+        clear_old_results(&history, &mut cleared);
         assert_eq!(cleared, before);
         // Small histories are sent untouched.
         let mut zero = 0;
-        assert!(clear_old_results(&history[..3], &mut zero, false).is_none());
+        assert!(clear_old_results(&history[..3], &mut zero).is_none());
     }
 
     #[test]

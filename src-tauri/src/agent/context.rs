@@ -71,6 +71,41 @@ fn clip_agent(text: &str) -> String {
     }
 }
 
+/// What trim_history left out of `full` (the chat) to get `sent`, for the
+/// context view: older messages not sent at all, and how much of the
+/// earlier answers was cut. Both are notes — not part of the request.
+pub(super) fn left_out(full: &[crate::chat::ChatTurn], sent: &[crate::chat::ChatTurn]) -> Vec<super::runtime::ContextItem> {
+    use super::runtime::est_tokens;
+    let dropped = full.len().saturating_sub(sent.len());
+    let mut out = Vec::new();
+    if dropped > 0 {
+        let tokens: usize = full[..dropped].iter().map(|t| est_tokens(&t.text)).sum();
+        out.push(super::runtime::ContextItem {
+            name: format!("Not sent · {dropped} older messages (only the latest {} go to the model)", sent.len()),
+            tokens,
+            note: true,
+        });
+    }
+    let (mut shortened, mut cut) = (0usize, 0usize);
+    for (orig, kept) in full[dropped..].iter().zip(sent) {
+        if matches!(orig.role.as_str(), "agent" | "assistant") {
+            let lost = est_tokens(&orig.text).saturating_sub(est_tokens(&kept.text));
+            if lost > 0 {
+                shortened += 1;
+                cut += lost;
+            }
+        }
+    }
+    if shortened > 0 {
+        out.push(super::runtime::ContextItem {
+            name: format!("Cut · {shortened} earlier answers sent as their last {HISTORY_AGENT_CHARS} chars"),
+            tokens: cut,
+            note: true,
+        });
+    }
+    out
+}
+
 /// Keeps only the LAST keep_chars characters (prefixed by an elision mark).
 pub(super) fn clip_head(s: &str, keep_chars: usize) -> String {
     let n = s.chars().count();

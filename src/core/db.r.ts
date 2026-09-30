@@ -2051,7 +2051,8 @@ export interface ContextPart {
   group: "messages" | "tools" | "mcp" | "skills" | "system";
   tokens: number;
   /** The category's lines: tools, skills, kinds of messages. */
-  items: { name: string; tokens: number }[];
+  /** `note`: for information only — not sent, not in `tokens`. */
+  items: { name: string; tokens: number; note?: boolean }[];
 }
 
 /** What the next request of a conversation would send, part by part. */

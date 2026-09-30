@@ -296,7 +296,12 @@ pub async fn agent_context(
     let system = if req.system.trim().is_empty() { prompt::default_system() } else { req.system.clone() };
     let full = turns.clone();
     let turns = context::trim_history(turns);
-    runtime::context_info(&app, &req, &system, &root, turns, &full).await
+    let omitted = context::left_out(&full, &turns);
+    let mut parts = runtime::context_info(&app, &req, &system, &root, turns).await?;
+    if let Some(p) = parts.iter_mut().find(|p| p.group == "messages") {
+        p.items.extend(omitted);
+    }
+    Ok(parts)
 }
 
 /// Runs the agent loop, streaming text and reporting each tool call.
@@ -330,10 +335,9 @@ pub async fn run_agent(
 
     // Only the recent conversation goes on the wire, with old answers
     // clipped — the whole chat history used to ride along on every round.
-    let full = turns.clone();
     let turns = context::trim_history(turns);
 
-    let result = runtime::run(&app, &run_id, &req, &system, &root, turns, &full).await;
+    let result = runtime::run(&app, &run_id, &req, &system, &root, turns).await;
 
     crate::cancel::clear(&run_id);
 

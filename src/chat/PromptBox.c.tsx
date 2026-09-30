@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from "motion/react";
 import {
   Send, Plus, X, Square, Mic, Loader2, Paperclip, FileText, Folder, GitBranch, SquarePen, Zap, Rabbit, Scale, Brain,
   Sparkles, Plug, ListChecks, SearchCode, BookOpen, Wrench, FlaskConical, GitCommitHorizontal,
-  ListPlus, Pencil, Play, Minimize2, ChevronUp,
+  ListPlus, Pencil, Play, Minimize2, ChevronUp, Circle, CircleCheck, CircleDot,
 } from "lucide-react";
 import * as db from "../core/db.r";
 import type { Project, Gateway, Attachment, Effort } from "../core/types.i";
@@ -21,6 +21,7 @@ import { ProjectPicker } from "./ProjectPicker.c";
 
 import { ComposerMenu, type ComposerItem } from "./ComposerMenu.c";
 import { detectTrigger, mentionText, rankFiles, replaceToken, splitPath } from "./composer.u";
+import type { PlanStep } from "./message.u";
 import { Thumb, ScrollBox, IconButton } from "../components";
 
 /** What a `/` action asks the app to do. */
@@ -79,6 +80,7 @@ export function PromptBox({
   onEditQueued,
   onOpenBgTask,
   contextMeter,
+  plan = [],
 }: {
   onSend: (text: string, selection: ChatSelection, attachments: Attachment[]) => void;
   projects: Project[];
@@ -110,6 +112,8 @@ export function PromptBox({
   onEditQueued?: (id: string, text: string) => void;
   /** Opens a background task (dev server, watcher) in the side panel. */
   onOpenBgTask?: (task: db.BgTask) => void;
+  /** The agent's task list for the current turn (its update_plan tool). */
+  plan?: PlanStep[];
 }) {
   const [text, setText] = useState("");
   /** The queued prompt being edited in place, and its draft. */
@@ -126,6 +130,12 @@ export function PromptBox({
   const [dragging, setDragging] = useState(false);
   /** The queue plate above the prompt: collapsed to one line by default. */
   const [queueOpen, setQueueOpen] = useState(false);
+  /** The task plate: open by default — it is what the agent is doing. */
+  const [planOpen, setPlanOpen] = useState(true);
+  const planDone = plan.filter((p) => p.status === "completed").length;
+  const planNow = plan.find((p) => p.status === "in_progress") ?? plan.find((p) => p.status === "pending");
+  // A finished list stays while the turn runs; after it, only unfinished work is worth the space.
+  const showPlan = plan.length > 0 && (busy || planDone < plan.length);
   const fileInput = useRef<HTMLInputElement>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
   const promptThumb = useOverlayThumb(ref);
@@ -483,6 +493,57 @@ export function PromptBox({
           <div className="mb-4 flex justify-center">
             {/* Project settings moved to Settings → Projects; nothing here. */}
             <ProjectPicker projects={projects} project={project} onSelect={onSelectProject} />
+          </div>
+        )}
+        {/* The agent's task list (update_plan): its own plate above the
+            prompt — tasks it generated, not the prompt. */}
+        {showPlan && (
+          <div className="prompt-lip mx-3 mb-1.5 flex flex-col rounded-xl">
+            <button
+              className="flex h-8 items-center gap-2 px-3 text-[12px] text-[var(--text-muted)] transition-colors hover:text-[var(--text-main)]"
+              onClick={() => setPlanOpen((o) => !o)}
+              title={planOpen ? "Collapse the tasks" : "Show the tasks"}
+            >
+              <ListChecks size={13} className="shrink-0" />
+              <span className="shrink-0 text-[var(--text-main)]">
+                Tasks {planDone}/{plan.length}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-left text-[var(--text-dim)]">
+                {!planOpen && planNow ? planNow.step : ""}
+              </span>
+              <ChevronUp size={13} className={`shrink-0 transition-transform ${planOpen ? "rotate-180" : ""}`} />
+            </button>
+            {planOpen && (
+              <ScrollBox className="flex max-h-[196px] flex-col gap-0.5 px-1.5 pb-1.5">
+                {plan.map((p, i) => (
+                  <div key={i} className="flex min-h-7 shrink-0 items-center gap-2 rounded-lg px-2">
+                    {p.status === "completed" ? (
+                      <CircleCheck size={13} className="shrink-0 text-[var(--diff-add)]" />
+                    ) : p.status === "in_progress" ? (
+                      busy ? (
+                        <Loader2 size={13} className="shrink-0 animate-spin text-[var(--accent)]" />
+                      ) : (
+                        <CircleDot size={13} className="shrink-0 text-[var(--accent)]" />
+                      )
+                    ) : (
+                      <Circle size={13} className="shrink-0 text-[var(--text-dim)]" />
+                    )}
+                    <span
+                      className={`min-w-0 flex-1 truncate text-[12.5px] ${
+                        p.status === "completed"
+                          ? "text-[var(--text-dim)] line-through"
+                          : p.status === "in_progress"
+                            ? "text-[var(--text-main)]"
+                            : "text-[var(--text-muted)]"
+                      }`}
+                      title={p.step}
+                    >
+                      {p.step}
+                    </span>
+                  </div>
+                ))}
+              </ScrollBox>
+            )}
           </div>
         )}
         {/* Queued follow-ups: their own small plate above the prompt, one

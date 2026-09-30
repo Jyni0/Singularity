@@ -15,6 +15,28 @@ pub(super) fn tool_specs(req: &AgentRequest) -> Value {
     let shell_names: Vec<&str> = if cfg!(windows) { vec!["bash", "powershell", "cmd"] } else { vec!["bash"] };
     let mut specs = json!([
         {
+            "name": "update_plan",
+            "description": "Your task list, shown to the user above the prompt box. For any task with 2 or more steps, call it FIRST with every step (the first in_progress, the rest pending), then keep it current: right after finishing a step mark it completed and the next in_progress, in the same turn as your next real tool call. Keep exactly one step in_progress while working. A plan written only in your reply text is not shown and does nothing. This tool does no work itself — keep calling the real tools until every step is completed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step": { "type": "string", "description": "One short action, in the user's language." },
+                                "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                            },
+                            "required": ["step", "status"]
+                        }
+                    },
+                    "explanation": { "type": "string", "description": "Optional: why the plan changed." }
+                },
+                "required": ["plan"]
+            }
+        },
+        {
             "name": "read_file",
             "description": "Read a text file. Returns the contents with line numbers — at most 2000 lines per call (the result says how to read on). Use start_line/end_line to read only the part you need.",
             "parameters": {
@@ -252,8 +274,9 @@ pub(super) fn default_system() -> String {
      1. Do exactly what the request asks, nothing more. No unrequested refactors, renames, \
      formatting, comments, tests, docs or fixes; mention other issues in one line instead. \
      If the request is ambiguous, do the narrowest thing its wording supports.\n\
-     2. A message that needs no work in the workspace (a greeting, small talk, a general question) gets a direct answer with no tool calls. Otherwise plan briefly, then act. Before the first tool call write a short plan: the goal in \
-     the user's terms and 1-5 steps, each serving something the request asks for. Then \
+     2. A message that needs no work in the workspace (a greeting, small talk, a general question) gets a direct answer with no tool calls. Otherwise plan briefly, then act. For a task of several steps, record the plan with update_plan \
+     (1-6 steps in the user's terms, each serving something the request asks for) in the same turn as your first real tool call — \
+     never end a reply on a plan: after planning comes doing. Then \
      act; independent calls (several reads, searches) go together in one turn. If a result \
      proves the plan wrong, say so in one line and adjust. Read only the files the task needs.\n\
      3. Change files with apply_patch (SEARCH copied verbatim from the file's content, \
@@ -289,9 +312,19 @@ pub(super) fn summarize(name: &str, args: &Value) -> String {
                 format!("{cmd}  [in {cwd}]")
             }
         }
+        "update_plan" => {
+            let plan = super::runtime::plan_steps(args);
+            let done = plan.iter().filter(|(_, s)| s == "completed").count();
+            format!("{done}/{} steps done", plan.len())
+        }
         "read_file" => {
-            let s = get("start_line");
-            let e = get("end_line");
+            // Numbers or strings — the model sends either.
+            let num = |k: &str| match args.get(k) {
+                Some(Value::String(s)) => s.clone(),
+                Some(v @ Value::Number(_)) => v.to_string(),
+                _ => String::new(),
+            };
+            let (s, e) = (num("start_line"), num("end_line"));
             if s.is_empty() && e.is_empty() {
                 get("path").to_string()
             } else {

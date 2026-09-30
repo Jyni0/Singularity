@@ -15,6 +15,34 @@ export function collectSteps(msgs: Msg[]): db.AgentStepEvent[] {
   return out;
 }
 
+/** One step of the agent's task list (its `update_plan` tool). */
+export interface PlanStep {
+  step: string;
+  status: "pending" | "in_progress" | "completed";
+}
+
+/** The steps of one `update_plan` result (`- [x]` / `- [>]` / `- [ ]` lines). */
+export function parsePlan(result: string): PlanStep[] {
+  const out: PlanStep[] = [];
+  for (const line of result.split("\n")) {
+    const m = /^- \[(x|>| )\] (.*)$/.exec(line);
+    if (!m) continue;
+    const status = m[1] === "x" ? "completed" : m[1] === ">" ? "in_progress" : "pending";
+    out.push({ step: m[2], status });
+  }
+  return out;
+}
+
+/** The task list of the latest agent turn: its last successful `update_plan`. */
+export function latestPlan(msgs: Msg[]): PlanStep[] {
+  const last = [...msgs].reverse().find((m) => m.role === "agent");
+  const steps = (last?.segments ?? []).flatMap((s) =>
+    s.kind === "step" && s.step.name === "update_plan" && s.step.done && s.step.ok ? [s.step] : []
+  );
+  const latest = steps[steps.length - 1];
+  return latest ? parsePlan(latest.result) : [];
+}
+
 /** Turns a stored row back into a renderable message (duration + photos + steps). */
 /** A stored turn can hold steps the run never finished (done=false) —
  *  freeze them on load so nothing animates forever. */

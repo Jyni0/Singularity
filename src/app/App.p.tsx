@@ -9,7 +9,7 @@ import { useBlockContextMenu } from "../hooks/useBlockContextMenu.h";
 import { GenerationGlow, type GenAnimation } from "../components/effects/GenerationGlow.c";
 
 import type { PanelState, PanelTabSpec } from "../chat/message.i";
-import { storedToMsg, fileLabel, toolLabel } from "../chat/message.u";
+import { storedToMsg, fileLabel, toolLabel, latestPlan } from "../chat/message.u";
 import { ChatMessage } from "../chat/ChatMessage.c";
 import { useChat, DRAFT_ID } from "../hooks/useChat.h";
 import { useScheduledTasks } from "../hooks/useScheduledTasks.h";
@@ -1416,6 +1416,7 @@ export default function App() {
                 onTakeQueued={(id) => (activeConv ? chat.takeQueued(activeConv.id, id) : undefined)}
                 onRunQueued={(id) => activeConv && void chat.runQueued(activeConv.id, activeConv.project, id)}
                 onEditQueued={(id, text) => activeConv && chat.editQueued(activeConv.id, id, text)}
+                plan={latestPlan(draftMsgs)}
                 contextMeter={
                   pickedModel && (
                     <ContextMeter

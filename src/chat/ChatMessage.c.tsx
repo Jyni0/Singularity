@@ -268,6 +268,8 @@ function LiveEdit({ before, after }: { before: string; after: string }) {
 function groupSegments(segments: Segment[]): (Segment | { group: Segment[] })[] {
   const out: (Segment | { group: Segment[] })[] = [];
   for (const seg of segments) {
+    // The task list lives above the prompt box, not among the tool cards.
+    if (seg.kind === "step" && seg.step.name === "update_plan") continue;
     if (seg.kind === "step") {
       const tail = out[out.length - 1];
       if (tail && "group" in tail) tail.group.push(seg);

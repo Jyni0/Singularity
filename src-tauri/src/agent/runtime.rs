@@ -957,6 +957,7 @@ fn fs_tools(ctx: &RunCtx, memo: &ReadMemo) -> Vec<DynamicTool> {
                                 crate::web::fetch(&get("url"), start).await
                             }
                             "change_dir" => change_dir(&c, &get("path")),
+                            "update_plan" => update_plan(&args),
                             "generate_image" => crate::imagegen::tool(&c.app, c.req.image_gen.as_ref(), &args).await,
                             "read_file" => {
                                 let root = c.cwd();
@@ -1008,6 +1009,67 @@ fn fs_tools(ctx: &RunCtx, memo: &ReadMemo) -> Vec<DynamicTool> {
             )
         })
         .collect()
+}
+
+/// `update_plan`'s steps as (step, status), statuses normalized to
+/// pending / in_progress / completed. Accepts the plan as a JSON string and
+/// the usual aliases (`done`, `in-progress`, `content` for `step`).
+pub(super) fn plan_steps(args: &Value) -> Vec<(String, String)> {
+    let plan = match args.get("plan") {
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+        Some(v) => v.clone(),
+        None => Value::Null,
+    };
+    let Some(items) = plan.as_array() else { return Vec::new() };
+    items
+        .iter()
+        .filter_map(|it| {
+            let step = match it {
+                Value::String(s) => s.clone(),
+                _ => ["step", "content", "title", "text"].iter().find_map(|k| it.get(*k)?.as_str().map(String::from))?,
+            };
+            let step = step.trim().to_string();
+            if step.is_empty() {
+                return None;
+            }
+            let status = match it.get("status").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase().replace(['-', ' '], "_").as_str() {
+                "completed" | "complete" | "done" | "finished" => "completed",
+                "in_progress" | "active" | "doing" | "current" | "working" => "in_progress",
+                _ => "pending",
+            };
+            Some((step, status.to_string()))
+        })
+        .collect()
+}
+
+/// `update_plan`: the model's task list. The result is a checklist the
+/// prompt box shows above itself (`- [x]` done, `- [>]` in progress,
+/// `- [ ]` pending) and a push to keep working.
+fn update_plan(args: &Value) -> tools::ToolResult {
+    let steps = plan_steps(args);
+    if steps.is_empty() {
+        return tools::ToolResult::err(
+            "update_plan needs `plan`: a list of {\"step\": \"…\", \"status\": \"pending|in_progress|completed\"}",
+        );
+    }
+    let done = steps.iter().filter(|(_, s)| s == "completed").count();
+    let mut out = if done == steps.len() {
+        format!("Plan updated: all {done} steps completed. Finish with a short summary of what changed.")
+    } else {
+        format!(
+            "Plan updated ({done}/{} done). Now do the step in progress with the real tools — do not stop here.",
+            steps.len()
+        )
+    };
+    for (step, status) in &steps {
+        let mark = match status.as_str() {
+            "completed" => "x",
+            "in_progress" => ">",
+            _ => " ",
+        };
+        out.push_str(&format!("\n- [{mark}] {}", one_line(step, 200)));
+    }
+    tools::ToolResult::ok(out)
 }
 
 /// `change_dir`: moves the run's working directory (relative paths of every
@@ -1924,9 +1986,22 @@ pub(super) async fn run(
         } else if is_text_tool_call(&said) {
             "[Singularity] Your last message wrote a tool call as plain text, so nothing ran. \
              Call the tool through the tool-calling interface (not in your reply text) and continue the task."
-        } else if announces_next_step(&reply) {
-            "[Singularity] Your last message announced a next step but ended without doing it — no tool was called. \
-             Do that step now with a tool call and continue until the task is done."
+        } else if !worked_since_request(&messages) && !plan_only_request(&messages) && is_plan(&reply) {
+            if cli {
+                "[Singularity] You wrote a plan and stopped — no tool ran, nothing was done. Record it with update_plan and do \
+                 the first step now: write the <tool_call> request lines for it, and keep going until the task is done."
+            } else {
+                "[Singularity] You wrote a plan and stopped — no tool was called, nothing was done. Record it with update_plan \
+                 and do the first step now with real tool calls; keep going until the task is done."
+            }
+        } else if announces_next_step(&reply) || waits_for_results(&reply) {
+            if cli {
+                "[Singularity] Your last message said what you would do next (or that you are waiting for results), but no \
+                 request line was sent, so nothing ran and nothing is coming. Write the <tool_call> request lines for that step now."
+            } else {
+                "[Singularity] Your last message announced a next step (or waited for results) but no tool was called, so \
+                 nothing ran. Do that step now with a tool call and continue until the task is done."
+            }
         } else {
             break;
         };
@@ -1980,6 +2055,54 @@ fn is_text_tool_call(text: &str) -> bool {
     CALL.is_match(&tail)
 }
 
+/// Whether the model called any tool since the latest message of the
+/// user (or the app's nudge) — what separates doing from only talking.
+fn worked_since_request(messages: &[Message]) -> bool {
+    for m in messages.iter().rev() {
+        match m {
+            Message::Assistant { content, .. } if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_))) => {
+                return true;
+            }
+            Message::User { content } if content.iter().any(|c| matches!(c, UserContent::Text(_))) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `/plan` asks for a plan and nothing else.
+fn plan_only_request(messages: &[Message]) -> bool {
+    messages.iter().rev().find_map(|m| match m {
+        Message::User { content } => content.iter().find_map(|c| match c {
+            UserContent::Text(t) if !t.text.starts_with("[Singularity]") => Some(t.text.starts_with("Plan only")),
+            _ => None,
+        }),
+        _ => None,
+    }) == Some(true)
+}
+
+/// An answer that is a plan: a `План:` / `Plan:` / `Steps:` heading line.
+fn is_plan(text: &str) -> bool {
+    use std::sync::LazyLock;
+    static PLAN: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?im)^\s*[#*]*\s*(план|plan|шаги|steps)\s*[#*]*\s*:").unwrap());
+    PLAN.is_match(text)
+}
+
+/// "Waiting for the file contents" — results of calls that were never made.
+fn waits_for_results(text: &str) -> bool {
+    use std::sync::LazyLock;
+    static WAIT: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)(ожидаю|жду|дождусь)\s+(результат|содержим|вывод|ответ|данн|файл)|waiting for (the )?(tool |file )?(results?|output|contents?|response)|once i (get|have|receive) the (results?|output|contents?)",
+        )
+        .unwrap()
+    });
+    let t = text.trim_end();
+    let start = t.char_indices().rev().nth(299).map_or(0, |(i, _)| i);
+    WAIT.is_match(&t[start..])
+}
+
 /// Whether an answer stops on an announcement of work it never did:
 /// "Now I'll update the handler:", "Сейчас исправлю файл…". A final summary
 /// ends on a statement, not on a colon or a "let me".
@@ -1987,7 +2110,7 @@ fn announces_next_step(text: &str) -> bool {
     use std::sync::LazyLock;
     static NEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(
-            r"(?i)^(let me|let's|now,? i('ll| will| am going to)|i('ll| will) now|next,? i('ll| will)|i('m| am) going to|сейчас|теперь (я )?(исправ|измен|обнов|добав|удал|перепиш|внес|сдела|посмотр|прочит|провер|созда|запущ)|далее|давай(те)?|приступаю|начну|перейду)",
+            r"(?i)^(let me|let's|now,? i('ll| will| am going to)|i('ll| will) now|next,? i('ll| will)|i('m| am) going to|сейчас|теперь (я )?(исправ|измен|обнов|добав|удал|перепиш|внес|сдела|посмотр|прочит|провер|созда|запущ)|далее|давай(те)?|приступаю|приступлю|начну|перейду|(я )?(проверю|проверяю|сверю|сверяю|доработаю|добавлю|исправлю|изменю|обновлю|запущу|внесу|посмотрю|прочитаю|открою|создам|перепишу|приведу|найду|изучу|читаю|открываю|ищу|начинаю)\b)",
         )
         .unwrap()
     });
@@ -2278,7 +2401,20 @@ mod text_call_tests {
         assert!(!next("Done. The build passes."));
         assert!(!next("Fixed it. Let me know if you want more."));
         assert!(!next("Какой вариант выбрать?"));
+        assert!(next("Проверю состояние репозитория и нужные файлы перед изменениями."));
+        assert!(next("Сверяю мастер создания VM, токены и доступный API."));
+        assert!(!next("Проверил: сборка проходит."));
         assert!(!next(""));
+    }
+
+    #[test]
+    fn plans_and_waiting_are_seen() {
+        use super::{is_plan, waits_for_results};
+        assert!(is_plan("План:\n1. Проверю файлы.\n2. Доработаю UI."));
+        assert!(is_plan("**Plan:**\n1. read"));
+        assert!(!is_plan("Готово. Изменил provision.ts: план тарифа теперь сохраняется."));
+        assert!(waits_for_results("Ожидаю содержимое файлов, затем внесу изменения одним минимальным набором патчей."));
+        assert!(!waits_for_results("Готово, typecheck проходит."));
     }
 }
 

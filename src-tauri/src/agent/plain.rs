@@ -22,6 +22,7 @@ pub async fn stream(app: &AppHandle, request_id: &str, p: &ProviderConfig, turns
         "effort": p.effort,
         "max_tokens": p.max_tokens,
         "workspace": "",
+        "chat_id": p.chat_id,
     }))
     .map_err(|e| e.to_string())?;
     let setup = model::build(&req)?;

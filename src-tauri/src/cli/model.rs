@@ -1,13 +1,32 @@
-//! [`CliModel`]: a Rig `CompletionModel` whose "HTTP call" is one headless
-//! CLI process. Each request renders the Rig history into a prompt
-//! (protocol.rs), starts the CLI hidden, feeds the prompt on stdin and turns
-//! its JSON event stream back into Rig stream items — text and reasoning
-//! deltas, tool calls from the `<tool_call>` protocol, usage and errors.
-//! Dropping the stream (Stop, retry) kills the process.
+//! [`CliModel`]: a Rig `CompletionModel` whose "HTTP call" is a headless
+//! CLI process. A request is rendered into a prompt (protocol.rs), fed to
+//! the CLI on stdin, and its JSON event stream is turned back into Rig
+//! stream items — text and reasoning deltas, tool calls from the
+//! `<tool_call>` protocol, usage and errors.
+//!
+//! Sessions: the official CLIs keep ONE conversation per task and only
+//! append to it, so the provider's prompt cache covers everything said so
+//! far. agy and Claude Code read further user messages from stdin in the
+//! same headless session, so a model keeps its CLI process alive across the
+//! calls of one agent run: a call that continues the previous one (same
+//! instructions and history, plus the CLI's own reply and the new tool
+//! results) writes only those results. Measured on agy: ~33% of the prompt
+//! from cache when every call started a new process, 80–90% in one session.
+//! Codex `exec` is one-shot, but `exec resume <thread>` continues its
+//! recorded conversation, so it gets the same treatment with a process per
+//! call. A call that does not continue (a retry after an error, another
+//! prompt) ends the session and starts a new one. Dropping a stream mid-turn
+//! (Stop) kills the process.
+//!
+//! Chats: a run's model takes its session from the chat's slot
+//! ([`CliModel::for_chat`]), so ONE CLI session serves the whole chat — the
+//! next message of the chat is written into the session that is already
+//! running (it holds the earlier runs, tool results included) instead of
+//! starting a new CLI with the whole conversation again.
 
 use super::protocol::{self, Piece, Rendered, ToolTagFilter};
-use super::{agy_model_args, ensure, scratch, tail, Cli};
-use rig_agent::core::completion::message::{AssistantContent, Text};
+use super::{agy_model_args, ensure, jobs, tail, Cli};
+use rig_agent::core::completion::message::{AssistantContent, Message, Text};
 use rig_agent::core::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
 };
@@ -17,25 +36,189 @@ use rig_agent::core::streaming::{
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 
 type Item = Result<RawStreamingChoice, CompletionError>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CliModel {
     cli: Cli,
     /// "default"/"" lets the CLI pick (the account's default model).
     model: String,
     /// low | medium | high
     effort: String,
+    /// The live CLI session of this model's agent run — or of its whole
+    /// chat (see the module docs).
+    session: Slot,
+    /// No call made yet: the first call of a run may resume the chat's
+    /// session with just the new user message.
+    fresh: Arc<AtomicBool>,
+}
+
+type Slot = Arc<tokio::sync::Mutex<Option<Session>>>;
+
+/// The chats' CLI sessions, most recently used last.
+static CHAT_SESSIONS: LazyLock<std::sync::Mutex<Vec<(String, Slot)>>> = LazyLock::new(Default::default);
+/// Idle chat sessions kept alive (each one is a CLI process for agy/Claude).
+const KEEP_CHATS: usize = 4;
+
+/// The session slot of `chat` for this CLI + model + effort. Another model
+/// or effort in the same chat ends the chat's previous session.
+fn chat_slot(chat: &str, key: &str) -> Slot {
+    let mut all = CHAT_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let prefix = format!("{chat}|");
+    all.retain(|(k, _)| !k.starts_with(&prefix) || k == key);
+    if let Some(i) = all.iter().position(|(k, _)| k == key) {
+        let entry = all.remove(i);
+        let slot = entry.1.clone();
+        all.push(entry);
+        return slot;
+    }
+    let slot = Slot::default();
+    all.push((key.to_string(), slot.clone()));
+    while all.len() > KEEP_CHATS {
+        all.remove(0); // its process is killed with it
+    }
+    slot
+}
+
+/// Ends the CLI session of `chat` (the chat was deleted).
+pub fn end_chat(chat: &str) {
+    let prefix = format!("{chat}|");
+    CHAT_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, _)| !k.starts_with(&prefix));
+}
+
+impl std::fmt::Debug for CliModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CliModel").field("cli", &self.cli).field("model", &self.model).field("effort", &self.effort).finish()
+    }
+}
+
+/// A running CLI process and its pipes.
+struct Proc {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    lines: Lines<BufReader<ChildStdout>>,
+    err_task: tokio::task::JoinHandle<String>,
+    /// Temp files of the process (system prompt, images) — removed on drop.
+    _job: Job,
+    /// agy reports session totals; a call's usage is the difference.
+    totals: Usage,
+}
+
+/// A live session between two calls: the process (or, for Codex, the
+/// recorded thread to resume) plus what it has seen.
+struct Session {
+    proc: Option<Proc>,
+    /// Codex: the thread id `exec resume` continues.
+    thread: Option<String>,
+    /// Fingerprint of the tool definitions + instructions it was started with.
+    tools: u64,
+    /// Fingerprint of the tool definitions alone (a new run of the chat may
+    /// come with updated instructions — the session keeps its own).
+    tool_defs: u64,
+    /// Fingerprints of the request messages it has seen (system included).
+    seen: Vec<u64>,
+    /// The user's own messages in the chat so far — a new run continues
+    /// the session only when it brings exactly one more.
+    turns: usize,
+    /// Codex: the thread's usage totals so far (a resumed thread reports
+    /// totals, not the call's own numbers).
+    totals: Usage,
+}
+
+/// The user's typed messages in a request (tool results do not count).
+fn user_turns(req: &CompletionRequest) -> usize {
+    use rig_agent::core::completion::message::UserContent;
+    req.chat_history
+        .iter()
+        .filter(|m| matches!(m, Message::User { content } if content.iter().any(|c| matches!(c, UserContent::Text(_)))))
+        .count()
+}
+
+fn fingerprint<T: serde::Serialize>(v: &T) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(v).unwrap_or_default().hash(&mut h);
+    h.finish()
+}
+
+/// (tools, per-message) fingerprints of a request.
+fn request_fingerprints(req: &CompletionRequest) -> (u64, Vec<u64>) {
+    let tools = fingerprint(&req.tools) ^ fingerprint(&req.preamble);
+    (tools, req.chat_history.iter().map(fingerprint).collect())
+}
+
+impl Session {
+    /// The text to write when `req` continues this session: everything
+    /// after the session's own reply. None when it does not continue.
+    fn followup(&self, req: &CompletionRequest, fps: &(u64, Vec<u64>)) -> Option<String> {
+        let n = self.seen.len();
+        if fps.0 != self.tools || fps.1.len() < n + 2 || fps.1[..n] != self.seen[..] {
+            return None;
+        }
+        let rest = &req.chat_history[n..];
+        if !matches!(rest[0], Message::Assistant { .. }) {
+            return None;
+        }
+        protocol::render_followup(&rest[1..], !req.tools.is_empty())
+    }
+
+    /// The text to write when `req` starts a NEW run of the chat this
+    /// session serves: its last user message. The session already holds the
+    /// earlier runs (in more detail than the saved chat). None when the
+    /// tools changed or the message carries images.
+    fn resume(&self, req: &CompletionRequest) -> Option<String> {
+        // Same tools, and the chat grew by exactly this message (an edited
+        // and resent earlier prompt is another conversation).
+        if fingerprint(&req.tools) != self.tool_defs || user_turns(req) != self.turns + 1 {
+            return None;
+        }
+        let last = req.chat_history.last().filter(|m| matches!(m, Message::User { .. }))?;
+        protocol::render_followup(std::slice::from_ref(last), !req.tools.is_empty())
+    }
+}
+
+/// CLIs whose headless mode keeps reading user messages from stdin.
+/// Codex keeps its conversation too, through `exec resume`.
+pub fn keeps_session(cli: Cli) -> bool {
+    matches!(cli, Cli::Antigravity | Cli::Claude | Cli::Codex)
+}
+
+/// One user message on a CLI's stream-json stdin.
+fn user_line(cli: Cli, text: &str) -> String {
+    let content = json!([{ "type": "text", "text": text }]);
+    match cli {
+        Cli::Claude => format!("{}\n", json!({ "type": "user", "message": { "role": "user", "content": content } })),
+        _ => format!("{}\n", json!({ "event": "user", "message": { "role": "user", "content": content } })),
+    }
 }
 
 impl CliModel {
     pub fn new(cli: Cli, model: &str, effort: &str) -> Self {
-        Self { cli, model: model.trim().to_string(), effort: effort.to_string() }
+        Self {
+            cli,
+            model: model.trim().to_string(),
+            effort: effort.to_string(),
+            session: Arc::default(),
+            fresh: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// A model whose session is the chat's one (see the module docs). An
+    /// empty `chat` = a session of this run only.
+    pub fn for_chat(cli: Cli, model: &str, effort: &str, chat: &str) -> Self {
+        let mut m = Self::new(cli, model, effort);
+        if !chat.is_empty() {
+            m.session = chat_slot(chat, &format!("{chat}|{cli:?}|{}|{effort}", m.model));
+        }
+        m
     }
 
     fn provider(&self) -> &'static str {
@@ -51,38 +234,35 @@ impl CliModel {
         (!m.is_empty() && m != "default").then_some(m)
     }
 
-    /// Starts the CLI and returns the Rig stream over its events.
-    async fn open(&self, req: CompletionRequest) -> Result<StreamingCompletionResponse, CompletionError> {
+    /// Starts a CLI process for `req`. Returns it and the first stdin text.
+    /// `persist`: Codex records the conversation so it can be resumed.
+    async fn spawn(&self, req: &CompletionRequest, persist: bool) -> Result<(Proc, String), CompletionError> {
+        self.spawn_rendered(&protocol::render(req), persist, None).await
+    }
+
+    /// Codex: continues recorded `thread` with `text`.
+    async fn spawn_resume(&self, thread: &str, text: &str) -> Result<(Proc, String), CompletionError> {
+        let r = Rendered { system: String::new(), prompt: text.to_string(), images: Vec::new() };
+        self.spawn_rendered(&r, true, Some(thread)).await
+    }
+
+    async fn spawn_rendered(&self, rendered: &Rendered, persist: bool, resume: Option<&str>) -> Result<(Proc, String), CompletionError> {
         let fail = CompletionError::ProviderError;
         let launch = ensure(self.cli).await.map_err(fail)?;
-        let rendered = protocol::render(&req);
         let agy_args = match (self.cli, self.model_arg()) {
             (Cli::Antigravity, Some(model)) => agy_model_args(&launch, model, &self.effort).await,
             _ => Vec::new(),
         };
-        let job = Job::prepare(self, &rendered, &agy_args).map_err(fail)?;
-
+        let mut job = Job::prepare(self, rendered, &agy_args, persist, resume).map_err(fail)?;
         let mut cmd = launch.command();
         cmd.args(&job.args).stdin(Stdio::piped());
+        if let Some(dir) = &job.cwd {
+            cmd.current_dir(dir);
+        }
         let mut child = cmd
             .spawn()
             .map_err(|e| fail(format!("cannot start {}: {e}", self.cli.label())))?;
-
-        // stdin: the prompt, then EOF so the CLI starts working. agy keeps it
-        // open: a turn it spent on its own (denied) tools gets a follow-up
-        // message in the same session — see `Decoder::stalled`.
-        let mut stdin = child.stdin.take().ok_or_else(|| fail("no stdin".into()))?;
-        let input = job.stdin.clone();
-        let keep_open = self.cli == Cli::Antigravity;
-        let writer = tokio::spawn(async move {
-            let _ = stdin.write_all(input.as_bytes()).await;
-            let _ = stdin.flush().await;
-            if keep_open {
-                return Some(stdin);
-            }
-            let _ = stdin.shutdown().await;
-            None
-        });
+        let stdin = child.stdin.take().ok_or_else(|| fail("no stdin".into()))?;
         // stderr: kept for the error message when the CLI fails.
         let mut stderr = child.stderr.take().ok_or_else(|| fail("no stderr".into()))?;
         let err_task = tokio::spawn(async move {
@@ -91,49 +271,129 @@ impl CliModel {
             String::from_utf8_lossy(&buf).to_string()
         });
         let stdout = child.stdout.take().ok_or_else(|| fail("no stdout".into()))?;
+        let first = std::mem::take(&mut job.stdin);
+        let proc = Proc {
+            child,
+            stdin: Some(stdin),
+            lines: BufReader::new(stdout).lines(),
+            err_task,
+            _job: job,
+            totals: Usage::new(),
+        };
+        Ok((proc, first))
+    }
+
+    /// Runs one call and returns the Rig stream over its events.
+    /// `sessioned`: keep (or continue) the CLI session of this model.
+    pub(super) async fn open(&self, req: CompletionRequest, sessioned: bool) -> Result<StreamingCompletionResponse, CompletionError> {
+        let cli = self.cli;
+        let sessioned = sessioned && keeps_session(cli);
+        let fps = request_fingerprints(&req);
+        let fresh = self.fresh.swap(false, Ordering::SeqCst);
+        let mut slot = if sessioned { Some(self.session.clone().lock_owned().await) } else { None };
+        // A session that does not continue is dropped here (its process
+        // killed) and a fresh one starts. The first call of a run may resume
+        // the chat's session with just the new message.
+        let live = slot.as_mut().and_then(|g| g.take()).and_then(|s| {
+            if let Some(text) = s.followup(&req, &fps) {
+                return Some((s, text, true));
+            }
+            let text = if fresh { s.resume(&req) } else { None }?;
+            Some((s, text, false))
+        });
+        // The chat's user messages at the start of this run (notes added
+        // inside a run are not part of the saved chat).
+        let turns = match &live {
+            Some((s, _, true)) => s.turns,
+            _ => user_turns(&req),
+        };
+        let mut thread: Option<String> = None;
+        let (mut proc, first) = match live {
+            Some((Session { proc: Some(proc), .. }, text, _)) => {
+                tracing::debug!(cli = ?cli, chars = text.len(), "CLI session continues");
+                (proc, user_line(cli, &text))
+            }
+            Some((Session { thread: Some(t), totals, .. }, text, _)) => {
+                tracing::debug!(cli = ?cli, chars = text.len(), "Codex thread resumes");
+                let mut started = self.spawn_resume(&t, &text).await?;
+                started.0.totals = totals;
+                thread = Some(t);
+                started
+            }
+            _ => {
+                if sessioned {
+                    tracing::debug!(cli = ?cli, messages = req.chat_history.len(), "CLI session starts");
+                }
+                self.spawn(&req, sessioned).await?
+            }
+        };
+        let tool_defs = fingerprint(&req.tools);
 
         let (tx, rx) = mpsc::channel::<Item>(64);
-        let cli = self.cli;
         let provider = self.provider();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
+            // The message, then — for a one-shot call — EOF so the CLI
+            // starts working. agy keeps stdin open even then: a turn it
+            // spent on its own (denied) tools gets a follow-up message in
+            // the same session — see `Decoder::stalled`.
+            if let Some(stdin) = proc.stdin.as_mut() {
+                let ok = stdin.write_all(first.as_bytes()).await.is_ok() && stdin.flush().await.is_ok();
+                if !ok {
+                    let _ = tx.send(Err(CompletionError::ProviderError(format!("{}: could not send the prompt", cli.label())))).await;
+                    return;
+                }
+            }
+            // Codex reads one prompt and works: EOF even in a session.
+            if (!sessioned || cli == Cli::Codex) && cli != Cli::Antigravity {
+                if let Some(mut s) = proc.stdin.take() {
+                    let _ = s.shutdown().await;
+                }
+            }
             let mut state = Decoder::new(cli);
             let mut out = Emitter::new(tx.clone());
-            let mut writer = Some(writer);
             let mut nudges = 0;
             loop {
                 tokio::select! {
-                    line = lines.next_line() => match line {
+                    line = proc.lines.next_line() => match line {
                         Ok(Some(line)) => {
                             if cfg!(test) && std::env::var_os("CLI_TRACE").is_some() {
                                 eprintln!("RAW {}", line.chars().take(400).collect::<String>());
                             }
                             for ev in state.feed(&line) {
                                 if !out.send(ev).await {
-                                    return; // consumer gone: child is killed on drop
+                                    return; // consumer gone: the process is killed on drop
                                 }
                             }
-                            if state.turn_over {
-                                state.turn_over = false;
-                                // The stdin handle, once the prompt is written.
-                                let mut stdin = match writer.take() {
-                                    Some(w) => w.await.ok().flatten(),
-                                    None => None,
-                                };
-                                if state.stalled && !out.produced && nudges < MAX_NUDGES {
-                                    if let Some(s) = stdin.as_mut() {
-                                        nudges += 1;
-                                        state.stalled = false;
-                                        let _ = s.write_all(nudge(&state.denied).as_bytes()).await;
-                                        let _ = s.flush().await;
-                                        writer = Some(tokio::spawn(async move { stdin }));
-                                        continue;
+                            if !state.turn_over {
+                                continue;
+                            }
+                            state.turn_over = false;
+                            if state.stalled && !out.produced && nudges < MAX_NUDGES {
+                                if let Some(s) = proc.stdin.as_mut() {
+                                    nudges += 1;
+                                    state.stalled = false;
+                                    let _ = s.write_all(nudge(cli, &state.denied).as_bytes()).await;
+                                    let _ = s.flush().await;
+                                    continue;
+                                }
+                            }
+                            if sessioned && state.fatal.is_none() && !(state.stalled && !out.produced) {
+                                // The turn is over and the session stays
+                                // alive for the next call of the run.
+                                let usage = proc.turn_usage(cli, &state.usage);
+                                if !out.flush().await {
+                                    return;
+                                }
+                                if tx.send(Ok(RawStreamingChoice::FinalResponse(StreamFinal::new(provider, usage)))).await.is_ok() {
+                                    if let Some(g) = slot.as_mut() {
+                                        **g = Some(Session { proc: Some(proc), thread: None, tools: fps.0, tool_defs, seen: fps.1, turns, totals: Usage::new() });
                                     }
                                 }
-                                // Done: EOF ends the session.
-                                if let Some(mut s) = stdin {
-                                    let _ = s.shutdown().await;
-                                }
+                                return;
+                            }
+                            // Done: EOF ends the session.
+                            if let Some(mut s) = proc.stdin.take() {
+                                let _ = s.shutdown().await;
                             }
                         }
                         Ok(None) => break,
@@ -147,9 +407,8 @@ impl CliModel {
                     _ = tx.closed() => return,
                 }
             }
-            let status = child.wait().await.ok();
-            let stderr = err_task.await.unwrap_or_default();
-            job.cleanup();
+            let status = proc.child.wait().await.ok();
+            let stderr = (&mut proc.err_task).await.unwrap_or_default();
 
             if let Some(msg) = state.fatal.take() {
                 let _ = tx.send(Err(CompletionError::ProviderError(explain(cli, &msg).await))).await;
@@ -178,9 +437,14 @@ impl CliModel {
             if !out.flush().await {
                 return;
             }
-            let _ = tx
-                .send(Ok(RawStreamingChoice::FinalResponse(StreamFinal::new(provider, state.usage))))
-                .await;
+            let usage = proc.turn_usage(cli, &state.usage);
+            let sent = tx.send(Ok(RawStreamingChoice::FinalResponse(StreamFinal::new(provider, usage)))).await.is_ok();
+            // Codex: the conversation is recorded; the next call resumes it.
+            if let (true, Cli::Codex, Some(t)) = (sent && sessioned, cli, state.thread.take().or(thread)) {
+                if let Some(g) = slot.as_mut() {
+                    **g = Some(Session { proc: None, thread: Some(t), tools: fps.0, tool_defs, seen: fps.1, turns, totals: proc.totals });
+                }
+            }
         });
 
         let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|x| (x, rx)) });
@@ -188,10 +452,33 @@ impl CliModel {
     }
 }
 
+impl Proc {
+    /// The usage of the call that just ended, with the whole prompt (cache
+    /// reads included) as input — what the agent's accounting expects.
+    fn turn_usage(&mut self, cli: Cli, reported: &Usage) -> Usage {
+        if cli == Cli::Claude {
+            return *reported;
+        }
+        // agy and a resumed Codex thread report totals; agy's input is
+        // WITHOUT the cache reads, Codex's with them.
+        let t = &self.totals;
+        let mut u = Usage::new();
+        u.cached_input_tokens = reported.cached_input_tokens.saturating_sub(t.cached_input_tokens);
+        u.input_tokens = reported.input_tokens.saturating_sub(t.input_tokens)
+            + if cli == Cli::Antigravity { u.cached_input_tokens } else { 0 };
+        u.output_tokens = reported.output_tokens.saturating_sub(t.output_tokens);
+        u.reasoning_tokens = reported.reasoning_tokens.saturating_sub(t.reasoning_tokens);
+        u.total_tokens = u.input_tokens + u.output_tokens;
+        self.totals = *reported;
+        u
+    }
+}
+
 impl CompletionModel for CliModel {
+    /// One-shot (compaction summaries): never touches the run's session.
     async fn completion(&self, request: CompletionRequest) -> Result<CompletionResponse, CompletionError> {
         use futures_util::StreamExt;
-        let mut stream = self.open(request).await?;
+        let mut stream = self.open(request, false).await?;
         while let Some(item) = stream.next().await {
             item?;
         }
@@ -204,7 +491,7 @@ impl CompletionModel for CliModel {
     }
 
     async fn stream(&self, request: CompletionRequest) -> Result<StreamingCompletionResponse, CompletionError> {
-        self.open(request).await
+        self.open(request, true).await
     }
 }
 
@@ -232,13 +519,17 @@ struct Job {
     stdin: String,
     /// Temp files (system prompt, images) removed after the run.
     files: Vec<PathBuf>,
+    /// Where the process runs (default: the shared scratch folder).
+    cwd: Option<PathBuf>,
 }
 
 impl Job {
-    fn prepare(m: &CliModel, r: &Rendered, agy_args: &[String]) -> Result<Self, String> {
-        let dir = scratch().join(format!("run-{}", uid()));
+    /// `persist` / `resume`: Codex only — record the conversation, or
+    /// continue a recorded thread with `r.prompt`.
+    fn prepare(m: &CliModel, r: &Rendered, agy_args: &[String], persist: bool, resume: Option<&str>) -> Result<Self, String> {
+        let dir = jobs().join(format!("run-{}", uid()));
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let mut job = Job { args: vec![], stdin: String::new(), files: vec![dir.clone()] };
+        let mut job = Job { args: vec![], stdin: String::new(), files: vec![dir.clone()], cwd: None };
         // Levels each CLI accepts (the UI offers only these; anything else
         // falls back to the CLI's own default).
         let levels: &[&str] = match m.cli {
@@ -293,10 +584,17 @@ impl Job {
                 );
             }
             Cli::Codex => {
-                job.args = ["exec", "--json", "--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only", "--color", "never"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
+                job.args = match resume {
+                    // `exec resume` takes no --sandbox / --color flags.
+                    Some(_) => vec!["exec", "resume", "--json", "--skip-git-repo-check", "-c", "sandbox_mode=\"read-only\""],
+                    None => vec!["exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never"],
+                }
+                .into_iter()
+                .map(String::from)
+                .collect();
+                if !persist {
+                    job.args.push("--ephemeral".into());
+                }
                 if let Some(model) = m.model_arg() {
                     job.args.extend(["-m".into(), model.into()]);
                 }
@@ -309,6 +607,9 @@ impl Job {
                     let bytes = base64_decode(&img.base64)?;
                     std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
                     job.args.push(format!("--image={}", p.display()));
+                }
+                if let Some(thread) = resume {
+                    job.args.push(thread.into());
                 }
                 job.args.push("-".into()); // prompt from stdin
                 job.stdin = with_system(r);
@@ -325,7 +626,20 @@ impl Job {
                 // `--model` (and `--effort` when needed), picked in `open`.
                 job.args.extend(agy_args.iter().cloned());
                 job.args.extend(["-p".into(), String::new()]);
-                let mut text = with_system(r);
+                // agy has no system-prompt flag, but it puts the GEMINI.md /
+                // AGENTS.md rules of its working folder INTO its system
+                // prompt. Our instructions go there (a folder per session):
+                // as the user's first message they read like an injection —
+                // Gemini spent its reasoning (and a whole call on its own
+                // RunCommand) doubting them — and a stable system prefix is
+                // what its prompt cache keys on.
+                let rest = write_agy_rules(&dir, &r.system).map_err(|e| format!("cannot write the agy rules: {e}"))?;
+                job.cwd = Some(dir.clone());
+                let mut text = if rest.trim().is_empty() {
+                    r.prompt.clone()
+                } else {
+                    with_system(&Rendered { system: rest, prompt: r.prompt.clone(), images: Vec::new() })
+                };
                 if !r.images.is_empty() {
                     text.push_str("\n\n[Images were attached, but this provider receives text only.]");
                 }
@@ -338,11 +652,41 @@ impl Job {
         Ok(job)
     }
 
-    fn cleanup(&self) {
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
         for f in &self.files {
             let _ = std::fs::remove_dir_all(f);
         }
     }
+}
+
+/// agy's per-file rules cap (bytes), with some room to spare.
+const AGY_RULE_BYTES: usize = 23_000;
+
+/// Writes `system` as agy rules into `dir` (GEMINI.md, then AGENTS.md — two
+/// files of 24 KB at most each). Returns what did not fit.
+fn write_agy_rules(dir: &std::path::Path, system: &str) -> std::io::Result<String> {
+    let mut rest = system;
+    for name in ["GEMINI.md", "AGENTS.md"] {
+        if rest.trim().is_empty() {
+            break;
+        }
+        let cut = if rest.len() <= AGY_RULE_BYTES {
+            rest.len()
+        } else {
+            // On a line boundary, at most AGY_RULE_BYTES.
+            let mut at = AGY_RULE_BYTES;
+            while !rest.is_char_boundary(at) {
+                at -= 1;
+            }
+            rest[..at].rfind('\n').map(|i| i + 1).unwrap_or(at)
+        };
+        std::fs::write(dir.join(name), &rest[..cut])?;
+        rest = &rest[cut..];
+    }
+    Ok(rest.to_string())
 }
 
 /// CLIs without a system-prompt flag get it at the top of the prompt, as the
@@ -387,7 +731,7 @@ struct Decoder {
     emitted: HashMap<String, usize>,
     /// Codex: a new agent message after an earlier one starts a paragraph.
     messages: usize,
-    /// agy: a turn just ended (its `result` arrived).
+    /// A turn just ended (its `result` arrived).
     turn_over: bool,
     /// agy: the turn ended with no answer after its own tools were denied —
     /// headless print mode auto-denies them and reports SUCCESS with an
@@ -395,6 +739,8 @@ struct Decoder {
     stalled: bool,
     /// agy: its own tools that were denied (RunCommand, …).
     denied: Vec<String>,
+    /// Codex: the recorded conversation (`thread.started`).
+    thread: Option<String>,
 }
 
 impl Decoder {
@@ -410,6 +756,7 @@ impl Decoder {
             turn_over: false,
             stalled: false,
             denied: Vec::new(),
+            thread: None,
         }
     }
 
@@ -467,6 +814,7 @@ impl Decoder {
                 self.usage.cache_creation_input_tokens = created;
                 self.usage.output_tokens = n("output_tokens");
                 self.usage.total_tokens = self.usage.input_tokens + created + self.usage.output_tokens;
+                self.turn_over = true;
                 if v["is_error"].as_bool().unwrap_or(false) {
                     let msg = s(v, "result");
                     self.fatal = Some(if msg.is_empty() { s(v, "subtype") } else { msg });
@@ -479,6 +827,10 @@ impl Decoder {
 
     fn codex(&mut self, v: &Value) -> Vec<Ev> {
         match v["type"].as_str().unwrap_or("") {
+            "thread.started" => {
+                self.thread = v["thread_id"].as_str().map(String::from);
+                vec![]
+            }
             "item.started" | "item.updated" | "item.completed" => {
                 let item = &v["item"];
                 let id = item["id"].as_str().unwrap_or("").to_string();
@@ -600,14 +952,14 @@ const MAX_NUDGES: usize = 2;
 
 /// The follow-up message: agy's own tools are off, the app's tools are the
 /// `<tool_call>` ones from the instructions.
-fn nudge(denied: &[String]) -> String {
+fn nudge(cli: Cli, denied: &[String]) -> String {
     let text = format!(
         "Your built-in tools ({}) are switched off in this app, and the call was denied. \
          Do not use them again. Use only the tools from my instructions, by writing a <tool_call> block, \
          or answer me in plain text.",
         denied.join(", ")
     );
-    format!("{}\n", json!({ "event": "user", "message": { "role": "user", "content": [{ "type": "text", "text": text }] } }))
+    user_line(cli, &text)
 }
 
 /* ---------- Rig stream items ---------- */
@@ -677,6 +1029,50 @@ impl Emitter {
 mod tests {
     use super::*;
 
+    fn req(history: Vec<Message>) -> CompletionRequest {
+        CompletionRequest {
+            model: None,
+            preamble: Some("instructions".into()),
+            chat_history: history,
+            documents: vec![],
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+            record_telemetry_content: false,
+        }
+    }
+
+    /// A new run of the same chat sends only its new message; an edited
+    /// earlier prompt (the chat did not grow by one) does not resume.
+    #[test]
+    fn chat_session_resumes_with_only_the_new_message() {
+        let first = req(vec![Message::user("build it")]);
+        let (tools, seen) = request_fingerprints(&first);
+        let s = Session { proc: None, thread: Some("t".into()), tools, tool_defs: fingerprint(&first.tools), seen, turns: 1, totals: Usage::new() };
+        // Next run: saved turns + the new prompt, with fresh instructions.
+        let mut next = req(vec![Message::user("build it"), Message::assistant("done"), Message::user("now test it")]);
+        next.preamble = Some("instructions, repo map changed".into());
+        assert_eq!(s.resume(&next).as_deref(), Some("now test it"));
+        let edited = req(vec![Message::user("build it differently")]);
+        assert!(s.resume(&edited).is_none());
+    }
+
+    #[test]
+    fn a_chat_has_one_session_slot_per_model() {
+        let a = chat_slot("chat-x", "chat-x|Claude|opus|high");
+        let b = chat_slot("chat-x", "chat-x|Claude|opus|high");
+        assert!(Arc::ptr_eq(&a, &b));
+        // Another model in the chat replaces it.
+        let c = chat_slot("chat-x", "chat-x|Claude|sonnet|high");
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert_eq!(CHAT_SESSIONS.lock().unwrap().iter().filter(|(k, _)| k.starts_with("chat-x|")).count(), 1);
+        end_chat("chat-x");
+        assert!(!CHAT_SESSIONS.lock().unwrap().iter().any(|(k, _)| k.starts_with("chat-x|")));
+    }
+
     /// agy's real events when Gemini used its own (denied) run_command.
     #[test]
     fn agy_denied_tool_turn_is_stalled_not_empty() {
@@ -690,7 +1086,7 @@ mod tests {
         }
         assert!(d.turn_over && d.stalled);
         assert_eq!(d.denied, ["run_command", "RunCommand"]);
-        assert!(nudge(&d.denied).ends_with("}\n"));
+        assert!(nudge(Cli::Antigravity, &d.denied).ends_with("}\n"));
 
         // An answered turn is not stalled, even with the old denial on record.
         let mut d = Decoder::new(Cli::Antigravity);

@@ -11,10 +11,16 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 /// Who wrote a turn in the conversation being sent to the model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatTurn {
     pub role: String,
     pub text: String,
+    /// Agent turns: a line per tool call (what was read, changed, run).
+    #[serde(default)]
+    pub work_log: String,
+    /// Agent turns: the read / search / command outputs themselves.
+    #[serde(default)]
+    pub work_detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,6 +73,9 @@ pub struct ProviderConfig {
     /// Longest answer, tokens (API models, set by hand); None = default.
     #[serde(default)]
     pub max_tokens: Option<u64>,
+    /// The conversation: a subscription CLI keeps ONE session per chat.
+    #[serde(default)]
+    pub chat_id: String,
 }
 
 /// One attached image, carried as a `data:` URL from the frontend.

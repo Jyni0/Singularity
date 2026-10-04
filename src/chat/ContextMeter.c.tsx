@@ -157,10 +157,26 @@ function Subscription({ usage, error }: { usage: db.CliUsage | null; error: stri
   );
 }
 
+/**
+ * The estimate's parts made to add up to a real measured size. What the
+ * estimate cannot see — the tool results and steps of the run (and, for a
+ * CLI, of every earlier run its session holds, plus the CLI's own prompt) —
+ * becomes its own category; a smaller real size scales everything down.
+ */
+function fitTo(parts: db.ContextPart[], real: number, extraLabel: string): db.ContextPart[] {
+  const sum = parts.reduce((a, p) => a + p.tokens, 0);
+  if (real <= sum) {
+    const k = real / Math.max(1, sum);
+    return parts.map((p) => ({ ...p, tokens: Math.round(p.tokens * k) }));
+  }
+  return [...parts, { label: extraLabel, group: "messages", tokens: real - sum, items: [] }];
+}
+
 export function ContextMeter({
   load,
   refreshKey,
   busy,
+  live,
 }: {
   /** Fetches the report for the current conversation + model. */
   load: () => Promise<ContextReport | null>;
@@ -168,6 +184,8 @@ export function ContextMeter({
   refreshKey: string;
   /** A run is in progress — no re-measuring mid-run. */
   busy?: boolean;
+  /** During a run: the provider's count of the agent's latest request. */
+  live?: number;
 }) {
   const [report, setReport] = useState<ContextReport | null>(null);
   const [loading, setLoading] = useState(false);
@@ -219,14 +237,24 @@ export function ContextMeter({
     };
   }, [open]);
 
-  const parts = (report?.parts ?? []).filter((p) => p.tokens > 0);
+  const kind = report?.providerKind as ProviderKind | undefined;
+  // A subscription CLI keeps ONE session per chat: the next message goes
+  // into it, so its real size is the last request's, not the saved turns'.
+  const cliSession = !!kind && isCliKind(kind);
+  const estimated = (report?.parts ?? []).filter((p) => p.tokens > 0);
+  // Mid-run the estimate (saved turns only) misses the run's tool results:
+  // the provider's own count of the latest request is the truth then.
+  const measured = live || (cliSession ? report?.lastRequest ?? 0 : 0);
+  const parts = (
+    measured ? fitTo(estimated, measured, cliSession ? "Session history & tool results" : "Tool results of this run") : estimated
+  ).filter((p) => p.tokens > 0);
   const used = parts.reduce((a, p) => a + p.tokens, 0);
+  const lastRequest = !live && !cliSession && report?.lastRequest && report.lastRequest > used ? report.lastRequest : null;
   const total = report?.info.context ?? FALLBACK_WINDOW;
   const free = Math.max(0, total - used);
   const pct = report ? Math.round((used / total) * 100) : 0;
   const warn = pct >= 85 ? "var(--diff-del)" : pct >= 60 ? "#f59e0b" : undefined;
   const summary = report ? `${fmtTokens(used)} / ${fmtTokens(total)} (${pct}%)` : "";
-  const kind = report?.providerKind as ProviderKind | undefined;
   const withItems = parts.filter((p) => p.items.length > 0);
   // Kept current in the background, so the menu opens on numbers.
   const limits = useCliUsage(kind);
@@ -282,6 +310,23 @@ export function ContextMeter({
                     <div key={i} className="rounded-full" style={{ width: `${(p.tokens / total) * 100}%`, background: COLOR[p.group] }} />
                   ))}
                 </div>
+                {live ? (
+                  <div className="-mt-1.5 mb-2.5 px-4 text-[11px] text-[var(--text-dim)]">
+                    Live: the size of the agent's latest request, as the provider counted it.
+                  </div>
+                ) : cliSession && measured ? (
+                  <div className="-mt-1.5 mb-2.5 px-4 text-[11px] text-[var(--text-dim)]">
+                    The chat's CLI session: its last request as the provider counted it — earlier runs with their tool results and
+                    the CLI's own instructions included. The next message is added to it.
+                  </div>
+                ) : (
+                  lastRequest && (
+                    <div className="-mt-1.5 mb-2.5 px-4 text-[11px] text-[var(--text-dim)]">
+                      The last run's final request was {fmtTokens(lastRequest)} with its tool results; the next message
+                      starts from the saved conversation shown above.
+                    </div>
+                  )
+                )}
 
                 {detailed && (
                   <ScrollArea className="flex-1">

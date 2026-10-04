@@ -12,15 +12,11 @@ import { Switch, SettingRow, SettingsCard, Sep, Button, Input, TextArea, IconBut
 export function AgentsSettings({
   subagents,
   onChange,
-  maxAgents,
-  onMaxAgents,
   maxRetries,
   onMaxRetries,
 }: {
   subagents: db.Subagent[];
   onChange: (next: db.Subagent[]) => void;
-  maxAgents: number;
-  onMaxAgents: (n: number) => void;
   maxRetries: number;
   onMaxRetries: (n: number) => void;
 }) {
@@ -57,21 +53,10 @@ export function AgentsSettings({
           />
         </SettingRow>
         <Sep />
-        <SettingRow
-          title="Max agents at once"
-          hint="How many agents may work in parallel (1–52). Above 1 a built-in “worker” helper is always available, and the agent splits work across helpers and runs independent tool calls side by side. They share the provider's rate limits — raise its Concurrency too."
-        >
-          <Input
-            type="number"
-            min={1}
-            max={52} className="w-[90px]"
-            value={maxAgents}
-            onChange={(e) => {
-              const n = Math.min(52, Math.max(1, Math.floor(Number(e.target.value)) || 1));
-              onMaxAgents(n);
-            }}
-          />
-        </SettingRow>
+        <div className="text-[12px] text-[var(--text-dim)]">
+          How many agents may work at once is set per provider (Settings → Models → the provider → Max agents), and a model can override it. The default is 1:
+          the agent works alone and opens no extra sessions. Subscription CLIs always use one agent and one session per chat.
+        </div>
       </SettingsCard>
 
       <SettingsCard>

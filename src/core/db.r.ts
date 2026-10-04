@@ -317,6 +317,8 @@ export async function updateConversationPinned(id: string, pinned: boolean): Pro
 }
 
 export async function removeConversation(id: string): Promise<void> {
+  // A subscription CLI may still hold this chat's session open.
+  void invoke("cli_end_chat", { chatId: id }).catch(() => {});
   const db = await getDb();
   if (!db) {
     for (const p of memory.projects) {
@@ -1031,6 +1033,11 @@ export async function onCliProgress(handler: (p: CliProgress) => void): Promise<
 export interface ChatTurn {
   role: "user" | "agent" | "compact";
   text: string;
+  /** Agent turns: one line per tool call (what was read, changed, run). */
+  work_log?: string;
+  /** Agent turns: the read / search / command outputs themselves. The
+   *  backend keeps them for the latest turn only (see trim_history). */
+  work_detail?: string;
 }
 
 /** An image attachment, carried as a data URL and converted per protocol. */
@@ -1061,6 +1068,8 @@ export interface ProviderConfig {
   concurrency?: number;
   /** Longest answer, tokens — the user's cap for an API model. */
   max_tokens?: number;
+  /** Conversation id: subscription CLIs keep ONE session per chat. */
+  chat_id?: string;
 }
 
 /**
@@ -1199,6 +1208,8 @@ export interface AgentRequest {
   subagents?: Subagent[];
   /** How many helper agents may work at the same time. */
   max_agents?: number;
+  /** Conversation id: subscription CLIs keep ONE session per chat. */
+  chat_id?: string;
   /** Retries of a failed model request (API/stream error), 5s apart. */
   max_retries?: number;
 }
@@ -1237,12 +1248,6 @@ export async function loadMaxRetries(): Promise<number> {
   return Number.isFinite(n) && n >= 0 ? Math.min(n, 20) : 5;
 }
 
-/** How many helper agents may run at once (default 2). */
-export async function loadMaxAgents(): Promise<number> {
-  const n = Number(await getSetting("max_agents"));
-  return Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), 52) : 2;
-}
-
 /**
  * Cumulative token accounting of one run (agent://usage / chat://usage) —
  * what the Debug mode HUD shows: totals across every round of the run, with
@@ -1260,6 +1265,9 @@ export interface RunUsage {
   first_input?: number;
   /** …and our estimate of the same request (calibrates the context gauge). */
   first_est?: number;
+  /** Agent runs: the provider's input count of the main agent's latest
+   *  request — how full the context really is (live during a run). */
+  last_input?: number;
 }
 
 export interface AgentStepEvent {
@@ -2597,6 +2605,64 @@ export async function loadModelCaps(rowId: string): Promise<ModelCapsOverride | 
 export async function saveModelCaps(rowId: string, caps: ModelCapsOverride | null): Promise<void> {
   await setSetting(`model_caps:${rowId}`, caps ? JSON.stringify(caps) : "");
   capsListeners.forEach((fn) => fn(rowId));
+}
+
+/**
+ * How many agents a model's run may use: 1 = the main agent alone (no
+ * helpers, no extra sessions), N = up to N helpers side by side. Set per
+ * model (Settings → Models); default 1. Subscription CLIs are always 1 —
+ * each helper would be another CLI session eating the plan's limits.
+ */
+export async function loadModelAgents(rowId: string, kind: string, providerId?: string): Promise<number> {
+  if (isCliKind(kind as ProviderKind)) return 1;
+  const own = await loadModelAgentsOverride(rowId);
+  if (own !== null) return own;
+  return providerId ? loadProviderAgents(providerId) : 1;
+}
+
+const parseAgents = (raw: string | null): number | null => {
+  const n = Number(raw);
+  return raw && Number.isFinite(n) && n >= 1 ? Math.min(52, Math.floor(n)) : null;
+};
+
+/** The model's own number; null = the provider's. */
+export async function loadModelAgentsOverride(rowId: string): Promise<number | null> {
+  return parseAgents(await getSetting(`model_agents:${rowId}`).catch(() => null));
+}
+
+/** null clears the model's own number (it follows its provider again). */
+export async function saveModelAgents(rowId: string, n: number | null): Promise<void> {
+  await setSetting(`model_agents:${rowId}`, n === null ? "" : String(Math.min(52, Math.max(1, Math.floor(n) || 1))));
+  capsListeners.forEach((fn) => fn(rowId));
+}
+
+/** The provider + model (and effort) a chat runs on — it keeps them. */
+export interface ConvModel {
+  gatewayId: string;
+  modelId: string;
+  effort?: Effort;
+}
+
+export async function loadConvModel(convId: string): Promise<ConvModel | null> {
+  try {
+    const raw = await getSetting(`conv_model:${convId}`);
+    return raw ? (JSON.parse(raw) as ConvModel) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveConvModel(convId: string, m: ConvModel): Promise<void> {
+  await setSetting(`conv_model:${convId}`, JSON.stringify(m));
+}
+
+/** Max agents for every model of a provider (Settings → Models → the provider). */
+export async function loadProviderAgents(providerId: string): Promise<number> {
+  return parseAgents(await getSetting(`provider_agents:${providerId}`).catch(() => null)) ?? 1;
+}
+
+export async function saveProviderAgents(providerId: string, n: number): Promise<void> {
+  await setSetting(`provider_agents:${providerId}`, String(Math.min(52, Math.max(1, Math.floor(n) || 1))));
 }
 
 const capsListeners = new Set<(rowId: string) => void>();

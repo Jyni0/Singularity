@@ -89,7 +89,7 @@ export function PromptBox({
   busy?: boolean;
   onStop?: () => void;
   /** Model chosen earlier — restored so the chat remembers its model. */
-  pickedModel?: { gatewayId: string; modelId: string } | null;
+  pickedModel?: { gatewayId: string; modelId: string; effort?: Effort } | null;
   /** Reports the model the user picked, so it can be persisted. */
   onPickModel?: (next: { gatewayId: string; modelId: string }) => void;
   /** Folder the prompt's run works in — the @ menu lists its files. */
@@ -112,7 +112,7 @@ export function PromptBox({
   const [gatewayId, setGatewayId] = useState("");
   const [modelId, setModelId] = useState("");
   const [effort, setEffort] = useState<Effort>(
-    () => (localStorage.getItem("effort") as Effort) || "medium"
+    () => (localStorage.getItem("effort") as Effort) || "low"
   );
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
@@ -322,6 +322,25 @@ export function PromptBox({
       setModelId(first.models[0].id);
     }
   }, [gateways, gatewayId, modelId, pickedModel]);
+
+  // Another chat opened (or the pick changed from outside): follow it — the
+  // effect above only repairs a selection that no longer exists.
+  // Applied once per pick (a provider list refresh must not undo the
+  // user's own later effort / model choice).
+  const appliedPick = useRef<typeof pickedModel>(null);
+  useEffect(() => {
+    if (!pickedModel || appliedPick.current === pickedModel) return;
+    const exists = gateways.some((g) => g.id === pickedModel.gatewayId && g.models.some((m) => m.id === pickedModel.modelId));
+    if (!exists) return;
+    appliedPick.current = pickedModel;
+    setGatewayId(pickedModel.gatewayId);
+    setModelId(pickedModel.modelId);
+    if (pickedModel.effort) {
+      setEffort(pickedModel.effort);
+      localStorage.setItem("effort", pickedModel.effort);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pickedModel, gateways]);
 
   const autoGrow = () => {
     const el = ref.current;

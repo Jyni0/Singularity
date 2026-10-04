@@ -71,8 +71,6 @@ export function SettingsModal({
   onGenAnimation,
   subagents,
   onSubagents,
-  maxAgents,
-  onMaxAgents,
   maxRetries,
   onMaxRetries,
   initialProject,
@@ -86,8 +84,6 @@ export function SettingsModal({
   /** Helper agents (Settings → Agent). */
   subagents: db.Subagent[];
   onSubagents: (next: db.Subagent[]) => void;
-  maxAgents: number;
-  onMaxAgents: (n: number) => void;
   /** Retries of a failed model request (API / stream errors). */
   maxRetries: number;
   onMaxRetries: (n: number) => void;
@@ -359,8 +355,6 @@ export function SettingsModal({
             <AgentsSettings
               subagents={subagents}
               onChange={onSubagents}
-              maxAgents={maxAgents}
-              onMaxAgents={onMaxAgents}
               maxRetries={maxRetries}
               onMaxRetries={onMaxRetries}
             />

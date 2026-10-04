@@ -16,7 +16,7 @@ mod model;
 mod protocol;
 mod usage;
 
-pub use model::CliModel;
+pub use model::{end_chat, keeps_session, CliModel};
 
 use serde::Serialize;
 use std::ffi::OsString;
@@ -84,6 +84,7 @@ pub fn init(app: &AppHandle) {
         .join("cli");
     let _ = ROOT.set(root);
     let _ = APP.set(app.clone());
+    sweep_leftovers();
     // Keep the app's own CLI copies current (older ones miss features the
     // app relies on, e.g. agy's read-only `/usage`).
     tauri::async_runtime::spawn(async {
@@ -125,10 +126,35 @@ fn root() -> PathBuf {
 }
 
 /// Empty working folder for CLI runs: they never see the user's files.
+///
+/// It must stay byte-for-byte the same between calls: the CLIs put their
+/// working folder (and what is in it) near the top of their own prompt, so
+/// anything that changes here breaks the provider's prompt cache for the
+/// whole rest of every request. Per-call files therefore live in `jobs()`.
 fn scratch() -> PathBuf {
     let dir = root().join("scratch");
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+/// Per-call temp files (system prompt file, images), outside `scratch()`.
+fn jobs() -> PathBuf {
+    let dir = root().join("jobs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Removes per-call folders left behind by killed runs (and by older
+/// versions, which kept them inside the working folder).
+fn sweep_leftovers() {
+    for dir in [scratch(), jobs()] {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with("run-") {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
 }
 
 /// First `name` on PATH (with the Windows executable extensions).
@@ -767,6 +793,12 @@ pub async fn cli_login(kind: String) -> Result<CliStatus, String> {
     login(cli_of(&kind)?).await
 }
 
+/// Ends the CLI session a deleted chat kept alive.
+#[tauri::command]
+pub fn cli_end_chat(chat_id: String) {
+    end_chat(&chat_id);
+}
+
 /// The subscription's plan and how much of each limit window is used.
 #[tauri::command]
 pub async fn cli_usage(kind: String) -> Result<usage::CliUsage, String> {
@@ -881,6 +913,119 @@ mod live {
             println!("item: {item:?}");
         }
         println!("choice: {:?}", s.choice);
+    }
+
+    /// Prompt-cache hits across the calls of one agent run: a big stable
+    /// prefix, then a history that only grows. Prints input / cache_read
+    /// per call. `CACHE_CLI=antigravity|claude|codex`, `CACHE_MODEL=…`.
+    #[tokio::test]
+    #[ignore]
+    async fn cache_across_turns() {
+        let _ = ROOT.set(PathBuf::from(std::env::var("CLI_TEST_ROOT").expect("CLI_TEST_ROOT")));
+        sweep_leftovers();
+        let cli = match std::env::var("CACHE_CLI").as_deref() {
+            Ok("claude") => Cli::Claude,
+            Ok("codex") => Cli::Codex,
+            _ => Cli::Antigravity,
+        };
+        let model = std::env::var("CACHE_MODEL").unwrap_or_else(|_| "default".into());
+        // ~8k tokens of stable system prompt, like the agent's.
+        let preamble: String = (0..400)
+            .map(|i| format!("Rule {i}: keep files under src/module_{i} consistent with the style guide section {i}.\n"))
+            .collect();
+        let tool = rig_agent::core::completion::ToolDefinition {
+            name: "read_file".into(),
+            description: "Read a text file".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        };
+        let mut history = vec![Message::user("Read src/a.txt with the read_file tool, then src/b.txt, then answer DONE.")];
+        // ONE model for the whole run, as the agent loop uses it: with
+        // CACHE_ONESHOT set every call starts a new process (the old way).
+        let model = CliModel::new(cli, &model, "low");
+        for turn in 0..3 {
+            let req = CompletionRequest {
+                model: None,
+                preamble: Some(preamble.clone()),
+                chat_history: history.clone(),
+                documents: vec![],
+                tools: vec![tool.clone()],
+                temperature: None,
+                max_tokens: None,
+                tool_choice: None,
+                additional_params: None,
+                output_schema: None,
+                record_telemetry_content: false,
+            };
+            let mut s = if std::env::var_os("CACHE_ONESHOT").is_some() { model.open(req, false).await } else { model.stream(req).await }.expect("open");
+            while let Some(item) = s.next().await {
+                if let Err(e) = item {
+                    println!("turn {turn}: error {e}");
+                }
+            }
+            let u = s.response.as_ref().map(|r| r.usage).unwrap_or_default();
+            println!(
+                "turn {turn}: input(whole prompt)={} cache_read={} output={} ({}% cached)",
+                u.input_tokens,
+                u.cached_input_tokens,
+                u.output_tokens,
+                if u.input_tokens > 0 { u.cached_input_tokens * 100 / u.input_tokens } else { 0 }
+            );
+            // Grow the history the way a run does: a tool call + its result.
+            let call = rig_agent::core::completion::message::ToolCall::new(
+                rig_agent::core::completion::message::ToolCallId::new_or_mint(format!("c{turn}")),
+                rig_agent::core::completion::message::ToolFunction::new("read_file".into(), serde_json::json!({"path": format!("src/{turn}.txt")})),
+            );
+            history.push(Message::Assistant { id: None, content: vec![rig_agent::core::completion::message::AssistantContent::ToolCall(call)] });
+            history.push(Message::tool_result(format!("c{turn}"), "read_file", format!("contents of file {turn}\n").repeat(200)));
+        }
+    }
+
+    /// The same three turns as `cache_across_turns`, but in ONE agy session:
+    /// each turn writes only the new message to the live process.
+    #[tokio::test]
+    #[ignore]
+    async fn agy_session_cache() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let _ = ROOT.set(PathBuf::from(std::env::var("CLI_TEST_ROOT").expect("CLI_TEST_ROOT")));
+        sweep_leftovers();
+        let model = std::env::var("CACHE_MODEL").unwrap_or_else(|_| "gemini-3.1-pro".into());
+        let launch = ensure(Cli::Antigravity).await.expect("agy");
+        let mut cmd = launch.command();
+        cmd.args(["--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands"]);
+        cmd.args(agy_model_args(&launch, &model, "low").await);
+        cmd.args(["-p", ""]).stdin(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn");
+        let mut stdin = child.stdin.take().unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let preamble: String = (0..400)
+            .map(|i| format!("Rule {i}: keep files under src/module_{i} consistent with the style guide section {i}.\n"))
+            .collect();
+        let msg = |text: String| format!("{}\n", serde_json::json!({ "event": "user", "message": { "role": "user", "content": [{ "type": "text", "text": text }] } }));
+        let mut first = format!(
+            "My instructions for this conversation:\n\n{preamble}\n\nTools: write <tool_call>{{\"name\":\"read_file\",\"arguments\":{{\"path\":\"…\"}}}}</tool_call> to read a file; I reply with its contents.\n\n---\n\nRead src/a.txt, then src/b.txt, then answer DONE."
+        );
+        let (mut prev_in, mut prev_cached) = (0u64, 0u64);
+        for turn in 0..3 {
+            stdin.write_all(msg(std::mem::take(&mut first)).as_bytes()).await.unwrap();
+            stdin.flush().await.unwrap();
+            loop {
+                let Some(line) = lines.next_line().await.unwrap() else { panic!("agy exited") };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                if v["event"] == "result" {
+                    let u = &v["result"]["usage"];
+                    let (i, c) = (u["input_tokens"].as_u64().unwrap_or(0), u["cache_read_tokens"].as_u64().unwrap_or(0));
+                    println!("turn {turn}: input={} cache_read={} (session totals {i} / {c})", i - prev_in, c - prev_cached);
+                    (prev_in, prev_cached) = (i, c);
+                    break;
+                }
+            }
+            first = format!(
+                "<tool_result name=\"read_file\" id=\"c{turn}\">\n{}</tool_result>",
+                format!("contents of file {turn}\n").repeat(200)
+            );
+        }
+        let _ = stdin.shutdown().await;
+        let _ = child.kill().await;
     }
 
     /// The reported bug: a fixed-effort model plus an effort that it lacks.

@@ -1,26 +1,36 @@
-//! Agent loop - lets the model actually do work, not just talk.
+//! Agent - lets the model actually do work, not just talk.
 //!
-//! The run loop itself is Rig's (`rig-agent`): provider clients, streaming,
-//! multi-turn tool calling and hooks. This file is the shared spine around
-//! it: the request shape, UI events, the command approval gate and the
-//! public entry point. The heavy parts live in the agent/ submodules:
-//!   prompt    - tool schema + system prompt + call summaries
-//!   model     - provider → Rig model handle (effort, temperature, caching)
-//!   runtime   - Rig agent build, streaming consumer, hook, tools, subagents
-//!   context   - history bounding
-//!   expand    - /commands, skills invoked by name and @mentions
+//! Only the low-level provider layer is Rig's (rig-core clients and
+//! streaming); the agent loop, context management, prompts and tool
+//! registry are ours. This file is the shared spine: the request shape, UI
+//! events, the command approval gate and the public entry point. The heavy
+//! parts live in the agent/ submodules:
+//!   agent_loop  - AgentLoop: model turns, tool execution, retries
+//!   guardrails  - LoopGuard (stuck-loop detector), turn budget
+//!   context     - history bounding, collapsing, read dedupe, compaction
+//!   prompts     - SystemPromptBuilder: the static half of every request
+//!   tools       - ToolRegistry: built-in, MCP, skill and delegate tools
+//!   permissions - which tool calls wait for the user's Allow/Deny
+//!   model       - provider → rig-core model handle (effort, temperature, caching)
+//!   run_ctx     - state shared by the agents of one run
+//!   runtime     - one run end to end, subagents, context view
+//!   expand      - /commands, skills invoked by name and @mentions
 
+mod agent_loop;
 mod cachenet;
 mod context;
 mod expand;
+mod guardrails;
 mod model;
+mod permissions;
 mod plain;
-mod prompt;
+mod prompts;
+mod run_ctx;
 mod runtime;
+mod tools;
 pub use plain::stream as stream_plain;
 pub use runtime::ContextPart;
 
-use crate::tools;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -115,10 +125,6 @@ async fn ask_confirm(app: &AppHandle, run_id: &str, command: &str, cwd: &str, re
         }
     }
 }
-
-/// Upper bound on model calls of one run (Rig's total model-call budget).
-/// The repeat guard in the hook stops pathological loops long before this.
-const MAX_TURNS: usize = 128;
 
 /* ---------- Events ---------- */
 
@@ -238,6 +244,9 @@ pub struct AgentRequest {
     /// How many subagents may work at the same time (0/1 = one at a time).
     #[serde(default)]
     pub max_agents: usize,
+    /// The conversation: a subscription CLI keeps ONE session per chat.
+    #[serde(default)]
+    pub chat_id: String,
     /// Retries of a failed model request (any API/stream error) before the
     /// run gives up. Settings → Agent; default 5.
     #[serde(default = "default_retries")]
@@ -249,6 +258,17 @@ pub struct AgentRequest {
     /// Where `generate_image` draws (None = this run cannot make pictures).
     #[serde(default)]
     pub image_gen: Option<crate::imagegen::ImageGenConfig>,
+}
+
+impl AgentRequest {
+    /// Whether the run offers the `delegate` tool.
+    /// Never with one agent, and never for a subscription CLI: each helper
+    /// is another CLI session eating the plan's limits.
+    pub(crate) fn has_helpers(&self) -> bool {
+        self.max_agents > 1
+            && crate::cli::Cli::from_kind(&self.kind).is_none()
+            && self.subagents.iter().any(|s| !s.name.trim().is_empty())
+    }
 }
 
 fn default_retries() -> usize {
@@ -293,7 +313,7 @@ pub async fn agent_context(
     turns: Vec<crate::chat::ChatTurn>,
 ) -> Result<Vec<runtime::ContextPart>, String> {
     let root = Path::new(&req.workspace).to_path_buf();
-    let system = if req.system.trim().is_empty() { prompt::default_system() } else { req.system.clone() };
+    let system = if req.system.trim().is_empty() { prompts::default_system() } else { req.system.clone() };
     let turns = context::trim_history(turns);
     runtime::context_info(&app, &req, &system, &root, turns).await
 }
@@ -319,7 +339,7 @@ pub async fn run_agent(
     }
 
     let system = if req.system.trim().is_empty() {
-        prompt::default_system()
+        prompts::default_system()
     } else {
         req.system.clone()
     };
@@ -331,7 +351,12 @@ pub async fn run_agent(
     // clipped — the whole chat history used to ride along on every round.
     let turns = context::trim_history(turns);
 
+    tracing::info!(run_id = %run_id, kind = %req.kind, model = %req.model, turns = turns.len(), "agent run started");
     let result = runtime::run(&app, &run_id, &req, &system, &root, turns).await;
+    match &result {
+        Ok(answer) => tracing::info!(run_id = %run_id, answer_chars = answer.len(), "agent run finished"),
+        Err(e) => tracing::warn!(run_id = %run_id, error = %context::one_line(e, 300), "agent run failed"),
+    }
 
     crate::cancel::clear(&run_id);
 
@@ -404,7 +429,7 @@ fn emit_think(app: &AppHandle, run_id: &str, delta: impl Into<String>) {
 
 /// Emits a step. `done=false` marks "this tool just started" so the UI shows the
 /// card immediately; `done=true` carries the result.
-fn emit_step(app: &AppHandle, run_id: &str, index: usize, name: &str, input: String, done: bool, res: &tools::ToolResult) {
+fn emit_step(app: &AppHandle, run_id: &str, index: usize, name: &str, input: String, done: bool, res: &crate::tools::ToolResult) {
     crate::runs::push_event(
         run_id,
         crate::runs::RunEvent::Step {
@@ -441,22 +466,22 @@ fn emit_step(app: &AppHandle, run_id: &str, index: usize, name: &str, input: Str
 /// Runs the model's ssh_exec call through the shared SSH pool. The unit name
 /// from the model maps to a saved server id; credentials never leave Rust.
 /// Every attempt is audit-logged with actor "agent" (the Logs page shows it).
-async fn run_ssh_tool(app: &AppHandle, req: &AgentRequest, args: &Value) -> tools::ToolResult {
+async fn run_ssh_tool(app: &AppHandle, req: &AgentRequest, args: &Value) -> crate::tools::ToolResult {
     let server_name = args.get("server").and_then(|v| v.as_str()).unwrap_or("");
     let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
     if server_name.is_empty() || command.is_empty() {
-        return tools::ToolResult::err("ssh_exec needs both server and command");
+        return crate::tools::ToolResult::err("ssh_exec needs both server and command");
     }
     let unit = req.ssh_units.iter().find(|u| u.name == server_name);
     let Some(unit) = unit else {
         let known: Vec<&str> = req.ssh_units.iter().map(|u| u.name.as_str()).collect();
-        return tools::ToolResult::err(format!(
+        return crate::tools::ToolResult::err(format!(
             "unknown server {server_name:?}; available: {known:?}"
         ));
     };
     match crate::ssh::exec(app, "agent", &unit.id, command).await {
-        Ok(out) => tools::ToolResult::ok(out),
-        Err(e) => tools::ToolResult::err(e),
+        Ok(out) => crate::tools::ToolResult::ok(out),
+        Err(e) => crate::tools::ToolResult::err(e),
     }
 }
 
@@ -479,4 +504,7 @@ pub struct RunUsage {
     /// Our estimate of that same request (context_info's method): the
     /// context gauge scales its estimates by first_input / first_est.
     pub first_est: u64,
+    /// Input tokens of the main agent's LATEST model call (cache reads
+    /// included) — how full its context really is right now.
+    pub last_input: u64,
 }

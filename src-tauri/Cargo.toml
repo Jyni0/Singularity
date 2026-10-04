@@ -49,6 +49,9 @@ aes-gcm = "0.11.1"
 encoding_rs = "0.8"
 rig-core = "0.42"
 rig-agent = "0.42"
+# Structured logs (agent steps, token spend, guard / context-editing events).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Unpacking the vendor CLIs' npm tarballs (cli/install.rs).
 tar = "0.4"
 flate2 = "1"
@@ -72,6 +75,10 @@ tauri-plugin-clipboard-manager = "2"
 
 # WebView2 hooks (same versions wry uses): take Ctrl+F / Ctrl+G / F3 away
 # from the browser's own find bar so the app's search gets them.
+[dev-dependencies]
+# Scripted MockCompletionModel for the agent loop tests.
+rig-core = { version = "0.42", features = ["test-utils"] }
+
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
 windows-core = "0.62"

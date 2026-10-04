@@ -12,6 +12,32 @@ export type DiffLine =
   | { kind: "ctx"; text: string; oldNo: number; newNo: number }
   | { kind: "hunk"; text: string };
 
+/** Lines added / removed between two texts (the common head and tail are
+ *  skipped first, so a small edit of a big file stays cheap). */
+export function diffStat(oldText: string, newText: string): { added: number; removed: number } {
+  if (oldText === newText) return { added: 0, removed: 0 };
+  const a = oldText === "" ? [] : oldText.split("\n");
+  const b = newText === "" ? [] : newText.split("\n");
+  let head = 0;
+  while (head < a.length && head < b.length && a[head] === b[head]) head++;
+  let tail = 0;
+  while (tail < a.length - head && tail < b.length - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail++;
+  const x = a.slice(head, a.length - tail);
+  const y = b.slice(head, b.length - tail);
+  if (x.length === 0 || y.length === 0 || x.length * y.length > 4_000_000) return { added: y.length, removed: x.length };
+  // LCS length, two rows.
+  let prev = new Uint32Array(y.length + 1);
+  let cur = new Uint32Array(y.length + 1);
+  for (let i = 1; i <= x.length; i++) {
+    for (let j = 1; j <= y.length; j++) {
+      cur[j] = x[i - 1] === y[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1]);
+    }
+    [prev, cur] = [cur, prev];
+  }
+  const same = prev[y.length];
+  return { added: y.length - same, removed: x.length - same };
+}
+
 export function computeDiff(oldText: string, newText: string): DiffLine[] {
   const a = oldText.split("\n");
   const b = newText.split("\n");

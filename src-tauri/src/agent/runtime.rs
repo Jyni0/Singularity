@@ -1,1145 +1,227 @@
-//! The agent run on Rig: builds a `rig_agent::Agent` from the request,
-//! streams it multi-turn and translates everything into the app's events.
+//! One agent run, end to end: loads skills and MCP servers, builds the
+//! system prompt and the tool registry, hands the conversation to the
+//! `AgentLoop` and returns its answer. Also the subagents (`delegate`) and
+//! the context view (what the next request would carry).
 //!
-//! * Text / reasoning deltas come off the Rig stream and go straight to the
-//!   UI (`agent://text`, `agent://think`).
-//! * Tool calls are observed through an [`AgentHook`]: the card appears while
-//!   the model is still streaming the arguments, the Allow/Deny gate runs
-//!   before execution, and the result (with diff metadata from the tool's
-//!   `ToolContext`) closes the card.
-//! * Tools are `DynamicTool`s over the existing `tools::dispatch`.
 //! * Subagents: user-defined helpers reachable through ONE `delegate` tool;
 //!   the model decides which task goes to which helper. A semaphore bounds
-//!   how many work at once, and the main run executes tool calls with the
-//!   same concurrency so several delegations really run in parallel.
+//!   how many work at once, and the main loop runs the tool calls of a turn
+//!   side by side, so several delegations really run in parallel.
 //! * Skills: a `skill` tool loads a skill's instructions on demand; the
-//!   preamble lists only names + descriptions.
-//! * MCP: every tool of every enabled MCP server becomes a `mcp__server__tool`
-//!   dynamic tool over the pooled connection (mcp.rs).
+//!   system prompt lists only names + descriptions.
+//! * MCP: every tool of every enabled MCP server is in the registry — inline,
+//!   or through mcp_find / mcp_call when the schemas are big.
 
-use super::context::one_line;
-use super::prompt::{summarize, tool_specs};
-use super::{
-    ask_confirm, cancelled_result, emit_retry, emit_step, emit_text, emit_think, emit_usage, is_cancelled,
-    model, run_ssh_tool, AgentRequest, RunUsage, SubagentDef, MAX_TURNS,
+use super::agent_loop::AgentLoop;
+use super::context::{est_tokens, one_line, project_context, ProjectContext};
+use super::prompts::{default_system, McpMode, SystemPromptBuilder};
+use super::run_ctx::{RunCtx, DEFAULT_WINDOW};
+use super::tools::{
+    builtin_tools, load_mcp, mcp_catalog, mcp_deferred, mcp_mode, tool_specs, AgentTool, CallInfo, McpBinding, McpCall, McpFind,
+    McpToolAdapter, SkillTool, ToolRegistry, ToolSource,
 };
-use crate::tools;
-use futures_util::StreamExt;
-use rig_agent::agent::{
-    AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, HookContext,
-    MultiTurnStreamItem, ObservationAction, StreamResponseFinish, ToolCall, ToolCallAction,
-    ToolCallDelta, ToolResultAction, ToolResultEvent,
-};
+use super::{cancelled_result, is_cancelled, AgentRequest, SubagentDef};
+use crate::tools::ToolResult;
+use futures_util::future::BoxFuture;
 use rig_agent::core::completion::message::{ImageMediaType, Message, UserContent};
-use rig_agent::core::streaming::StreamedAssistantContent;
-use rig_agent::core::tool::{ToolExecutionError, ToolOutput};
-use rig_agent::core::wasm_compat::WasmBoxedFuture;
-use rig_agent::streaming::StreamingChat;
-use rig_agent::tool::{DynamicTool, ToolContext};
+use rig_agent::core::completion::ToolDefinition;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use tauri::AppHandle;
 
 /// Upper bound of "Max agents at once".
 pub(super) const MAX_AGENTS: usize = 52;
 /// Name of the built-in general-purpose helper.
 const WORKER: &str = "worker";
+/// How long the run waits for the model's context window lookup.
+const WINDOW_LOOKUP: std::time::Duration = std::time::Duration::from_secs(4);
 
-/* ---------- Shared run state ---------- */
-
-/// State shared by the main agent, its hook, its tools and every subagent of
-/// one run. Cheap to clone (all Arcs).
-#[derive(Clone)]
-struct RunCtx {
-    app: AppHandle,
-    run_id: String,
-    req: Arc<AgentRequest>,
-    root: PathBuf,
-    /// Rig internal call id → the UI cards opened under it. Normally one per
-    /// id, but gateways / local servers can hand several parallel calls the
-    /// same id — each (id, call fingerprint) then keeps a card of its own
-    /// instead of all of them overwriting one ("list_dir shown as a failed
-    /// Edit").
-    steps: Arc<Mutex<HashMap<String, Vec<CallCard>>>>,
-    /// Next step index (shared by main agent and subagents).
-    counter: Arc<AtomicUsize>,
-    /// One Allow/Deny banner at a time, even with parallel tool calls.
-    confirm_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Bounds concurrently working subagents.
-    agent_slots: Arc<tokio::sync::Semaphore>,
-    /// Canonical delegate args → its step index, so the running subagent can
-    /// stream its progress into its own card.
-    delegate_cards: Arc<Mutex<HashMap<String, usize>>>,
-    usage: Arc<Mutex<RunUsage>>,
-    started: std::time::Instant,
-    /// MCP tool name → (server name, read-only hint) for the approval gate.
-    mcp_tools: Arc<HashMap<String, (String, bool)>>,
-    /// Working directory of file tools and commands; `change_dir` moves it.
-    /// Starts at the workspace.
-    cwd: Arc<Mutex<PathBuf>>,
-    /// Set once the provider rejected the temperature parameter (reasoning
-    /// models, out-of-range values): later requests go without it.
-    no_temperature: Arc<AtomicBool>,
-}
-
-impl RunCtx {
-    fn cwd(&self) -> PathBuf {
-        self.cwd.lock().unwrap().clone()
-    }
-
-    fn next_index(&self) -> usize {
-        self.counter.fetch_add(1, Ordering::SeqCst) + 1
-    }
-
-    /// Card of a call whose arguments are still streaming.
-    fn live_step(&self, internal_id: &str) -> usize {
-        let mut map = self.steps.lock().unwrap();
-        let cards = map.entry(internal_id.to_string()).or_default();
-        if let Some(c) = cards.iter().find(|c| c.call.is_none()) {
-            return c.index;
-        }
-        let index = self.next_index();
-        cards.push(CallCard { call: None, index, done: false });
-        index
-    }
-
-    /// Card of a call about to run: the live card of its id if one is still
-    /// unclaimed, else a new one.
-    fn call_step(&self, internal_id: &str, fingerprint: &str) -> usize {
-        let mut map = self.steps.lock().unwrap();
-        let cards = map.entry(internal_id.to_string()).or_default();
-        if let Some(c) = cards.iter_mut().find(|c| c.call.is_none()) {
-            c.call = Some(fingerprint.to_string());
-            return c.index;
-        }
-        let index = self.next_index();
-        cards.push(CallCard { call: Some(fingerprint.to_string()), index, done: false });
-        index
-    }
-
-    /// How many calls ran under this Rig call id (> 1 = the gateway reused it).
-    fn cards_under(&self, internal_id: &str) -> usize {
-        self.steps.lock().unwrap().get(internal_id).map_or(0, |c| c.iter().filter(|c| c.call.is_some()).count())
-    }
-
-    /// Card a finished call's result belongs to: the one opened for exactly
-    /// this call (id + fingerprint).
-    fn result_step(&self, internal_id: &str, fingerprint: &str) -> usize {
-        let mut map = self.steps.lock().unwrap();
-        let cards = map.entry(internal_id.to_string()).or_default();
-        let pick = cards
-            .iter()
-            .position(|c| !c.done && c.call.as_deref() == Some(fingerprint))
-            .or_else(|| cards.iter().position(|c| !c.done && c.call.is_none()));
-        match pick {
-            Some(i) => {
-                cards[i].done = true;
-                cards[i].index
-            }
-            None => {
-                let index = self.next_index();
-                cards.push(CallCard { call: Some(fingerprint.to_string()), index, done: true });
-                index
-            }
-        }
-    }
-
-    fn add_usage(&self, input: u64, output: u64, cached: u64) {
-        let mut u = self.usage.lock().unwrap();
-        if u.first_input == 0 {
-            u.first_input = input;
-        }
-        u.prompt_tokens += input;
-        u.completion_tokens += output;
-        u.cached_tokens += cached;
-        u.elapsed_ms = self.started.elapsed().as_millis() as u64;
-        emit_usage(&self.app, &u);
-    }
-}
-
-/// Canonical JSON text of tool arguments (key order, whitespace) — the hook
-/// sees the raw string, the tool the parsed value; both map to this.
-fn canonical(args: &Value) -> String {
-    serde_json::to_string(args).unwrap_or_default()
-}
-
-/// One UI card under a Rig call id.
-struct CallCard {
-    /// Fingerprint (`tool(args)`) of the call that claimed it; None while
-    /// its arguments are still streaming.
-    call: Option<String>,
-    index: usize,
-    done: bool,
-}
-
-/// Arguments as an object: some providers send them as a JSON *string*
-/// (`"{\"command\":…}"`), which the hook and the tool then saw differently.
-fn norm_args(args: &Value) -> Value {
-    match args {
-        Value::String(s) => serde_json::from_str::<Value>(s)
-            .ok()
-            .filter(|v| v.is_object())
-            .unwrap_or_else(|| args.clone()),
-        _ => args.clone(),
-    }
-}
-
-/// Parses the raw argument text the hooks get.
-fn parse_args(raw: &str) -> Value {
-    norm_args(&serde_json::from_str(raw).unwrap_or(json!({})))
-}
-
-/// `tool(args)` — identifies one call independent of Rig's call id.
-fn fingerprint(tool: &str, args: &Value) -> String {
-    format!("{tool}({})", canonical(&norm_args(args)))
-}
-
-/// Tool results by call fingerprint, filled by the tools themselves. The
-/// hook reads the card's result from here: Rig's per-call ToolContext is
-/// keyed by its call id, and calls that share an id also shared (and
-/// overwrote) each other's result.
-static RESULTS: Mutex<Option<HashMap<String, Vec<tools::ToolResult>>>> = Mutex::new(None);
-
-fn stash_result(fingerprint: String, res: &tools::ToolResult) {
-    if let Ok(mut g) = RESULTS.lock() {
-        g.get_or_insert_with(HashMap::new).entry(fingerprint).or_default().push(res.clone());
-    }
-}
-
-fn take_result(fingerprint: &str) -> Option<tools::ToolResult> {
-    let mut g = RESULTS.lock().ok()?;
-    let map = g.as_mut()?;
-    let key = if map.contains_key(fingerprint) {
-        fingerprint.to_string()
-    } else {
-        // Same tool, arguments serialized a little differently: accept it
-        // only when exactly one result of that tool is waiting.
-        let tool = fingerprint.split('(').next().unwrap_or("");
-        let prefix = format!("{tool}(");
-        let mut same = map.keys().filter(|k| k.starts_with(&prefix));
-        match (same.next(), same.next()) {
-            (Some(k), None) => k.clone(),
-            _ => return None,
-        }
-    };
-    let fingerprint = key.as_str();
-    let list = map.get_mut(fingerprint)?;
-    let res = (!list.is_empty()).then(|| list.remove(0));
-    if list.is_empty() {
-        map.remove(fingerprint);
-    }
-    res
-}
-
-/* ---------- Context editing ---------- */
-
-/// Text size of one tool result.
-fn result_chars(r: &rig_agent::core::completion::message::ToolResult) -> usize {
-    use rig_agent::core::completion::message::ToolResultContent;
-    r.content
-        .iter()
-        .map(|c| match c {
-            ToolResultContent::Text(t) => t.text.len(),
-            ToolResultContent::Json { value } => value.to_string().len(),
-            ToolResultContent::Image(_) => 1_000,
-        })
-        .sum()
-}
-
-/// Returns the history to send with the oldest bulky tool results stubbed
-/// (None = send it unchanged). `cleared` is the hook's watermark: it only
-/// ever moves forward, and only when the history outgrew the trigger.
-fn clear_old_results(history: &[Message], cleared: &mut usize) -> Option<Vec<Message>> {
-    use rig_agent::core::completion::message::ToolResultContent;
-    // Clearable results in order: (message, content index, size). A helper's
-    // report and loaded skill instructions are the agent's working notes —
-    // they are never cleared.
-    let mut results = Vec::new();
-    for (mi, m) in history.iter().enumerate() {
-        if let Message::User { content } = m {
-            for (ci, c) in content.iter().enumerate() {
-                if let UserContent::ToolResult(r) = c {
-                    let size = result_chars(r);
-                    if size >= CLEAR_MIN_CHARS && r.name != "delegate" && r.name != "skill" {
-                        results.push((mi, ci, size));
-                    }
-                }
-            }
-        }
-    }
-    let clearable = results.len().saturating_sub(CLEAR_KEEP_RECENT);
-    *cleared = (*cleared).min(clearable);
-    let total: usize = history.iter().map(|m| serde_json::to_string(m).map(|j| j.len()).unwrap_or(0)).sum();
-    let freed = |n: usize| results[..n].iter().map(|r| r.2.saturating_sub(CLEARED_STUB.len())).sum::<usize>();
-    if total.saturating_sub(freed(*cleared)) > CLEAR_TRIGGER_CHARS {
-        while *cleared < clearable && total.saturating_sub(freed(*cleared)) > CLEAR_TARGET_CHARS {
-            *cleared += 1;
-        }
-    }
-    if *cleared == 0 {
-        return None;
-    }
-    let mut out = history.to_vec();
-    for &(mi, ci, _) in &results[..*cleared] {
-        if let Message::User { content } = &mut out[mi] {
-            if let Some(UserContent::ToolResult(r)) = content.get_mut(ci) {
-                r.content = vec![ToolResultContent::text(CLEARED_STUB)];
-            }
-        }
-    }
-    Some(out)
-}
-
-/* ---------- Hook: live cards, approvals, guard, limiter ---------- */
-
-/// Arguments of a call still streaming, for the live card.
-#[derive(Default)]
-struct LiveCall {
-    name: String,
-    args: String,
-    shown: usize,
-}
-
-/// Argument growth (chars) between two live card updates.
-const LIVE_ARGS_STEP: usize = 400;
-/// Identical consecutive tool calls tolerated before they are skipped.
-const REPEAT_SKIP_AT: usize = 3;
-/// …and before the run is stopped outright.
-const REPEAT_STOP_AT: usize = 5;
-/// Marker of the repeat guard's stop — deliberate, never retried.
-const GUARD_STOP: &str = "the model repeated the same action";
-/// Context editing — the client-side twin of Anthropic's `clear_tool_uses`:
-/// once the conversation inside a run grows past CLEAR_TRIGGER_CHARS, the
-/// OLDEST bulky tool results are replaced by a stub until it is back under
-/// CLEAR_TARGET_CHARS. The most recent results always stay. Clearing jumps
-/// in big steps and then holds still, so the prompt prefix stays byte-stable
-/// between jumps and the provider's prompt cache keeps hitting.
-const CLEAR_TRIGGER_CHARS: usize = 160_000;
-const CLEAR_TARGET_CHARS: usize = 80_000;
-/// Newest tool results that are never cleared.
-const CLEAR_KEEP_RECENT: usize = 6;
-/// Results shorter than this are not worth clearing.
-const CLEAR_MIN_CHARS: usize = 600;
-const CLEARED_STUB: &str = "[older tool result cleared to save context — call the tool again if you still need it]";
-/// Pause between retries of a failed model request.
-const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// The latest model request of one logical run — (prompt, history) exactly
-/// as Rig is about to send it. After a failure the run resumes from here.
-type Snapshot = Arc<Mutex<Option<(Message, Vec<Message>)>>>;
-
-struct UiHook {
-    ctx: RunCtx,
-    snapshot: Snapshot,
-    /// "[Helper] " prefix for subagent cards; empty for the main agent.
-    label: String,
-    permit: Mutex<Option<crate::limiter::Permit>>,
-    live: Mutex<HashMap<String, LiveCall>>,
-    last_call: Mutex<(String, usize)>,
-    /// How many of the clearable tool results (oldest first) are stubbed.
-    cleared: Mutex<usize>,
-}
-
-impl UiHook {
-    fn new(ctx: RunCtx, label: Option<&str>, snapshot: Snapshot) -> Self {
-        Self {
-            ctx,
-            snapshot,
-            label: label.map(|l| format!("[{l}] ")).unwrap_or_default(),
-            permit: Mutex::new(None),
-            live: Mutex::new(HashMap::new()),
-            last_call: Mutex::new((String::new(), 0)),
-            cleared: Mutex::new(0),
-        }
-    }
-
-    fn step(&self, index: usize, name: &str, input: String, done: bool, res: &tools::ToolResult) {
-        let input = format!("{}{input}", self.label);
-        emit_step(&self.ctx.app, &self.ctx.run_id, index, name, input, done, res);
-    }
-}
-
-impl AgentHook for UiHook {
-    /// Provider limits (RPM + concurrency) gate every model call; Stop ends
-    /// the run before another request goes out.
-    async fn on_completion_call(&self, _ctx: &HookContext, event: CompletionCallEvent<'_>) -> CompletionCallAction {
-        if is_cancelled(&self.ctx.run_id) {
-            return CompletionCallAction::Stop(crate::cancel::STOPPED.to_string());
-        }
-        *self.snapshot.lock().unwrap() = Some((event.prompt.clone(), event.history.to_vec()));
-        let req = &self.ctx.req;
-        let key = if req.provider_id.is_empty() { req.base_url.clone() } else { req.provider_id.clone() };
-        let permit = crate::limiter::acquire(&key, req.rate_limit_rpm, req.concurrency, &self.ctx.run_id).await;
-        *self.permit.lock().unwrap() = Some(permit);
-        let mut cleared = self.cleared.lock().unwrap();
-        match clear_old_results(event.history, &mut cleared) {
-            Some(history) => CompletionCallAction::patch(rig_agent::agent::RequestPatch::new().history(history)),
-            None => CompletionCallAction::Continue,
-        }
-    }
-
-    /// The provider slot is free once the stream ends — tools and approval
-    /// banners must not hold it.
-    async fn on_stream_response_finish(&self, _ctx: &HookContext, _event: StreamResponseFinish<'_>) -> ObservationAction {
-        self.permit.lock().unwrap().take();
-        ObservationAction::Continue
-    }
-
-    /// The card appears while the model is still writing the call, and grows
-    /// with its arguments — a long apply_patch is never a silent pause.
-    async fn on_tool_call_delta(&self, _ctx: &HookContext, event: ToolCallDelta<'_>) -> ObservationAction {
-        let update = {
-            let mut live = self.live.lock().unwrap();
-            let call = live.entry(event.internal_call_id.to_string()).or_default();
-            if let Some(n) = event.tool_name {
-                if call.name.is_empty() {
-                    call.name = n.to_string();
-                }
-            }
-            call.args.push_str(event.delta);
-            let first = call.shown == 0;
-            if call.name.is_empty() || (!first && call.args.len() < call.shown + LIVE_ARGS_STEP) {
-                None
-            } else {
-                call.shown = call.args.len().max(1);
-                Some((call.name.clone(), live_summary(&call.name, &call.args)))
-            }
-        };
-        if let Some((name, input)) = update {
-            let idx = self.ctx.live_step(event.internal_call_id);
-            self.step(idx, &name, input, false, &tools::ToolResult::ok(""));
-        }
-        ObservationAction::Continue
-    }
-
-    /// Before execution: repeat guard, start card, Allow/Deny gate.
-    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
-        if is_cancelled(&self.ctx.run_id) {
-            return ToolCallAction::Stop(crate::cancel::STOPPED.to_string());
-        }
-        let args = parse_args(event.args);
-        let summary = summarize(event.tool_name, &args);
-        let idx = self.ctx.call_step(event.internal_call_id, &fingerprint(event.tool_name, &args));
-        // The streamed-args buffer of this id is done; a later call that
-        // reuses the id must not inherit its name and arguments.
-        self.live.lock().unwrap().remove(event.internal_call_id);
-        if event.tool_name == "delegate" {
-            self.ctx.delegate_cards.lock().unwrap().insert(canonical(&args), idx);
-        }
-
-        // Stuck-loop guard: the same call over and over gets skipped with a
-        // nudge, then ends the run with what exists.
-        let fp = format!("{}({})", event.tool_name, canonical(&args));
-        let repeats = {
-            let mut last = self.last_call.lock().unwrap();
-            if last.0 == fp {
-                last.1 += 1;
-            } else {
-                *last = (fp.clone(), 1);
-            }
-            last.1
-        };
-        if repeats >= REPEAT_STOP_AT {
-            self.step(idx, event.tool_name, summary, true, &tools::ToolResult::err("stopped: repeated call"));
-            return ToolCallAction::Stop(format!("{GUARD_STOP} {repeats} times ({})", one_line(&fp, 120)));
-        }
-        if repeats >= REPEAT_SKIP_AT {
-            self.step(idx, event.tool_name, summary, true, &tools::ToolResult::err("skipped: repeated call"));
-            return ToolCallAction::Skip(
-                "You already made this exact call and it will not give a different result. Change your approach or finish with an answer.".into(),
-            );
-        }
-
-        self.step(idx, event.tool_name, summary.clone(), false, &tools::ToolResult::ok(""));
-
-        // Permission gate (safety.rs): commands need a yes unless the project
-        // runs them automatically, and risky commands, secrets and writes to
-        // system / outside-project paths ALWAYS need one.
-        // MCP tools act outside the app — they ask like commands do, unless
-        // the server marks the tool read-only or the project auto-runs.
-        // mcp_call is gated as the MCP tool it runs.
-        let mcp_target = if event.tool_name == "mcp_call" {
-            let name = args.get("tool").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let hit = self.ctx.mcp_tools.get_key_value(name.as_str()).or_else(|| {
-                let tail = format!("__{name}");
-                let mut hits = self.ctx.mcp_tools.iter().filter(|(k, _)| k.ends_with(&tail));
-                let first = hits.next()?;
-                hits.next().is_none().then_some(first)
-            });
-            // Unknown name: the tool itself reports it, nothing runs.
-            hit.map(|(k, v)| (k.clone(), v.clone(), args.get("arguments").cloned().unwrap_or(Value::Null)))
-        } else {
-            self.ctx.mcp_tools.get(event.tool_name).map(|v| (event.tool_name.to_string(), v.clone(), args.clone()))
-        };
-        let gate = match (event.tool_name == "mcp_call", mcp_target) {
-            (_, Some((tool, (server, read_only), shown))) => (!self.ctx.req.auto_run && !read_only).then(|| Gate {
-                what: format!("{tool} {}", one_line(&canonical(&shown), 200)),
-                place: format!("MCP server {server}"),
-                reason: String::new(),
-            }),
-            (true, None) => None,
-            (false, None) => permission_gate(
-                event.tool_name,
-                &args,
-                &self.ctx.req.workspace,
-                &self.ctx.cwd().to_string_lossy(),
-                self.ctx.req.auto_run,
-            ),
-        };
-        if let Some(gate) = gate {
-            let approved = {
-                let _one_banner = self.ctx.confirm_lock.lock().await;
-                ask_confirm(&self.ctx.app, &self.ctx.run_id, &gate.what, &gate.place, &gate.reason).await
-            };
-            if !approved {
-                self.step(idx, event.tool_name, summary, true, &tools::ToolResult::err("denied by the user"));
-                return ToolCallAction::Skip(
-                    "The user denied this action. Do not retry it or work around it — continue without it, or explain what you would need.".into(),
-                );
-            }
-        }
-        ToolCallAction::Run
-    }
-
-    /// After execution: close the card with the real result (the tool left
-    /// its full `ToolResult`, diff included, in the context).
-    async fn on_tool_result(&self, _ctx: &HookContext, event: ToolResultEvent<'_>) -> ToolResultAction {
-        let args = parse_args(event.args);
-        let fp = fingerprint(event.tool_name, &args);
-        let shared_id = self.ctx.cards_under(event.internal_call_id) > 1;
-        let idx = self.ctx.result_step(event.internal_call_id, &fp);
-        // Rig's ToolContext is per call id — with a reused id it may hold
-        // ANOTHER call's result ("npm install" showing a list_dir listing),
-        // so it is only trusted when the id is unique.
-        let res = take_result(&fp)
-            .or_else(|| (!shared_id).then(|| event.tool_context.result::<tools::ToolResult>().cloned()).flatten())
-            .unwrap_or_else(|| tools::ToolResult::ok(event.presentation.render()));
-        self.step(idx, event.tool_name, summarize(event.tool_name, &args), true, &res);
-        ToolResultAction::Keep
-    }
-}
-
-/// What the Allow/Deny banner shows for a call that needs a yes.
-struct Gate {
-    what: String,
-    place: String,
-    reason: String,
-}
-
-/// Decides whether a tool call must wait for the user. `reason` is empty
-/// for the plain "commands need approval" case and names the danger
-/// otherwise.
-fn permission_gate(tool: &str, args: &Value, workspace: &str, cwd: &str, auto_run: bool) -> Option<Gate> {
-    let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
-    // A file the call writes / reads: sensitive paths always ask, writes
-    // outside the project ask unless the project auto-runs.
-    let path_gate = |path: &str, write: bool, verb: &str| -> Option<Gate> {
-        let full = full_path(cwd, path);
-        let reason = if let Some(why) = crate::safety::sensitive_path(&full.to_string_lossy(), write) {
-            format!("{} {}", if write { "Writes a file that" } else { "Reads a file that" }, why)
-        } else if write && !auto_run && !is_inside(&full, Path::new(workspace)) {
-            "Writes outside the project folder".to_string()
-        } else {
-            return None;
-        };
-        Some(Gate {
-            what: format!("{verb} {}", full.display()),
-            place: workspace.to_string(),
-            reason,
-        })
-    };
-    match tool {
-        "run_command" | "ssh_exec" => {
-            let cmd = get("command");
-            let risky = crate::safety::risky_command(cmd);
-            if auto_run && risky.is_none() {
-                return None;
-            }
-            let place = if tool == "ssh_exec" {
-                format!("server {}", get("server"))
-            } else if get("cwd").is_empty() {
-                cwd.to_string()
-            } else {
-                full_path(cwd, get("cwd")).display().to_string()
-            };
-            Some(Gate {
-                what: cmd.to_string(),
-                place,
-                reason: risky.map(|r| format!("Risky command: {r}")).unwrap_or_default(),
-            })
-        }
-        "git" => {
-            let sub = get("subcommand").trim().to_string();
-            let rest = match args.get("args") {
-                Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "),
-                Some(Value::String(t)) => t.clone(),
-                _ => String::new(),
-            };
-            let line = format!("git {sub} {rest}").trim().to_string();
-            let risky = crate::safety::risky_command(&line);
-            // Read-only subcommands never ask (a `branch`/`tag`/`remote`
-            // with arguments may change things, so those do).
-            let read_only = tools::GIT_READ_ONLY.contains(&sub.as_str())
-                && (rest.is_empty() || !matches!(sub.as_str(), "branch" | "tag" | "remote"));
-            if risky.is_none() && (read_only || auto_run) {
-                return None;
-            }
-            Some(Gate {
-                what: line,
-                place: if get("cwd").is_empty() { cwd.to_string() } else { full_path(cwd, get("cwd")).display().to_string() },
-                reason: risky.map(|r| format!("Risky command: {r}")).unwrap_or_default(),
-            })
-        }
-        "file_op" => match get("op") {
-            "info" | "exists" => None,
-            "delete" => {
-                let full = full_path(cwd, get("path"));
-                let inside = is_inside(&full, Path::new(workspace));
-                if auto_run && inside && crate::safety::sensitive_path(&full.to_string_lossy(), true).is_none() {
-                    return None;
-                }
-                Some(Gate {
-                    what: format!("delete {}", full.display()),
-                    place: workspace.to_string(),
-                    reason: if inside { String::new() } else { "Deletes outside the project folder".into() },
-                })
-            }
-            "move" | "rename" => path_gate(get("path"), true, "move").or_else(|| path_gate(get("to"), true, "move to")),
-            "copy" => path_gate(get("to"), true, "copy to"),
-            _ => path_gate(get("path"), true, "create"),
-        },
-        "read_file" | "list_dir" | "grep" | "find_files" | "apply_patch" | "write_file" | "edit_file" => {
-            let write = matches!(tool, "apply_patch" | "write_file" | "edit_file");
-            path_gate(get("path"), write, if write { "edit" } else { "read" })
-        }
-        _ => None,
-    }
-}
-
-/// The path a tool will touch, relative paths joined onto the workspace and
-/// `.`/`..` folded lexically (the file may not exist yet).
-fn full_path(workspace: &str, path: &str) -> PathBuf {
-    let p = Path::new(path.trim());
-    let joined = if p.is_absolute() { p.to_path_buf() } else { Path::new(workspace).join(p) };
-    let mut out = PathBuf::new();
-    for c in joined.components() {
-        match c {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-fn is_inside(path: &Path, root: &Path) -> bool {
-    if root.as_os_str().is_empty() {
-        return true;
-    }
-    // Windows paths compare case-insensitively.
-    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase();
-    let (p, r) = (norm(path), norm(root));
-    p == r || p.starts_with(&(r + "/"))
-}
-
-/// Card input for a call whose JSON arguments may still be incomplete.
-fn live_summary(name: &str, args: &str) -> String {
-    if let Ok(v) = serde_json::from_str::<Value>(args) {
-        return summarize(name, &v);
-    }
-    let key = match name {
-        "run_command" | "ssh_exec" => "command",
-        "grep" | "find_files" => "pattern",
-        "web_search" => "query",
-        "web_fetch" => "url",
-        "generate_image" => "prompt",
-        "git" => "subcommand",
-        "delegate" => "agent",
-        "skill" => "name",
-        "mcp_find" => "query",
-        "mcp_call" => "tool",
-        _ => "path",
-    };
-    let head = partial_field(args, key).unwrap_or_default();
-    if args.len() < 64 {
-        format!("{head}…")
-    } else {
-        format!("{head} … ({} chars)", args.len())
-    }
-}
-
-/// Reads a string field out of a possibly truncated JSON object.
-fn partial_field(json: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\"");
-    let at = json.find(&pat)? + pat.len();
-    let rest = json[at..].trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
-    let mut out = String::new();
-    let mut esc = false;
-    for ch in rest.chars() {
-        if esc {
-            out.push(if ch == 'n' || ch == 't' { ' ' } else { ch });
-            esc = false;
-            continue;
-        }
-        match ch {
-            '\\' => esc = true,
-            '"' => break,
-            c => out.push(c),
-        }
-    }
-    Some(one_line(&out, 80))
-}
-
-/* ---------- Tools ---------- */
-
-type ToolFuture<'a> = WasmBoxedFuture<'a, Result<ToolOutput, ToolExecutionError>>;
-
-/// Pins a closure to the higher-ranked signature DynamicTool expects.
-fn tool_fn<F>(f: F) -> F
-where
-    F: for<'a> Fn(&'a mut ToolContext, Value) -> ToolFuture<'a> + Send + Sync + 'static,
-{
-    f
-}
-
-/// What the model reads back: the output, marked when it is an error.
-fn model_text(res: &tools::ToolResult) -> String {
-    if res.ok {
-        res.output.clone()
-    } else {
-        format!("ERROR: {}", res.output)
-    }
-}
-
-/// The filesystem / command / SSH tools, as Rig dynamic tools.
-fn fs_tools(ctx: &RunCtx) -> Vec<DynamicTool> {
-    let specs = tool_specs(&ctx.req);
-    specs
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|spec| {
-            let name = spec["name"].as_str().unwrap_or("").to_string();
-            let description = spec["description"].as_str().unwrap_or("").to_string();
-            let parameters = spec["parameters"].clone();
-            let c = ctx.clone();
-            let tool_name = name.clone();
-            DynamicTool::new(
-                name,
-                description,
-                parameters,
-                tool_fn(move |tctx, args| {
-                    let c = c.clone();
-                    let tool_name = tool_name.clone();
-                    Box::pin(async move {
-                        let args = norm_args(&args);
-                        let fp = fingerprint(&tool_name, &args);
-                        let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let res = match tool_name.as_str() {
-                            "ssh_exec" => run_ssh_tool(&c.app, &c.req, &args).await,
-                            "web_search" => {
-                                let max = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
-                                crate::web::search(&get("query"), max).await
-                            }
-                            "web_fetch" => {
-                                let start = args.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                                crate::web::fetch(&get("url"), start).await
-                            }
-                            "change_dir" => change_dir(&c, &get("path")),
-                            "generate_image" => crate::imagegen::tool(&c.app, c.req.image_gen.as_ref(), &args).await,
-                            _ => {
-                                // Tools block (file IO, processes): keep the async
-                                // workers free so events keep flowing.
-                                let root = c.cwd();
-                                tokio::task::spawn_blocking(move || tools::dispatch(&root, &tool_name, &args))
-                                    .await
-                                    .unwrap_or_else(|e| tools::ToolResult::err(format!("tool task failed: {e}")))
-                            }
-                        };
-                        let text = model_text(&res);
-                        stash_result(fp, &res);
-                        tctx.insert_result(res);
-                        Ok(ToolOutput::text(text))
-                    })
-                }),
-            )
-        })
-        .collect()
-}
-
-/// `change_dir`: moves the run's working directory (relative paths of every
-/// later file tool and command start there) and lists the new place.
-fn change_dir(ctx: &RunCtx, path: &str) -> tools::ToolResult {
-    let current = ctx.cwd();
-    let target = if path.trim().is_empty() {
-        ctx.root.clone()
-    } else {
-        match tools::resolve(&current, path) {
-            Ok(p) => p,
-            Err(e) => return tools::ToolResult::err(e),
-        }
-    };
-    if !target.is_dir() {
-        return tools::ToolResult::err(tools::not_found(&current, path));
-    }
-    let target = full_path(&target.to_string_lossy(), "");
-    *ctx.cwd.lock().unwrap() = target.clone();
-    let listing = tools::list_dir(&target, "");
-    tools::ToolResult::ok(format!("now in {}\n{}", target.display(), listing.output))
-}
+/* ---------- Subagents ---------- */
 
 /// The single `delegate` tool that hands a task to a user-defined helper.
-fn delegate_tool(ctx: &RunCtx) -> DynamicTool {
-    let names: Vec<String> = ctx.req.subagents.iter().map(|s| s.name.clone()).collect();
-    let roster = ctx
-        .req
-        .subagents
-        .iter()
-        .map(|s| format!("- {}: {}", s.name, s.description))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let c = ctx.clone();
-    DynamicTool::new(
-        "delegate",
-        format!(
-            "Hand a self-contained task to a helper agent and get its result back. Helpers have the same file/command tools. Use one only when the task matches its specialty; call delegate several times in one turn to run helpers in parallel.\nHelpers:\n{roster}"
-        ),
-        json!({
-            "type": "object",
-            "properties": {
-                "agent": { "type": "string", "enum": names, "description": "Which helper to use." },
-                "task": { "type": "string", "description": "Complete, self-contained instruction for the helper." }
-            },
-            "required": ["agent", "task"]
-        }),
-        tool_fn(move |tctx, args| {
-            let c = c.clone();
-            Box::pin(async move {
-                let args = norm_args(&args);
-                let fp = fingerprint("delegate", &args);
-                let name = args.get("agent").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let card = c.delegate_cards.lock().unwrap().get(&canonical(&args)).copied();
-                let res = match c.req.subagents.iter().find(|s| s.name == name) {
-                    None => tools::ToolResult::err(format!("unknown helper {name:?}")),
-                    Some(def) => {
-                        // Bounded parallelism: extra delegations queue here.
-                        let _slot = c.agent_slots.acquire().await;
-                        match run_subagent(&c, def, &task, card).await {
-                            Ok(text) => tools::ToolResult::ok(text),
-                            Err(e) => tools::ToolResult::err(e),
-                        }
-                    }
-                };
-                let text = model_text(&res);
-                stash_result(fp, &res);
-                tctx.insert_result(res);
-                Ok(ToolOutput::text(text))
-            })
-        }),
-    )
+struct DelegateTool {
+    ctx: RunCtx,
+    /// The workspace's instructions + repo map — helpers start informed too.
+    project: Arc<ProjectContext>,
 }
 
-/// The `skill` tool: loads a skill's instructions (or one of its files).
-fn skill_tool(skills: Arc<Vec<crate::skills::Skill>>) -> DynamicTool {
-    let names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
-    DynamicTool::new(
-        "skill",
-        "Load the instructions of a skill listed in the system prompt. Call it before starting a task that matches the skill's description, then follow the instructions. Pass `file` to read one of the skill's supporting files.",
-        json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "enum": names, "description": "Skill to load." },
-                "file": { "type": "string", "description": "Optional: a file inside the skill folder, as listed by the skill." }
-            },
-            "required": ["name"]
-        }),
-        tool_fn(move |tctx, args| {
-            let skills = skills.clone();
-            Box::pin(async move {
-                let args = norm_args(&args);
-                let fp = fingerprint("skill", &args);
-                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let file = args.get("file").and_then(|v| v.as_str());
-                let res = match skills.iter().find(|s| s.name == name) {
-                    None => tools::ToolResult::err(format!("unknown skill {name:?}")),
-                    Some(s) => match crate::skills::load_for_model(s, file) {
-                        Ok(text) => tools::ToolResult::ok(text),
-                        Err(e) => tools::ToolResult::err(e),
-                    },
-                };
-                let text = model_text(&res);
-                stash_result(fp, &res);
-                tctx.insert_result(res);
-                Ok(ToolOutput::text(text))
-            })
-        }),
-    )
-}
-
-/// One MCP tool offered to the model.
-#[derive(Clone)]
-struct McpBinding {
-    server: Arc<crate::mcp::McpServer>,
-    tool: crate::mcp::McpTool,
-    /// Name the model sees (`mcp__server__tool`, unique within the run).
-    name: String,
-}
-
-/// Connects every enabled MCP server (pooled — usually instant) and lists
-/// their tools. A server that fails gets a red card and is left out; the run
-/// goes on with the rest.
-async fn load_mcp(app: &AppHandle, run_id: &str, counter: &AtomicUsize) -> Vec<McpBinding> {
-    let servers: Vec<_> = crate::mcp::list(app)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|s| s.enabled)
-        .collect();
-    if servers.is_empty() {
-        return Vec::new();
-    }
-    let results = futures_util::future::join_all(servers.into_iter().map(|s| async move {
-        let r = tokio::select! {
-            r = crate::mcp::connect(&s) => r,
-            _ = crate::cancel::cancel_signal(run_id) => Err(crate::cancel::STOPPED.to_string()),
-        };
-        (s, r)
-    }))
-    .await;
-    let mut out: Vec<McpBinding> = Vec::new();
-    for (server, res) in results {
-        match res {
-            Ok(conn) => {
-                let server = Arc::new(server);
-                for tool in &conn.tools {
-                    let mut name = crate::mcp::tool_name(&server.name, &tool.name);
-                    let mut n = 2;
-                    while out.iter().any(|b| b.name == name) {
-                        let suffix = format!("_{n}");
-                        name = format!("{}{suffix}", name.chars().take(64 - suffix.len()).collect::<String>());
-                        n += 1;
-                    }
-                    out.push(McpBinding { server: server.clone(), tool: tool.clone(), name });
-                }
-            }
-            Err(e) if e == crate::cancel::STOPPED => {}
-            Err(e) => {
-                let idx = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                emit_step(app, run_id, idx, "mcp", format!("connect {}", server.name), true, &tools::ToolResult::err(e));
-            }
+impl AgentTool for DelegateTool {
+    fn definition(&self) -> ToolDefinition {
+        let subagents = &self.ctx.req.subagents;
+        let names: Vec<&str> = subagents.iter().map(|s| s.name.as_str()).collect();
+        let roster = subagents.iter().map(|s| format!("- {}: {}", s.name, s.description)).collect::<Vec<_>>().join("\n");
+        ToolDefinition {
+            name: "delegate".into(),
+            description: format!(
+                "Hand a self-contained task to a helper agent and get its result back. Helpers have the same file/command tools. Use one only when the task matches its specialty; call delegate several times in one turn to run helpers in parallel.\nHelpers:\n{roster}"
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string", "enum": names, "description": "Which helper to use." },
+                    "task": { "type": "string", "description": "Complete, self-contained instruction for the helper." }
+                },
+                "required": ["agent", "task"]
+            }),
         }
     }
-    out
+
+    fn source(&self) -> ToolSource {
+        ToolSource::Agent
+    }
+
+    fn call<'a>(&'a self, args: Value, info: CallInfo) -> BoxFuture<'a, ToolResult> {
+        Box::pin(async move {
+            let name = args.get("agent").and_then(|v| v.as_str()).unwrap_or("");
+            let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(def) = self.ctx.req.subagents.iter().find(|s| s.name == name) else {
+                return ToolResult::err(format!("unknown helper {name:?}"));
+            };
+            // Bounded parallelism: extra delegations queue here.
+            let _slot = self.ctx.agent_slots.acquire().await;
+            match run_subagent(&self.ctx, &self.project, def, task, info.card).await {
+                Ok(text) => ToolResult::ok(text),
+                Err(e) => ToolResult::err(e),
+            }
+        })
+    }
 }
 
-fn mcp_tool(b: &McpBinding) -> DynamicTool {
-    let desc = if b.tool.description.trim().is_empty() {
-        format!("{} (MCP server {})", b.tool.name, b.server.name)
-    } else {
-        format!("{} (MCP server {})", b.tool.description.trim(), b.server.name)
-    };
-    let (server, tool_name) = (b.server.clone(), b.tool.name.clone());
-    let model_name = b.name.clone();
-    DynamicTool::new(
-        b.name.clone(),
-        desc,
-        b.tool.input_schema.clone(),
-        tool_fn(move |tctx, args| {
-            let (server, tool_name) = (server.clone(), tool_name.clone());
-            let args = norm_args(&args);
-            let fp = fingerprint(&model_name, &args);
-            Box::pin(async move {
-                let res = match crate::mcp::call(&server, &tool_name, args).await {
-                    Ok((text, false)) => tools::ToolResult::ok(text),
-                    Ok((text, true)) => tools::ToolResult::err(text),
-                    Err(e) => tools::ToolResult::err(e),
-                };
-                let text = model_text(&res);
-                stash_result(fp, &res);
-                tctx.insert_result(res);
-                Ok(ToolOutput::text(text))
-            })
-        }),
-    )
-}
-
-/// MCP schemas above this many tokens are not sent inline (see mcp_deferred).
-const MCP_INLINE_TOKENS: usize = 6_000;
-
-fn mcp_schema_tokens(mcp: &[McpBinding]) -> usize {
-    mcp.iter()
-        .map(|b| est_tokens(&format!("{}{}{}", b.name, b.tool.description, b.tool.input_schema)))
-        .sum()
-}
-
-/// Whether MCP tools are offered through mcp_find / mcp_call instead of one
-/// tool each. A dozen servers (Playwright, DevTools…) carry 20k+ tokens of
-/// schemas into EVERY request: on a local model reading ~40 tokens/s that
-/// was minutes before the first word and more than its whole window (Ollama
-/// then silently cuts the prompt's start — the model lost its instructions
-/// and never finished). Local models always defer; others once it is big.
-fn mcp_deferred(req: &AgentRequest, mcp: &[McpBinding]) -> bool {
-    !mcp.is_empty() && (req.kind == "ollama" || mcp_schema_tokens(mcp) > MCP_INLINE_TOKENS)
-}
-
-/// The MCP binding a model-given name points at: the full
-/// `mcp__server__tool` name, or the bare tool name when that is unique.
-fn find_mcp<'a>(mcp: &'a [McpBinding], name: &str) -> Option<&'a McpBinding> {
-    let name = name.trim();
-    mcp.iter().find(|b| b.name == name).or_else(|| {
-        let mut hits = mcp.iter().filter(|b| b.tool.name == name);
-        let first = hits.next()?;
-        hits.next().is_none().then_some(first)
-    })
-}
-
-/// Catalog for the system prompt: server → tool names, no schemas.
-fn mcp_catalog(mcp: &[McpBinding]) -> String {
-    let mut out = String::from(
-        "\n\nMCP tools — extra tools from servers the user connected. Their parameters are NOT loaded: \
-         call mcp_find with what you need (or an exact tool name) to get its name and parameters, \
-         then run it with mcp_call {tool, arguments}. Use them when they fit better than the built-in tools.",
+/// Runs one helper agent to completion. Its tool cards join the run's
+/// transcript (prefixed with its name); its prose streams into the delegate
+/// card and comes back to the main agent as the tool result.
+async fn run_subagent(ctx: &RunCtx, project: &ProjectContext, def: &SubagentDef, task: &str, card: usize) -> Result<String, String> {
+    let base = default_system();
+    let prompt = SystemPromptBuilder {
+        system: &base,
+        req: &ctx.req,
+        root: &ctx.root,
+        skills: &[],
+        mcp: McpMode::Off,
+        helpers: false,
+        parallel: 1,
+        project,
+    }
+    .build();
+    let preamble = format!(
+        "{prompt}\n\n# Your assignment\nYou are the helper agent \"{}\". {}\nDo ONLY the task you are given, then answer with a short factual summary of what you did or found.",
+        def.name,
+        def.prompt.trim()
     );
-    let mut servers: Vec<&str> = Vec::new();
-    for b in mcp {
-        if !servers.contains(&b.server.name.as_str()) {
-            servers.push(&b.server.name);
+    let mut tools = ToolRegistry::new(Arc::default());
+    tools.extend(builtin_tools(ctx));
+    let agent = AgentLoop {
+        ctx,
+        preamble,
+        tools: &tools,
+        label: format!("[{}] ", def.name),
+        to_ui: false,
+        // Helpers batch their own independent tool calls too.
+        parallel: ctx.req.max_agents.clamp(1, 8),
+    };
+    let summary = format!("{}: {}", def.name, one_line(task, 80));
+    let mut partial = String::new();
+    let mut shown = 0usize;
+    let mut progress = |t: &str| {
+        partial.push_str(t);
+        // Live progress in the delegate card, throttled.
+        if partial.len() >= shown + 200 {
+            shown = partial.len();
+            ctx.step("", card, "delegate", &summary, false, &ToolResult::ok(partial.clone()));
         }
+    };
+    match agent.run(vec![Message::user(task)], &mut progress).await {
+        Ok(text) if text.trim().is_empty() => Err("the helper returned no answer".into()),
+        other => other,
     }
-    for server in servers {
-        let names: Vec<&str> = mcp.iter().filter(|b| b.server.name == server).map(|b| b.name.as_str()).collect();
-        out.push_str(&format!("\n- {server}: {}", names.join(", ")));
-    }
-    out
 }
 
-/// `mcp_find`: full name, description and parameters of matching MCP tools.
-fn mcp_find_tool(mcp: Arc<Vec<McpBinding>>) -> DynamicTool {
-    DynamicTool::new(
-        "mcp_find",
-        "Look up MCP tools listed in the system prompt: returns their exact names, descriptions and parameter schemas. Pass keywords (\"screenshot\", \"navigate page\") or an exact tool name.",
-        json!({
-            "type": "object",
-            "properties": { "query": { "type": "string", "description": "Keywords or an exact tool name." } },
-            "required": ["query"]
-        }),
-        tool_fn(move |tctx, args| {
-            let mcp = mcp.clone();
-            Box::pin(async move {
-                let args = norm_args(&args);
-                let fp = fingerprint("mcp_find", &args);
-                let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                let words: Vec<&str> = query.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|w| w.len() > 1).collect();
-                let mut scored: Vec<(usize, &McpBinding)> = match find_mcp(&mcp, &query) {
-                    Some(b) => vec![(usize::MAX, b)],
-                    None => mcp
-                        .iter()
-                        .map(|b| {
-                            let hay = format!("{} {} {}", b.name, b.server.name, b.tool.description).to_lowercase();
-                            (words.iter().filter(|w| hay.contains(*w)).count(), b)
-                        })
-                        .filter(|(n, _)| *n > 0)
-                        .collect(),
-                };
-                scored.sort_by(|a, b| b.0.cmp(&a.0));
-                let res = if scored.is_empty() {
-                    tools::ToolResult::err(format!("no MCP tool matches {query:?} — pick a name from the list in the system prompt"))
-                } else {
-                    tools::ToolResult::ok(
-                        scored
-                            .iter()
-                            .take(6)
-                            .map(|(_, b)| format!("{}\n{}\nparameters: {}", b.name, one_line(&b.tool.description, 600), b.tool.input_schema))
-                            .collect::<Vec<_>>()
-                            .join("\n\n"),
-                    )
-                };
-                let text = model_text(&res);
-                stash_result(fp, &res);
-                tctx.insert_result(res);
-                Ok(ToolOutput::text(text))
-            })
-        }),
-    )
+/// The request with the built-in helper added: with room for more than one
+/// agent, a general-purpose helper is always there — parallel work no
+/// longer depends on the user defining subagents.
+fn with_worker(req: &AgentRequest) -> AgentRequest {
+    let mut req = req.clone();
+    let cli = crate::cli::Cli::from_kind(&req.kind).is_some();
+    if !cli && req.max_agents.clamp(1, MAX_AGENTS) > 1 && !req.subagents.iter().any(|s| s.name == WORKER) {
+        req.subagents.push(SubagentDef {
+            name: WORKER.into(),
+            description: "General-purpose helper for ANY self-contained part of the task: exploring or reading an area of the codebase, researching on the web, implementing a change confined to its own files, running and fixing tests. Give it everything it needs in `task`.".into(),
+            prompt: "Work fast: batch independent tool calls into one turn.".into(),
+        });
+    }
+    req
 }
 
-/// `mcp_call`: runs one MCP tool by name.
-fn mcp_call_tool(mcp: Arc<Vec<McpBinding>>) -> DynamicTool {
-    DynamicTool::new(
-        "mcp_call",
-        "Run an MCP tool. Get its exact name and parameters with mcp_find first.",
-        json!({
-            "type": "object",
-            "properties": {
-                "tool": { "type": "string", "description": "Exact MCP tool name (mcp__server__tool)." },
-                "arguments": { "type": "object", "description": "The tool's parameters, as mcp_find showed them." }
-            },
-            "required": ["tool"]
-        }),
-        tool_fn(move |tctx, args| {
-            let mcp = mcp.clone();
-            Box::pin(async move {
-                let args = norm_args(&args);
-                let fp = fingerprint("mcp_call", &args);
-                let name = args.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-                let call_args = match args.get("arguments") {
-                    Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| json!({})),
-                    Some(v) if v.is_object() => v.clone(),
-                    _ => json!({}),
-                };
-                let res = match find_mcp(&mcp, name) {
-                    None => tools::ToolResult::err(format!("unknown MCP tool {name:?} — use mcp_find to get the exact name")),
-                    Some(b) => match crate::mcp::call(&b.server, &b.tool.name, call_args).await {
-                        Ok((text, false)) => tools::ToolResult::ok(text),
-                        Ok((text, true)) => tools::ToolResult::err(text),
-                        Err(e) => tools::ToolResult::err(e),
-                    },
-                };
-                let text = model_text(&res);
-                stash_result(fp, &res);
-                tctx.insert_result(res);
-                Ok(ToolOutput::text(text))
-            })
-        }),
-    )
+/* ---------- Main run ---------- */
+
+/// The system prompt of a main run; the context view measures the same.
+fn prompt_builder<'a>(
+    system: &'a str,
+    req: &'a AgentRequest,
+    root: &'a Path,
+    skills: &'a [crate::skills::Skill],
+    mcp: &[McpBinding],
+    project: &'a ProjectContext,
+) -> SystemPromptBuilder<'a> {
+    SystemPromptBuilder {
+        system,
+        req,
+        root,
+        skills,
+        mcp: mcp_mode(req, mcp),
+        helpers: req.has_helpers(),
+        parallel: req.max_agents.clamp(1, MAX_AGENTS),
+        project,
+    }
 }
 
-/* ---------- Agent build + streaming ---------- */
-
-/// Builds one Rig agent (main or helper) on the request's provider.
-type CacheSeen = Option<Arc<Mutex<Option<super::cachenet::CacheSeen>>>>;
-
-fn build_agent(ctx: &RunCtx, preamble: &str, tools: Vec<DynamicTool>) -> Result<(rig_agent::Agent, CacheSeen), String> {
-    let setup = model::build(&ctx.req)?;
-    let seen = setup.cache_seen.clone();
-    let mut b = AgentBuilder::from_model_handle(setup.handle)
-        .preamble(preamble)
-        .default_max_turns(MAX_TURNS);
-    if let Some(t) = setup.temperature.filter(|_| !ctx.no_temperature.load(Ordering::Relaxed)) {
-        b = b.temperature(t);
-    }
-    if let Some(m) = setup.max_tokens {
-        b = b.max_tokens(m);
-    }
-    if let Some(p) = setup.params {
-        b = b.additional_params(p);
-    }
-    Ok((b.dynamic_tools(tools).build(), seen))
+/// Instructions + repo map of the workspace, built off the async workers.
+async fn load_project(root: &Path) -> Arc<ProjectContext> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || project_context(&root)).await.unwrap_or_default()
 }
 
-/// Chat history → Rig messages; the LAST user turn becomes the prompt (with
-/// the attached images).
-fn to_messages(req: &AgentRequest, turns: &[crate::chat::ChatTurn]) -> (Vec<Message>, Message) {
-    let last_user = turns
-        .iter()
-        .rposition(|t| t.role != "agent" && t.role != "assistant");
+/// Every tool of the main agent, in a fixed order (the tool definitions
+/// are part of the cached request prefix).
+fn main_tools(ctx: &RunCtx, skills: &Arc<Vec<crate::skills::Skill>>, mcp: &[McpBinding], project: &Arc<ProjectContext>) -> ToolRegistry {
+    let mcp_all = Arc::new(mcp.to_vec());
+    let mut r = ToolRegistry::new(mcp_all.clone());
+    r.extend(builtin_tools(ctx));
+    if ctx.req.has_helpers() {
+        r.add(DelegateTool { ctx: ctx.clone(), project: project.clone() });
+    }
+    if !skills.is_empty() {
+        r.add(SkillTool(skills.clone()));
+    }
+    if mcp_deferred(&ctx.req, mcp) {
+        r.add(McpFind(mcp_all.clone()));
+        r.add(McpCall(mcp_all));
+    } else {
+        r.extend(mcp.iter().cloned().map(McpToolAdapter));
+    }
+    r
+}
+
+/// The model's context window (provider catalog / Ollama), or
+/// DEFAULT_WINDOW when unknown or slow to find out.
+async fn context_window(req: &AgentRequest) -> u64 {
+    if crate::cli::Cli::from_kind(&req.kind).is_some() {
+        return DEFAULT_WINDOW;
+    }
+    let info = crate::pricing::model_info(req.kind.clone(), req.base_url.clone(), req.model.clone());
+    let window = tokio::time::timeout(WINDOW_LOOKUP, info).await.ok().and_then(|i| i.context).filter(|c| *c >= 4_096);
+    if window.is_none() {
+        tracing::debug!(model = %req.model, "context window unknown; assuming {DEFAULT_WINDOW}");
+    }
+    window.unwrap_or(DEFAULT_WINDOW)
+}
+
+/// Chat history → messages; the LAST user turn (with the attached images)
+/// is the prompt and ends the list.
+fn to_messages(req: &AgentRequest, turns: &[crate::chat::ChatTurn]) -> Vec<Message> {
+    let last_user = turns.iter().rposition(|t| t.role != "agent" && t.role != "assistant");
     let mut history = Vec::new();
     let mut prompt = Message::user("");
     for (i, t) in turns.iter().enumerate() {
@@ -1154,11 +236,7 @@ fn to_messages(req: &AgentRequest, turns: &[crate::chat::ChatTurn]) -> (Vec<Mess
                     "image/webp" => Some(ImageMediaType::WEBP),
                     _ => None,
                 };
-                content.push(UserContent::image_base64(
-                    crate::chat::base64_body(&img.data_url).to_string(),
-                    mt,
-                    None,
-                ));
+                content.push(UserContent::image_base64(crate::chat::base64_body(&img.data_url).to_string(), mt, None));
             }
             prompt = Message::User { content };
         } else if agent {
@@ -1169,321 +247,8 @@ fn to_messages(req: &AgentRequest, turns: &[crate::chat::ChatTurn]) -> (Vec<Mess
             history.push(Message::user(t.text.clone()));
         }
     }
-    (history, prompt)
-}
-
-/// Consumes one Rig stream: text and reasoning go to the UI (only when
-/// `to_ui`), usage to the HUD. Returns the text it produced plus the error
-/// that ended it, if any (Stop drops the stream at once and reports
-/// `STOPPED`).
-async fn drive(
-    ctx: &RunCtx,
-    mut stream: rig_agent::agent::StreamingResult,
-    seen: &CacheSeen,
-    to_ui: bool,
-    mut on_text: impl FnMut(&str),
-) -> (String, Option<String>) {
-    let mut text = String::new();
-    // Providers that stream reasoning deltas also send the full block at the
-    // end of the turn — show it only when no deltas came.
-    let mut saw_reasoning_delta = false;
-    loop {
-        let item = tokio::select! {
-            it = stream.next() => match it {
-                Some(it) => it,
-                None => break,
-            },
-            _ = crate::cancel::cancel_signal(&ctx.run_id) => {
-                drop(stream);
-                return (text, Some(crate::cancel::STOPPED.to_string()));
-            }
-        };
-        let item = match item {
-            Ok(it) => it,
-            Err(e) => {
-                let msg = e.to_string();
-                if is_cancelled(&ctx.run_id) || msg.contains(crate::cancel::STOPPED) {
-                    return (text, Some(crate::cancel::STOPPED.to_string()));
-                }
-                return (text, Some(msg));
-            }
-        };
-        match item {
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
-                if !t.text.is_empty() {
-                    text.push_str(&t.text);
-                    on_text(&t.text);
-                    if to_ui {
-                        emit_text(&ctx.app, &ctx.run_id, t.text);
-                    }
-                }
-            }
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ReasoningDelta { reasoning, .. }) => {
-                saw_reasoning_delta = true;
-                if to_ui && !reasoning.is_empty() {
-                    emit_think(&ctx.app, &ctx.run_id, reasoning);
-                }
-            }
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning { reasoning, .. }) => {
-                if to_ui && !saw_reasoning_delta {
-                    let full = reasoning.display_text();
-                    if !full.trim().is_empty() {
-                        emit_think(&ctx.app, &ctx.run_id, full);
-                    }
-                }
-                saw_reasoning_delta = false;
-            }
-            MultiTurnStreamItem::CompletionCall(call) => {
-                let u = call.usage;
-                // Input = the WHOLE prompt, cache reads included, for every
-                // provider (Anthropic reports reads apart from input).
-                let (mut input, mut cached) = if ctx.req.kind == "anthropic-messages" {
-                    (u.input_tokens + u.cache_creation_input_tokens + u.cached_input_tokens, u.cached_input_tokens)
-                } else {
-                    (u.input_tokens + u.cache_creation_input_tokens, u.cached_input_tokens)
-                };
-                // What the gateway itself reported (fields Rig does not read).
-                if let Some(s) = seen.as_ref().and_then(|s| s.lock().unwrap().take()) {
-                    cached = cached.max(s.cached);
-                    input = input.max(s.prompt);
-                    if s.cached > 0 && s.prompt < s.cached {
-                        // Anthropic-style report behind the gateway: reads apart from input.
-                        input = input.max(s.prompt + s.cached + s.created);
-                    }
-                }
-                ctx.add_usage(input, u.output_tokens, cached);
-            }
-            MultiTurnStreamItem::FinalResponse(resp) => {
-                if text.trim().is_empty() && !resp.output.trim().is_empty() {
-                    // Non-streaming providers: the answer only arrives here.
-                    text = resp.output.clone();
-                    if to_ui {
-                        emit_text(&ctx.app, &ctx.run_id, resp.output);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    (text, None)
-}
-
-/// Runs an agent (main or helper) to the end, retrying ANY failure — HTTP
-/// 5xx/429, broken JSON, a cut connection — up to `req.max_retries` times,
-/// every RETRY_DELAY. A retry resumes from the exact request that failed
-/// (the hook's snapshot), so finished tool work is never redone. Stop and
-/// the repeat guard are deliberate and end the run at once.
-#[allow(clippy::too_many_arguments)]
-async fn run_with_retry(
-    ctx: &RunCtx,
-    preamble: &str,
-    tools: impl Fn() -> Vec<DynamicTool>,
-    label: Option<&str>,
-    mut prompt: Message,
-    mut history: Vec<Message>,
-    parallel: usize,
-    to_ui: bool,
-    mut on_text: impl FnMut(&str),
-) -> Result<String, String> {
-    let snapshot: Snapshot = Arc::default();
-    let mut text = String::new();
-    let mut attempt = 0usize;
-    loop {
-        let (agent, seen) = build_agent(ctx, preamble, tools())?;
-        let stream = agent
-            .stream_chat(prompt.clone(), history.clone())
-            .max_turns(MAX_TURNS)
-            // Several delegate calls in one turn run side by side.
-            .tool_concurrency(parallel)
-            .add_hook(UiHook::new(ctx.clone(), label, snapshot.clone()))
-            .await;
-        let (part, err) = drive(ctx, stream, &seen, to_ui, &mut on_text).await;
-        text.push_str(&part);
-        let Some(err) = err else {
-            return Ok(text);
-        };
-        if err.starts_with(crate::cancel::STOPPED) || is_cancelled(&ctx.run_id) {
-            return cancelled_result(text);
-        }
-        if err.contains(GUARD_STOP) {
-            return Err(err);
-        }
-        // The provider refused the temperature (reasoning models take none,
-        // Anthropic caps it at 1): drop it and go again at once — this used
-        // to burn every retry, 5 s apart, on the same 400.
-        if ctx.req.temperature.is_some()
-            && !ctx.no_temperature.load(Ordering::Relaxed)
-            && err.to_lowercase().contains("temperature")
-        {
-            ctx.no_temperature.store(true, Ordering::Relaxed);
-            emit_text(
-                &ctx.app,
-                &ctx.run_id,
-                "\n\n⚠️ This model does not accept the chosen temperature — continuing with its default.\n\n".to_string(),
-            );
-            if let Some((p, h)) = snapshot.lock().unwrap().take() {
-                prompt = p;
-                history = h;
-            }
-            continue;
-        }
-        if attempt >= ctx.req.max_retries {
-            return Err(err);
-        }
-        attempt += 1;
-        let who = label.map(|l| format!("{l}: ")).unwrap_or_default();
-        emit_retry(&ctx.app, &ctx.run_id, format!("{who}{}", one_line(&err, 300)), attempt, ctx.req.max_retries);
-        tokio::select! {
-            _ = tokio::time::sleep(RETRY_DELAY) => {}
-            _ = crate::cancel::cancel_signal(&ctx.run_id) => return cancelled_result(text),
-        }
-        // Resume from the request that failed; before the first request
-        // there is no snapshot and the original prompt goes out again.
-        if let Some((p, h)) = snapshot.lock().unwrap().take() {
-            prompt = p;
-            history = h;
-        }
-    }
-}
-
-/// Runs one helper agent to completion. Its tool cards join the run's
-/// transcript (prefixed with its name); its prose streams into the delegate
-/// card and comes back to the main agent as the tool result.
-async fn run_subagent(ctx: &RunCtx, def: &SubagentDef, task: &str, card: Option<usize>) -> Result<String, String> {
-    let preamble = format!(
-        "{}\n\nYou are the helper agent \"{}\". {}\nDo ONLY the task you are given, then answer with a short factual summary of what you did or found.",
-        super::prompt::default_system(),
-        def.name,
-        def.prompt.trim()
-    );
-    let summary = format!("{}: {}", def.name, one_line(task, 80));
-    let mut partial = String::new();
-    let mut shown = 0usize;
-    // Helpers batch their own independent tool calls too (several reads /
-    // searches in one turn run side by side).
-    let parallel = ctx.req.max_agents.clamp(1, 8);
-    let result = run_with_retry(ctx, &preamble, || fs_tools(ctx), Some(&def.name), Message::user(task), Vec::new(), parallel, false, |t| {
-        partial.push_str(t);
-        // Live progress in the delegate card, throttled.
-        if let Some(idx) = card {
-            if partial.len() >= shown + 200 {
-                shown = partial.len();
-                emit_step(&ctx.app, &ctx.run_id, idx, "delegate", summary.clone(), false, &tools::ToolResult::ok(partial.clone()));
-            }
-        }
-    })
-    .await;
-    match result {
-        Ok(text) if text.trim().is_empty() => Err("the helper returned no answer".into()),
-        other => other,
-    }
-}
-
-/// The main run.
-/// The request with the built-in helper added: with room for more than one
-/// agent, a general-purpose helper is always there — parallel work no
-/// longer depends on the user defining subagents.
-fn with_worker(req: &AgentRequest) -> AgentRequest {
-    let mut req = req.clone();
-    if req.max_agents.clamp(1, MAX_AGENTS) > 1 && !req.subagents.iter().any(|s| s.name == WORKER) {
-        req.subagents.push(SubagentDef {
-            name: WORKER.into(),
-            description: "General-purpose helper for ANY self-contained part of the task: exploring or reading an area of the codebase, researching on the web, implementing a change confined to its own files, running and fixing tests. Give it everything it needs in `task`.".into(),
-            prompt: "Work fast: batch independent tool calls into one turn.".into(),
-        });
-    }
-    req
-}
-
-fn has_helpers(req: &AgentRequest) -> bool {
-    req.subagents.iter().any(|s| !s.name.trim().is_empty())
-}
-
-/// The system prompt as labelled sections; joined, they are the preamble.
-/// The context view measures the very same sections.
-fn preamble_sections(
-    system: &str,
-    req: &AgentRequest,
-    root: &Path,
-    skills: &[crate::skills::Skill],
-    mcp: &[McpBinding],
-) -> Vec<(&'static str, String)> {
-    let parallel = req.max_agents.clamp(1, MAX_AGENTS);
-    let mut out: Vec<(&'static str, String)> = vec![("System prompt", system.to_string())];
-    // Facts the model otherwise guesses wrong: which OS and shell, where it
-    // is, and today's date (for web searches and "latest version" questions).
-    // Only name the tools this run has (Settings → Plugins can switch some off).
-    let on = |name: &str| !req.disabled_tools.iter().any(|d| d == name);
-    let mut prefer = String::from(
-        "Prefer the dedicated tools over shell one-liners: find_files / list_dir / grep to look around, \
-         read_file to read, apply_patch to edit, file_op to create folders or move / copy / delete",
-    );
-    if on("git") {
-        prefer.push_str(", git for git");
-    }
-    if on("web_search") || on("web_fetch") {
-        prefer.push_str(", web_search + web_fetch for anything on the internet (never curl/wget for reading pages)");
-    }
-    prefer.push_str(". ");
-    if on("run_command") {
-        prefer.push_str(
-            "Use run_command for builds, tests, package managers and project scripts; \
-             start dev servers and watchers with background:true. \
-             When a command fails, read its error and hint and change the approach — never rerun it unchanged.",
-        );
-    }
-    let mut env = format!(
-        "\n\nEnvironment:\n- {}\n- Workspace: {} (the starting working directory; change_dir moves it)\n- Today: {}\n{prefer}",
-        tools::shell_summary(),
-        root.display(),
-        today()
-    );
-    if has_helpers(req) {
-        env.push_str(&format!(
-            "\n\nHelper agents are available through the `delegate` tool — up to {parallel} work AT THE SAME TIME. \
-             Use them aggressively for throughput: split any task with independent parts (several files, modules, \
-             questions, searches) into self-contained sub-tasks and delegate them ALL IN ONE TURN so they run in parallel, \
-             then integrate their reports. Keep tightly coupled or tiny work for yourself."
-        ));
-    }
-    // Parallel tool calls: independent reads / searches / commands in one
-    // turn run side by side instead of one round-trip each.
-    env.push_str(
-        "\n\nSpeed: whenever several tool calls do not depend on each other (reading several files, several searches, \
-         listing folders), issue them together in ONE turn — they run in parallel. Avoid one-call-per-turn crawling.",
-    );
-    if !mcp.is_empty() && !mcp_deferred(req, mcp) {
-        env.push_str(
-            "\n\nTools named mcp__<server>__<tool> come from MCP servers the user connected; use them when they fit the task better than the built-in tools.",
-        );
-    }
-    // Without this the model "generates" a picture in words and tells the
-    // user it is shown above — while nothing is.
-    if req.image_gen.is_some() && on("generate_image") {
-        env.push_str(
-            "\n\nPictures: when the user asks for an image, photo, drawing, logo or icon, call generate_image — \
-             it is shown to the user automatically; afterwards just say it is ready (one short line).",
-        );
-    } else {
-        env.push_str(
-            "\n\nPictures: this run has no image generator. If the user asks for a picture, say you cannot draw \
-             with the current model and that an image model can be added in Settings → Models; never claim a picture was made.",
-        );
-    }
-    out.push(("Environment & working rules", env));
-    if mcp_deferred(req, mcp) {
-        out.push(("MCP catalog", mcp_catalog(mcp)));
-    }
-    if !skills.is_empty() {
-        let mut list = String::from(
-            "\n\nSkills — instruction packs for particular kinds of tasks. When the request matches a skill's description, call the `skill` tool with its name BEFORE you start, then follow it:",
-        );
-        for s in skills {
-            list.push_str(&format!("\n- {}: {}", s.name, one_line(&s.description, 300)));
-        }
-        out.push(("Skills list", list));
-    }
-    out
+    history.push(prompt);
+    history
 }
 
 /// /commands, invoked skills and @mentions → what the model reads. File IO
@@ -1523,73 +288,32 @@ pub(super) async fn run(
 ) -> Result<String, String> {
     let parallel = req.max_agents.clamp(1, MAX_AGENTS);
     let req = &with_worker(req);
-    let counter = Arc::new(AtomicUsize::new(0));
+    let window = context_window(req).await;
+    let ctx = RunCtx::new(Some(app), run_id, req, root.to_path_buf(), parallel, window);
     let skills = Arc::new(crate::skills::for_run(app, &req.workspace));
-    let mcp = load_mcp(app, run_id, &counter).await;
+    let (mcp, project) = tokio::join!(load_mcp(app, run_id, &ctx.counter), load_project(root));
     if is_cancelled(run_id) {
         return cancelled_result(String::new());
     }
-    let ctx = RunCtx {
-        app: app.clone(),
-        run_id: run_id.to_string(),
-        req: Arc::new(req.clone()),
-        root: root.to_path_buf(),
-        steps: Arc::default(),
-        counter,
-        confirm_lock: Arc::default(),
-        agent_slots: Arc::new(tokio::sync::Semaphore::new(parallel)),
-        delegate_cards: Arc::default(),
-        usage: Arc::new(Mutex::new(RunUsage {
-            run_id: run_id.to_string(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cached_tokens: 0,
-            elapsed_ms: 0,
-            first_input: 0,
-            first_est: 0,
-        })),
-        started: std::time::Instant::now(),
-        mcp_tools: Arc::new(
-            mcp.iter()
-                .map(|b| (b.name.clone(), (b.server.name.clone(), b.tool.read_only)))
-                .collect(),
-        ),
-        cwd: Arc::new(Mutex::new(root.to_path_buf())),
-        no_temperature: Arc::default(),
-    };
 
-    let has_helpers = has_helpers(req);
-    let deferred = mcp_deferred(req, &mcp);
-    let mcp_all = Arc::new(mcp.clone());
-    let preamble: String = preamble_sections(system, req, root, &skills, &mcp)
-        .into_iter()
-        .map(|(_, text)| text)
-        .collect();
-    let tools = || {
-        let mut t = fs_tools(&ctx);
-        if has_helpers {
-            t.push(delegate_tool(&ctx));
-        }
-        if !skills.is_empty() {
-            t.push(skill_tool(skills.clone()));
-        }
-        if deferred {
-            t.push(mcp_find_tool(mcp_all.clone()));
-            t.push(mcp_call_tool(mcp_all.clone()));
-        } else {
-            t.extend(mcp.iter().map(mcp_tool));
-        }
-        t
-    };
+    let preamble = prompt_builder(system, req, root, &skills, &mcp, &project).build();
+    let tools = main_tools(&ctx, &skills, &mcp, &project);
     let turns = expand_turns(skills.clone(), root, turns).await?;
     ctx.usage.lock().unwrap().first_est =
-        measure(req, system, root, &skills, &mcp, &turns, None).iter().map(|p| p.tokens as u64).sum();
-    let (history, prompt) = to_messages(req, &turns);
-    // The main agent may run many tool calls of one turn at once (parallel
-    // reads, several delegations); at least a handful even with one helper.
-    let tool_parallel = parallel.max(8);
-    let text = run_with_retry(&ctx, &preamble, tools, None, prompt, history, tool_parallel, true, |_| {}).await?;
-    if text.trim().is_empty() && ctx.counter.load(Ordering::SeqCst) == 0 {
+        measure(req, system, root, &skills, &mcp, &project, &turns, None).iter().map(|p| p.tokens as u64).sum();
+    let agent = AgentLoop {
+        ctx: &ctx,
+        preamble,
+        tools: &tools,
+        label: String::new(),
+        to_ui: true,
+        // The main agent may run many tool calls of one turn at once
+        // (parallel reads, several delegations); at least a handful even
+        // with one helper.
+        parallel: parallel.max(8),
+    };
+    let text = agent.run(to_messages(req, &turns), &mut |_| {}).await?;
+    if text.trim().is_empty() && ctx.steps() == 0 {
         return Err(
             "the model returned an empty answer — its output may have been reasoning-only; retry, or try another model/effort level".into(),
         );
@@ -1598,21 +322,6 @@ pub(super) async fn run(
 }
 
 /* ---------- Context view ---------- */
-
-/// Rough token count: ~4 characters per token for ASCII (English, code),
-/// ~2.5 for other scripts (Cyrillic, CJK tokenize denser). Real tokenizers
-/// differ by model; this is for the "how full is it" gauge.
-pub(crate) fn est_tokens(text: &str) -> usize {
-    let (mut ascii, mut other) = (0usize, 0usize);
-    for c in text.chars() {
-        if c.is_ascii() {
-            ascii += 1;
-        } else {
-            other += 1;
-        }
-    }
-    (ascii as f64 / 4.0 + other as f64 / 2.5).ceil() as usize
-}
 
 /// One line inside a context category (a tool, a skill, a kind of message).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1650,9 +359,9 @@ fn category(label: &str, group: &'static str, mut items: Vec<ContextItem>) -> Co
 }
 
 /// What the NEXT agent request of this conversation would send, measured
-/// category by category — the same preamble, tool list and trimmed,
+/// category by category — the same system prompt, tool list and trimmed,
 /// expanded history the run builds. (Inside a run the history then grows
-/// with tool calls and results; context editing trims those.)
+/// with tool calls and results; the context manager trims those.)
 pub(super) async fn context_info(
     app: &AppHandle,
     req: &AgentRequest,
@@ -1663,21 +372,23 @@ pub(super) async fn context_info(
     let req = &with_worker(req);
     let counter = AtomicUsize::new(0);
     let skills = Arc::new(crate::skills::for_run(app, &req.workspace));
-    let mcp = load_mcp(app, "context-info", &counter).await;
+    let (mcp, project) = tokio::join!(load_mcp(app, "context-info", &counter), load_project(root));
     // The latest prompt as typed: the rest of its expanded text is @files.
     let raw_last = turns.iter().rev().find(|t| t.role != "agent" && t.role != "assistant").map(|t| t.text.clone());
     let turns = expand_turns(skills.clone(), root, turns).await?;
-    Ok(measure(req, system, root, &skills, &mcp, &turns, raw_last.as_deref()))
+    Ok(measure(req, system, root, &skills, &mcp, &project, &turns, raw_last.as_deref()))
 }
 
 /// Estimated tokens per category of one request (see context_info). The
 /// run measures its first request the same way, which calibrates this.
+#[allow(clippy::too_many_arguments)]
 fn measure(
     req: &AgentRequest,
     system: &str,
     root: &Path,
     skills: &[crate::skills::Skill],
     mcp: &[McpBinding],
+    project: &ProjectContext,
     turns: &[crate::chat::ChatTurn],
     raw_last: Option<&str>,
 ) -> Vec<ContextPart> {
@@ -1718,7 +429,7 @@ fn measure(
         .iter()
         .map(|spec| item(spec["name"].as_str().unwrap_or("tool"), &spec.to_string()))
         .collect();
-    if has_helpers(req) {
+    if req.has_helpers() {
         let roster: String = req.subagents.iter().map(|s| format!("- {}: {}\n", s.name, s.description)).collect();
         tools_items.push(item("delegate", &format!("{roster}{}", " ".repeat(420))));
     }
@@ -1743,7 +454,7 @@ fn measure(
         parts.push(category("MCP tools", "mcp", items));
     }
 
-    let sections = preamble_sections(system, req, root, skills, mcp);
+    let sections = prompt_builder(system, req, root, skills, mcp, project).sections();
     if !skills.is_empty() {
         // Only name + description ride along; a skill's body loads on use.
         let items = skills
@@ -1761,135 +472,31 @@ fn measure(
     parts
 }
 
-/// Today's date (UTC) as YYYY-MM-DD.
-fn today() -> String {
-    let days = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / 86_400)
-        .unwrap_or(0) as i64;
-    // Civil-from-days (Howard Hinnant).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn old_tool_results_are_cleared_in_steps() {
-        let stub_count = |h: &[Message]| {
-            h.iter()
-                .filter(|m| serde_json::to_string(m).unwrap().contains("older tool result cleared"))
-                .count()
-        };
-        // 30 bulky results ≈ 300k chars: well past the trigger.
-        let mut history = vec![Message::user("task")];
-        for i in 0..30 {
-            history.push(Message::tool_result(format!("c{i}"), "read_file", "x".repeat(10_000)));
-        }
-        history.push(Message::tool_result("d", "delegate", "y".repeat(10_000)));
-        let mut cleared = 0;
-        let out = clear_old_results(&history, &mut cleared).expect("history over the trigger is edited");
-        assert!(cleared > 0 && cleared <= 30 - CLEAR_KEEP_RECENT);
-        assert_eq!(stub_count(&out), cleared);
-        // The newest results and the helper's report stay verbatim.
-        assert!(serde_json::to_string(&out[30]).unwrap().contains("xxxx"));
-        assert!(serde_json::to_string(out.last().unwrap()).unwrap().contains("yyyy"));
-        // Next turn with one more small result: the watermark holds (cache-stable).
-        history.push(Message::tool_result("e", "list_dir", "z"));
-        let before = cleared;
-        clear_old_results(&history, &mut cleared);
-        assert_eq!(cleared, before);
-        // Small histories are sent untouched.
-        let mut zero = 0;
-        assert!(clear_old_results(&history[..3], &mut zero).is_none());
-    }
-
-    #[test]
-    fn today_is_a_date() {
-        let t = today();
-        assert_eq!(t.len(), 10);
-        assert!(t.starts_with("20"));
-    }
-
-    #[test]
-    fn gates_follow_the_tool() {
-        let ws = if cfg!(windows) { "C:/proj" } else { "/proj" };
-        assert!(permission_gate("git", &json!({"subcommand": "status"}), ws, ws, false).is_none());
-        assert!(permission_gate("git", &json!({"subcommand": "commit", "args": ["-m", "x"]}), ws, ws, false).is_some());
-        assert!(permission_gate("git", &json!({"subcommand": "commit", "args": ["-m", "x"]}), ws, ws, true).is_none());
-        assert!(permission_gate("git", &json!({"subcommand": "reset", "args": ["--hard"]}), ws, ws, true).is_some());
-        assert!(permission_gate("file_op", &json!({"op": "delete", "path": "a"}), ws, ws, false).is_some());
-        assert!(permission_gate("file_op", &json!({"op": "delete", "path": "a"}), ws, ws, true).is_none());
-        assert!(permission_gate("file_op", &json!({"op": "mkdir", "path": "a/b"}), ws, ws, false).is_none());
-        assert!(permission_gate("web_fetch", &json!({"url": "https://x"}), ws, ws, false).is_none());
-    }
-
-    #[test]
-    fn partial_field_reads_truncated_json() {
-        assert_eq!(partial_field(r#"{"path":"src/ma"#, "path").as_deref(), Some("src/ma"));
-        assert_eq!(partial_field(r#"{"path": "a\"b", "diff":"x"#, "path").as_deref(), Some("a\"b"));
-        assert_eq!(partial_field(r#"{"diff":"x"#, "path"), None);
-    }
-
-    #[test]
-    fn live_summary_uses_full_json_when_complete() {
-        assert_eq!(live_summary("list_dir", r#"{"path":"src"}"#), "src");
-        assert!(live_summary("apply_patch", r#"{"path":"a.rs","diff":"<<<"#).starts_with("a.rs"));
-    }
-
-    #[test]
-    fn string_encoded_args_match() {
-        let obj = json!({"command": "npm install", "cwd": "web"});
-        let as_string = Value::String(obj.to_string());
-        assert_eq!(fingerprint("run_command", &obj), fingerprint("run_command", &as_string));
-        assert_eq!(parse_args(&serde_json::to_string(&obj.to_string()).unwrap()), obj);
-    }
-
-    #[test]
-    fn canonical_ignores_formatting() {
-        let a: Value = serde_json::from_str(r#"{ "agent": "X",  "task": "t" }"#).unwrap();
-        let b: Value = serde_json::from_str(r#"{"agent":"X","task":"t"}"#).unwrap();
-        assert_eq!(canonical(&a), canonical(&b));
-    }
-}
-
-#[cfg(test)]
-mod mcp_defer_tests {
-    use super::*;
-
-    fn binding(server: &str, tool: &str) -> McpBinding {
-        let tool = crate::mcp::McpTool {
-            name: tool.into(),
-            description: format!("{tool} does things"),
-            input_schema: json!({ "type": "object" }),
-            read_only: false,
-        };
-        let server: crate::mcp::McpServer = serde_json::from_value(json!({
-            "id": "s", "name": server, "transport": "http", "url": "http://x", "enabled": true
+    fn req(max_agents: usize) -> AgentRequest {
+        serde_json::from_value(json!({
+            "kind": "openai", "base_url": "http://x", "model": "m", "workspace": "/w", "max_agents": max_agents
         }))
-        .unwrap_or_else(|_| panic!("McpServer shape"));
-        McpBinding { name: crate::mcp::tool_name(&server.name, &tool.name), server: Arc::new(server), tool }
+        .unwrap()
     }
 
     #[test]
-    fn deferred_lookup_by_full_or_bare_name() {
-        let mcp = vec![binding("Browser", "navigate"), binding("Browser", "click"), binding("DevTools", "click")];
-        assert_eq!(find_mcp(&mcp, "navigate").map(|b| b.tool.name.as_str()), Some("navigate"));
-        assert!(find_mcp(&mcp, "click").is_none(), "ambiguous bare name");
-        let full = mcp[2].name.clone();
-        assert_eq!(find_mcp(&mcp, &full).map(|b| b.server.name.as_str()), Some("DevTools"));
-        let cat = mcp_catalog(&mcp);
-        assert!(cat.contains("- Browser: ") && cat.contains("- DevTools: "));
+    fn worker_joins_only_with_room_for_helpers() {
+        assert!(!with_worker(&req(1)).has_helpers());
+        let r = with_worker(&req(4));
+        assert_eq!(r.subagents.iter().filter(|s| s.name == WORKER).count(), 1);
+        assert_eq!(with_worker(&r).subagents.len(), r.subagents.len(), "added once");
+    }
+
+    #[test]
+    fn last_user_turn_is_the_prompt() {
+        let turn = |role: &str, text: &str| crate::chat::ChatTurn { role: role.into(), text: text.into(), ..Default::default() };
+        let msgs = to_messages(&req(1), &[turn("user", "a"), turn("agent", "b"), turn("agent", " "), turn("user", "c")]);
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(msgs[1], Message::Assistant { .. }));
+        assert!(serde_json::to_string(msgs.last().unwrap()).unwrap().contains("\"c\""));
     }
 }
-

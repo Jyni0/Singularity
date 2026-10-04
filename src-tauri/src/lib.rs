@@ -254,7 +254,16 @@ fn ssh_connected(app: tauri::AppHandle) -> Vec<String> {
     ssh::connected_ids()
 }
 
+/// Logs to stderr. Filter with RUST_LOG (default: this crate at info), e.g.
+/// `RUST_LOG=singularity_lib::agent=debug` for per-step agent detail.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("singularity_lib=info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
+}
+
 pub fn run() {
+    init_tracing();
     let migrations = db::migrations();
 
     tauri::Builder::default()
@@ -327,6 +336,7 @@ pub fn run() {
             cli::cli_login,
             cli::cli_logout,
             cli::cli_usage,
+            cli::cli_end_chat,
             agent_run,
             agent_confirm,
             agent_snapshot,

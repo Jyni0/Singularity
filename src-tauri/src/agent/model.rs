@@ -86,7 +86,8 @@ fn build_model(req: &AgentRequest) -> Result<ModelSetup, String> {
     // CLIs take no sampling parameters.
     if let Some(cli) = crate::cli::Cli::from_kind(&req.kind) {
         return Ok(ModelSetup {
-            handle: ModelHandle::new(crate::cli::CliModel::new(cli, &req.model, effort)),
+            // One CLI session for the whole chat (see cli::model).
+            handle: ModelHandle::new(crate::cli::CliModel::for_chat(cli, &req.model, effort, &req.chat_id)),
             params: None,
             temperature: None,
             max_tokens: None,

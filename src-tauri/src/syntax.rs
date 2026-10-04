@@ -24,7 +24,7 @@ const MAX_REPORTED: usize = 8;
 /// Files larger than this are not parsed (generated bundles, lockfiles).
 const MAX_BYTES: usize = 1_500_000;
 
-fn language(path: &Path) -> Option<Language> {
+pub(crate) fn language(path: &Path) -> Option<Language> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     Some(match ext.as_str() {
         "js" | "mjs" | "cjs" | "jsx" => tree_sitter_javascript::LANGUAGE.into(),
@@ -261,5 +261,103 @@ mod tests {
         assert_eq!(introduced(path, Some(before), same).unwrap(), vec![]);
         let worse = "const a = (1;\nconst b = {3;\n";
         assert!(!introduced(path, Some(before), worse).unwrap().is_empty());
+    }
+}
+
+/* ---------- Outline (Roo Code's list_code_definition_names) ---------- */
+
+/// Kinds that define something worth listing in an outline.
+const OUTLINE_DEFS: &[&str] = &[
+    "function_declaration", "function_definition", "function_item", "generator_function_declaration",
+    "class_declaration", "abstract_class_declaration", "class_definition", "class_specifier",
+    "struct_item", "enum_item", "trait_item", "union_item", "type_item", "macro_definition",
+    "interface_declaration", "type_alias_declaration", "enum_declaration", "struct_specifier",
+    "method_declaration", "type_spec", "record_declaration", "struct_declaration", "trait_declaration",
+    "impl_item", "method_definition", "function_signature_item", "constructor_declaration", "mod_item",
+];
+/// Wrappers / bodies whose children are definitions too.
+const OUTLINE_CONTAINERS: &[&str] = &[
+    "export_statement", "decorated_definition", "type_declaration", "namespace_declaration",
+    "file_scoped_namespace_declaration", "internal_module", "declaration_list", "namespace_definition",
+    "template_declaration", "ambient_declaration", "class_body", "block", "field_declaration_list",
+    "interface_body", "enum_body", "statement_block",
+];
+const OUTLINE_MAX: usize = 80;
+
+/// The definitions of a file with their line ranges — `12-40  export function
+/// Foo(props: Props) {` — so the model reads just the part it needs. Code
+/// via tree-sitter; Markdown by its headings. Empty when nothing is known.
+pub fn outline(path: &Path, text: &str) -> Vec<String> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if matches!(ext.as_str(), "md" | "mdx" | "markdown") {
+        return text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with('#'))
+            .take(OUTLINE_MAX)
+            .map(|(i, l)| format!("{:>5}  {}", i + 1, clip(l)))
+            .collect();
+    }
+    let Some(lang) = language(path) else { return Vec::new() };
+    let mut parser = Parser::new();
+    if parser.set_language(&lang).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(text, None) else { return Vec::new() };
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    walk_outline(tree.root_node(), &lines, 0, &mut out);
+    if out.len() > OUTLINE_MAX {
+        let more = out.len() - OUTLINE_MAX;
+        out.truncate(OUTLINE_MAX);
+        out.push(format!("       … {more} more"));
+    }
+    out
+}
+
+fn walk_outline(node: Node, lines: &[&str], depth: usize, out: &mut Vec<String>) {
+    if depth > 4 {
+        return;
+    }
+    let mut c = node.walk();
+    for child in node.named_children(&mut c) {
+        let kind = child.kind();
+        let def = OUTLINE_DEFS.contains(&kind) || is_callable_const(child);
+        if def {
+            let (a, b) = (child.start_position().row, child.end_position().row);
+            // One-liners (a `type X = …`) are not worth a line of their own.
+            if b > a {
+                let first = lines.get(a).copied().unwrap_or("");
+                out.push(format!("{:>5}-{:<5} {}{}", a + 1, b + 1, "  ".repeat(depth.min(3)), clip(first.trim())));
+            }
+            // Members of a class / impl / trait.
+            if let Some(body) = child.child_by_field_name("body") {
+                walk_outline(body, lines, depth + 1, out);
+            }
+        } else if OUTLINE_CONTAINERS.contains(&kind) {
+            walk_outline(child, lines, depth, out);
+        }
+    }
+}
+
+/// `const Foo = (…) => …` / `export const api = {…}` style definitions.
+fn is_callable_const(n: Node) -> bool {
+    if n.kind() != "lexical_declaration" && n.kind() != "variable_declaration" {
+        return false;
+    }
+    let mut c = n.walk();
+    let found = n.named_children(&mut c).any(|d| {
+        d.kind() == "variable_declarator"
+            && d.child_by_field_name("value").is_some_and(|v| {
+                matches!(v.kind(), "arrow_function" | "function_expression" | "function" | "class" | "call_expression" | "object")
+            })
+    });
+    found
+}
+
+fn clip(s: &str) -> String {
+    match s.char_indices().nth(110) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
     }
 }

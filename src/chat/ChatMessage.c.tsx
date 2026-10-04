@@ -1,7 +1,8 @@
-import { Fragment, useEffect, useRef, useState, memo } from "react";
-import { ArrowUp, Bug, Check, ChevronDown, ChevronRight, Copy, Image as ImageIcon, Pencil, Wrench } from "lucide-react";
+import { Fragment, useEffect, useMemo, useRef, useState, memo } from "react";
+import { ArrowUp, Bug, Check, ChevronDown, ChevronRight, Copy, FileDiff as FileDiffIcon, Image as ImageIcon, Pencil, Wrench } from "lucide-react";
 import * as db from "../core/db.r";
 import { formatDuration } from "../utils/format.u";
+import { diffStat } from "../utils/diff.u";
 import { Markdown, ToolCall, ThinkBlock } from "./Markdown.c";
 import { GourabDock } from "./Gourab.c";
 import type { Segment } from "./message.i";
@@ -227,6 +228,85 @@ function StepGroup({
   );
 }
 
+interface FileChange {
+  path: string;
+  added: number;
+  removed: number;
+  created: boolean;
+  /** The file's net change over the turn, ready for the diff tab. */
+  step: db.AgentStepEvent;
+}
+
+/**
+ * Every file the turn changed, net: the content before its FIRST edit
+ * against the content after its LAST one (a file patched five times is one
+ * row). "src/a.ts" and "C:/proj/src/a.ts" are the same file.
+ */
+function turnChanges(segments: Segment[]): FileChange[] {
+  const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
+  const byKey = new Map<string, { path: string; old: string | undefined; step: db.AgentStepEvent }>();
+  for (const s of segments) {
+    if (s.kind !== "step" || !s.step.done || !s.step.path || s.step.new_text === undefined) continue;
+    const n = norm(s.step.path);
+    const key = [...byKey.keys()].find((k) => k === n || k.endsWith("/" + n) || n.endsWith("/" + k)) ?? n;
+    const prev = byKey.get(key);
+    if (prev) byKey.set(key, { ...prev, path: prev.path.length >= s.step.path.length ? prev.path : s.step.path, step: s.step });
+    else byKey.set(key, { path: s.step.path, old: s.step.old_text ?? undefined, step: s.step });
+  }
+  return [...byKey.values()]
+    .map(({ path, old, step }) => {
+      const { added, removed } = diffStat(old ?? "", step.new_text ?? "");
+      return { path, added, removed, created: old === undefined, step: { ...step, old_text: old } };
+    })
+    .filter((c) => c.added + c.removed > 0 || c.created);
+}
+
+/** The end-of-turn summary: "4 files changed +120 −35", each file opens its diff. */
+function ChangesSummary({ segments, onInspectStep }: { segments: Segment[]; onInspectStep?: (step: db.AgentStepEvent) => void }) {
+  const changes = useMemo(() => turnChanges(segments), [segments]);
+  const [open, setOpen] = useState(false);
+  if (changes.length === 0) return null;
+  const added = changes.reduce((n, c) => n + c.added, 0);
+  const removed = changes.reduce((n, c) => n + c.removed, 0);
+  const name = (p: string) => p.replace(/\\/g, "/").split("/").pop() ?? p;
+  const dir = (p: string) => p.replace(/\\/g, "/").split("/").slice(0, -1).join("/");
+  return (
+    <div className="flex flex-col overflow-hidden rounded-xl border border-[var(--border)]">
+      <button
+        className="flex items-center gap-2 px-3 py-1.5 text-left text-[12.5px] text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)]"
+        onClick={() => setOpen(!open)}
+      >
+        <FileDiffIcon size={13} className="shrink-0" />
+        <span className="flex-1 text-[var(--text-main)]">
+          {changes.length} file{changes.length === 1 ? "" : "s"} changed
+        </span>
+        <span className="font-mono text-[11.5px] text-[var(--diff-add)]">+{added}</span>
+        <span className="font-mono text-[11.5px] text-[var(--diff-del)]">−{removed}</span>
+        <ChevronRight size={12} className={`shrink-0 text-[var(--text-dim)] transition-transform ${open ? "rotate-90" : ""}`} />
+      </button>
+      {open && (
+        <div className="flex flex-col border-t border-[var(--border)] py-1">
+          {changes.map((c) => (
+            <button
+              key={c.path}
+              className="flex min-w-0 items-center gap-2 px-3 py-[3px] text-left text-[12px] transition-colors hover:bg-[var(--hover-bg)]"
+              onClick={() => onInspectStep?.(c.step)}
+              title={c.path}
+            >
+              <FileIcon path={c.path} size={12} />
+              <span className="shrink-0 text-[var(--text-main)]">{name(c.path)}</span>
+              <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-dim)]">{dir(c.path)}</span>
+              {c.created && <span className="shrink-0 text-[10.5px] text-[var(--text-dim)]">new</span>}
+              <span className="shrink-0 font-mono text-[11px] text-[var(--diff-add)]">+{c.added}</span>
+              <span className="shrink-0 font-mono text-[11px] text-[var(--diff-del)]">−{c.removed}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Folds consecutive step segments into groups (one StepGroup each). */
 function groupSegments(segments: Segment[]): (Segment | { group: Segment[] })[] {
   const out: (Segment | { group: Segment[] })[] = [];
@@ -404,6 +484,7 @@ function ChatMessageView({
           return null;
         })}
         {error && <ErrorText text={error} />}
+        {!streaming && <ChangesSummary segments={segments} onInspectStep={onInspectStep} />}
         <LiveTail streaming={streaming} lastChange={lastChange} segments={segments} />
         <div className="flex items-center justify-between">
           {actions || <span />}
@@ -485,16 +566,31 @@ function UsageHud({ usage, streaming }: { usage: db.RunUsage; streaming?: boolea
   // runs stored them apart — then cached can exceed prompt).
   const promptAll = Math.max(usage.prompt_tokens, usage.cached_tokens);
   const cacheRate = promptAll > 0 ? Math.round((usage.cached_tokens / promptAll) * 100) : 0;
-  const fmt = (n: number) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(Math.round(n)));
+  // Every call resends the whole prompt, so the sum of prompts grows with
+  // the square of the turns; what the provider actually processes anew is
+  // the part NOT read from its cache.
+  const fresh = promptAll - usage.cached_tokens;
+  const fmt = (n: number) =>
+    n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + "M" : n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(Math.round(n));
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1.5 py-1">
       <Bug size={11} className="shrink-0 text-[var(--accent)]" />
       <HudCell label="speed" value={tps > 0 ? tps.toFixed(1) + " tok/s" : "—"} title="Completion tokens per second" />
+      <HudCell label="input" value={fmt(fresh)} title={`Input tokens processed anew (not from cache): ${fresh}`} />
+      <HudCell label="output" value={fmt(usage.completion_tokens)} title={`Output tokens, reasoning included: ${usage.completion_tokens}`} />
+      <HudCell label="cached" value={fmt(usage.cached_tokens)} title={`Input tokens read from the provider's cache: ${usage.cached_tokens}`} />
       <HudCell
-        label="tokens"
-        value={fmt(usage.prompt_tokens) + " in · " + fmt(usage.completion_tokens) + " out"}
-        title={"Prompt: " + usage.prompt_tokens + " · Completion: " + usage.completion_tokens}
+        label="sum"
+        value={fmt(promptAll + usage.completion_tokens)}
+        title={`All tokens of the turn (input + cached + output): ${promptAll + usage.completion_tokens}`}
       />
+      {!!usage.last_input && (
+        <HudCell
+          label="context"
+          value={fmt(usage.last_input)}
+          title={"Size of the latest request — how full the model's context is now: " + usage.last_input}
+        />
+      )}
       <HudCell
         label="cache"
         value={cacheRate + "%"}

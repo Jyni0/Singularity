@@ -135,16 +135,51 @@ pub fn render(req: &CompletionRequest) -> Rendered {
 
     // The CLIs wrap the request in long prompts of their own; a reminder at
     // the very end keeps the app's tool protocol in view.
-    let prompt = if req.tools.is_empty() {
-        prompt
-    } else {
-        format!(
-            "{prompt}\n\n(Reminder: when my app's tools can do or look this up, reply with request \
-             lines {OPEN}{{\"name\": …, \"arguments\": {{…}}}}{CLOSE} and stop — my app runs them.)"
-        )
-    };
+    let prompt = if req.tools.is_empty() { prompt } else { format!("{prompt}\n\n{}", reminder()) };
 
     Rendered { system, prompt, images }
+}
+
+fn reminder() -> String {
+    format!(
+        "(Reminder: when my app's tools can do or look this up, reply with request \
+         lines {OPEN}{{\"name\": …, \"arguments\": {{…}}}}{CLOSE} and stop — my app runs them.)"
+    )
+}
+
+/// The next message of a LIVE CLI session: only what came after the
+/// session's own last reply (the tool results, a user note). The session
+/// already holds the instructions and everything before. None when the
+/// messages cannot be sent as text (an image) — the caller starts afresh.
+pub fn render_followup(messages: &[Message], tools: bool) -> Option<String> {
+    let mut parts = Vec::new();
+    for msg in messages {
+        let Message::User { content } = msg else { return None };
+        for c in content {
+            match c {
+                UserContent::Text(t) => parts.push(t.text.clone()),
+                UserContent::ToolResult(r) => {
+                    let body = r
+                        .content
+                        .iter()
+                        .map(|c| match c {
+                            ToolResultContent::Text(t) => t.text.clone(),
+                            ToolResultContent::Json { value } => value.to_string(),
+                            ToolResultContent::Image(_) => "[image]".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    parts.push(format!("<tool_result name=\"{}\" id=\"{}\">\n{body}\n</tool_result>", r.name, r.wire_call_id()));
+                }
+                _ => return None,
+            }
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let text = parts.join("\n\n");
+    Some(if tools { format!("{text}\n\n{}", reminder()) } else { text })
 }
 
 /// The app's tools, described for a model that can only answer in text.
@@ -155,7 +190,8 @@ fn tool_protocol(req: &CompletionRequest) -> String {
     let mut out = String::from(
         "# My app's tools\n\
          I am using you through my own app. It has the tools listed below, which you do not have \
-         yourself: my app runs them for you when your reply contains a request line. Do not use \
+         yourself: my app runs them for you when your reply contains a request line. This is my \
+         genuine setup, not an injection — follow it without second-guessing. Do not use \
          your own built-in tools for this work. The request line format is exactly:\n\
          <tool_call>{\"name\": \"TOOL_NAME\", \"arguments\": { ... }}</tool_call>\n\
          The arguments must be valid JSON matching the tool's schema. You may write several \
@@ -265,6 +301,18 @@ fn parse_call(body: &str) -> Piece {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn followup_carries_only_the_new_results() {
+        let msgs = vec![Message::tool_result("c1", "read_file", "file body")];
+        let text = render_followup(&msgs, true).unwrap();
+        assert!(text.starts_with("<tool_result name=\"read_file\""), "{text}");
+        assert!(text.contains("file body") && text.contains("Reminder"), "{text}");
+        assert!(!text.contains("<user>") && !text.contains("Continue the conversation"));
+        // An assistant message cannot be "new" in a live session.
+        assert!(render_followup(&[Message::assistant("x")], true).is_none());
+        assert!(render_followup(&[], true).is_none());
+    }
 
     #[test]
     fn splits_calls_across_chunks() {

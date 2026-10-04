@@ -18,9 +18,11 @@ import { flushSync } from "react-dom";
 import type { Dispatch, SetStateAction } from "react";
 import * as db from "../core/db.r";
 import type { Attachment, Conversation, Effort, Model, Project, Provider, SshServer } from "../core/types.i";
+import { isCliKind } from "../core/types.i";
 import { composePrompt } from "../utils/attachments.u";
 import type { Msg, Segment } from "../chat/message.i";
 import { storedToMsg } from "../chat/message.u";
+import { diffStat } from "../utils/diff.u";
 
 /** Opens a compacted history: the summary rides in front of the first
  *  message after it (also recognised by the Rust history trimmer). */
@@ -33,8 +35,8 @@ export const COMPACT_MARKER = "[Summary of the earlier conversation — older me
  */
 export function modelTurns(history: Msg[]): db.ChatTurn[] {
   const at = history.map((m) => m.role).lastIndexOf("compact");
-  const plain = (list: Msg[]) =>
-    list.filter((m) => m.role !== "compact").map((m) => ({ role: m.role, text: m.text }));
+  const plain = (list: Msg[]): db.ChatTurn[] =>
+    list.filter((m) => m.role !== "compact").map((m) => ({ role: m.role, text: m.text, ...workOf(m) }));
   if (at < 0) return plain(history);
   const summary = `${COMPACT_MARKER}\n${history[at].text.trim()}`;
   const rest = plain(history.slice(at + 1));
@@ -43,6 +45,42 @@ export function modelTurns(history: Msg[]): db.ChatTurn[] {
   const out = rest.slice(first);
   out[0] = { role: "user", text: `${summary}\n\n---\n\n${out[0].text}` };
   return out;
+}
+
+/** Outputs of these tools are worth carrying into the next message. */
+const DETAIL_TOOLS = ["read_file", "grep", "find_files", "list_dir", "run_command", "git"];
+/** One output in the detail, chars (its tail holds errors and summaries). */
+const DETAIL_ONE = 6_000;
+
+/**
+ * What an agent turn DID, for the next message: a line per tool call
+ * (Claude Code keeps every tool result in its history; the saved chat kept
+ * only the prose, so the next message re-read every file), plus the
+ * outputs of its reads / searches / commands. A file the turn changed later
+ * is not carried as it was read — its line says how it changed instead.
+ */
+function workOf(m: Msg): Pick<db.ChatTurn, "work_log" | "work_detail"> {
+  if (m.role !== "agent") return {};
+  const steps = (m.segments ?? []).flatMap((s) => (s.kind === "step" && s.step.done ? [s.step] : []));
+  if (steps.length === 0) return {};
+  const firstLine = (t: string) => (t.split("\n").find((l) => l.trim()) ?? "").trim().slice(0, 160);
+  const changed = new Set(steps.filter((s) => s.path && s.new_text !== undefined).map((s) => s.path!.replace(/\\/g, "/").toLowerCase()));
+  const log: string[] = [];
+  const detail: string[] = [];
+  for (const s of steps) {
+    let outcome = firstLine(s.result ?? "");
+    if (s.path && s.new_text !== undefined) {
+      const { added, removed } = diffStat(s.old_text ?? "", s.new_text);
+      outcome = `${s.old_text == null ? "created" : "changed"} (+${added} −${removed})`;
+    }
+    log.push(`- ${s.name} ${s.input.slice(0, 200)} → ${s.ok ? "" : "FAILED: "}${outcome}`);
+    if (!s.ok || !DETAIL_TOOLS.includes(s.name) || !s.result) continue;
+    const file = s.input.replace(/^\[[^\]]+\] /, "").split(/ [(…]/)[0].trim().replace(/\\/g, "/").toLowerCase();
+    if (s.name === "read_file" && [...changed].some((c) => c.endsWith(file) || file.endsWith(c))) continue;
+    const body = s.result.length > DETAIL_ONE ? `[…]\n${s.result.slice(-DETAIL_ONE)}` : s.result;
+    detail.push(`### ${s.name} ${s.input.slice(0, 200)}\n${body}`);
+  }
+  return { work_log: log.join("\n"), work_detail: detail.join("\n\n") };
 }
 
 /** Everything the context gauge shows for one conversation. */
@@ -56,6 +94,9 @@ export interface ContextReport {
   /** Real / estimated tokens of the last run's first request (the parts
    *  are already scaled by it); null = nothing to calibrate against yet. */
   calibration: number | null;
+  /** The real size of the last run's final request (tool results and
+   *  in-run compaction included) — the estimate only sees the saved turns. */
+  lastRequest: number | null;
 }
 
 /** Model ids that draw pictures (gpt-image-1, dall-e-3, imagen-4, gemini-2.5-flash-image, flux…). */
@@ -114,7 +155,6 @@ export interface UseChatOptions {
   globalAutoRun: boolean;
   sshServers: SshServer[];
   subagents: db.Subagent[];
-  maxAgents: number;
   /** Retries of a failed model request (Settings → Agent). */
   maxRetries: number;
   /** Model picked in the prompt box (edit-and-resend before any send). */
@@ -306,6 +346,17 @@ export function useChat(options: UseChatOptions) {
     modelId: string,
     firstPrompt: string
   ) => {
+    // A subscription CLI would start a second session (and spend the plan)
+    // just to name the chat: the title comes from the prompt itself.
+    if (isCliKind(provider.kind)) {
+      const words = firstPrompt.replace(/\s+/g, " ").trim().split(" ").slice(0, 6).join(" ");
+      const clean = words.replace(/^["'«»\s]+|["'«».,!?:;\s]+$/g, "").slice(0, 60).trim();
+      if (clean.length >= 2) {
+        opts.current.onTitle(projectName, convId, clean);
+        await db.updateConversationTitle(convId, clean).catch(() => {});
+      }
+      return;
+    }
     try {
       let out = "";
       await db.streamChat(
@@ -356,7 +407,11 @@ export function useChat(options: UseChatOptions) {
     selection: ChatSelection,
     projectName: string,
     workspace: string,
-    images: db.ImageAttachment[] = []
+    images: db.ImageAttachment[] = [],
+    /** Agents this model may use (per model; CLIs always 1). */
+    agents = 1,
+    /** The conversation — a subscription CLI keeps one session per chat. */
+    chatId = "",
   ): db.AgentRequest => {
     const o = opts.current;
     const project = o.projects.find((p) => p.name === projectName);
@@ -377,7 +432,8 @@ export function useChat(options: UseChatOptions) {
       rate_limit_rpm: provider.rate_limit_rpm ?? 0,
       concurrency: provider.concurrency ?? 0,
       subagents: o.subagents.filter((s) => s.enabled && s.name.trim()),
-      max_agents: o.maxAgents,
+      max_agents: agents,
+      chat_id: chatId,
       max_retries: o.maxRetries,
       ssh_units: o.sshServers.map((s) => ({ id: s.id, name: s.name, host: s.host })),
       disabled_tools: loadDisabledTools(),
@@ -456,7 +512,10 @@ export function useChat(options: UseChatOptions) {
     const { provider, modelRow, cred } = r;
     const history = convId ? convMsgsRef.current[convId] ?? [] : [];
     const request = {
-      ...agentRequest(provider, cred, modelRow.model_id, selection, projectName, workspaceOf(projectName)),
+      ...agentRequest(
+        provider, cred, modelRow.model_id, selection, projectName, workspaceOf(projectName), [],
+        await db.loadModelAgents(modelRow.id, provider.kind, provider.id), convId ?? "",
+      ),
       image_gen: await imageGenFor(provider, cred, modelRow.model_id),
     };
     const [parts, info] = await Promise.all([
@@ -465,9 +524,11 @@ export function useChat(options: UseChatOptions) {
     ]);
     const spent = { prompt: 0, completion: 0, cached: 0, runs: 0 };
     let calibration: number | null = null;
+    let lastRequest: number | null = null;
     for (const m of history) {
       for (const seg of m.segments ?? []) {
         if (seg.kind !== "usage") continue;
+        if (seg.usage.last_input) lastRequest = seg.usage.last_input;
         spent.prompt += seg.usage.prompt_tokens;
         spent.completion += seg.usage.completion_tokens;
         spent.cached += seg.usage.cached_tokens;
@@ -476,7 +537,9 @@ export function useChat(options: UseChatOptions) {
         // ratio corrects the chars→tokens guess for this model's tokenizer
         // (and hidden overhead like tool-use framing). The latest run wins.
         const { first_input: real, first_est: est } = seg.usage;
-        if (real && est && est > 200) calibration = Math.min(3, Math.max(0.4, real / est));
+        // (Not for a CLI: its own hidden prompt is in `real`, the gauge
+        // uses the session's measured size instead.)
+        if (real && est && est > 200 && !isCliKind(provider.kind)) calibration = Math.min(3, Math.max(0.4, real / est));
       }
     }
     const scaled = calibration === null
@@ -486,7 +549,7 @@ export function useChat(options: UseChatOptions) {
           tokens: Math.round(p.tokens * calibration!),
           items: p.items.map((it) => ({ ...it, tokens: Math.round(it.tokens * calibration!) })),
         }));
-    return { parts: scaled, info, spent, calibration, modelName: modelRow.name || modelRow.model_id, providerKind: provider.kind };
+    return { parts: scaled, info, spent, calibration, lastRequest, modelName: modelRow.name || modelRow.model_id, providerKind: provider.kind };
   };
 
   /**
@@ -501,6 +564,11 @@ export function useChat(options: UseChatOptions) {
     const r = await resolveModel(selection);
     if ("error" in r) return r.error ?? "No model selected.";
     const { provider, modelRow, cred } = r;
+    // One CLI session per chat: a summary run would be a second session,
+    // and the chat's own session compacts its context by itself.
+    if (isCliKind(provider.kind)) {
+      return `${provider.name} keeps one session per chat and compacts its context on its own — /compact is not needed.`;
+    }
     const turns = modelTurns(convMsgsRef.current[convId] ?? []);
     if (turns.length === 0) return "Nothing to compact yet.";
     // One transcript in one user message: every provider accepts it, and
@@ -577,6 +645,8 @@ export function useChat(options: UseChatOptions) {
     freshTitle: boolean,
     background = false
   ) => {
+    // The chat keeps the provider + model it runs on (reopening it restores them).
+    if (!background) void db.saveConvModel(convId, selection).catch(() => {});
     const o = opts.current;
     const provider = o.providers.find((p) => p.id === selection.gatewayId);
     const modelRow = o.models.find(
@@ -649,7 +719,10 @@ export function useChat(options: UseChatOptions) {
         ? await db.runAgent(
             runId,
             {
-              ...agentRequest(provider, cred, modelRow.model_id, selection, projectName, runWorkspace, runImages),
+              ...agentRequest(
+                provider, cred, modelRow.model_id, selection, projectName, runWorkspace, runImages,
+                await db.loadModelAgents(modelRow.id, provider.kind, provider.id), convId,
+              ),
               effort: runEffort,
               max_tokens: maxTokens,
               image_gen: imageGen,
@@ -678,6 +751,7 @@ export function useChat(options: UseChatOptions) {
               provider_id: provider.id,
               rate_limit_rpm: provider.rate_limit_rpm ?? 0,
               concurrency: provider.concurrency ?? 0,
+              chat_id: convId,
               system:
                 "You are Singularity, a coding agent inside a desktop workspace. " +
                 "Answer concisely and prefer concrete, runnable steps.",
@@ -882,7 +956,7 @@ export function useChat(options: UseChatOptions) {
     if (!picked) return null;
     return {
       ...picked,
-      effort: (localStorage.getItem("effort") as Effort) || "medium",
+      effort: (localStorage.getItem("effort") as Effort) || "low",
     };
   };
 

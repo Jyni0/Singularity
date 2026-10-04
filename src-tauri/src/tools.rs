@@ -13,11 +13,17 @@ use std::time::Duration;
 
 /// Largest file we will read into the model context.
 const MAX_READ_BYTES: usize = 200_000;
-/// Largest command output returned to the model.
-const MAX_OUTPUT_BYTES: usize = 20_000;
-/// Lines read_file returns when no end_line is given — a whole 5k-line
-/// file used to land in the context (and be re-sent on every step).
+/// Most lines one read_file returns, even for an explicit range.
 const READ_DEFAULT_LINES: usize = 2_000;
+/// A file up to this size is read whole when no range is given…
+const READ_WHOLE_LINES: usize = 400;
+const READ_WHOLE_BYTES: usize = 32_000;
+/// …a bigger one gives its first lines plus an outline with line ranges
+/// (Roo Code's partial read + list_code_definition_names): every step
+/// re-sends what was read, so a 3000-line file must not land whole.
+const READ_PREVIEW_LINES: usize = 150;
+/// start_line without end_line: this many lines from there.
+const READ_ON_LINES: usize = 400;
 /// Longer lines (minified bundles, data blobs) are cut in read_file.
 const READ_MAX_LINE_CHARS: usize = 2_000;
 /// How long a single command may run.
@@ -159,38 +165,236 @@ pub fn normalize_path(path: &str) -> String {
     p
 }
 
-/// Error text for a path that does not exist, with the workspace's paths
-/// whose file name matches — the model usually guessed the folder wrong,
-/// and a list of real candidates ends the guessing loop.
+/// Error text for a path that does not exist — written so the model's
+/// NEXT call is the right one, not another round of guessing:
+///
+/// * The path is named as resolved (Roo Code's getReadablePath); the
+///   "relative paths start at" note only appears for a relative path.
+/// * A misspelled component (`src/compoents`) is corrected against the real
+///   entries of its folder, Aider-style (difflib.get_close_matches, 0.8).
+/// * Files with the same name elsewhere in the project — the workspace, or
+///   for a path outside it the project that path lies in (its git /
+///   package root).
+/// * Otherwise what the deepest existing folder on the way contains, so no
+///   extra list_dir round trip is needed.
 pub fn not_found(root: &Path, path: &str) -> String {
     let full = resolve(root, path).unwrap_or_else(|_| root.join(path));
-    let mut msg = format!("not found: {} (relative paths start at {})", full.display(), root.display());
+    let absolute = Path::new(&normalize_path(path)).is_absolute();
+    let mut msg = if absolute {
+        format!("not found: {}", full.display())
+    } else {
+        format!("not found: {} (relative paths start at {})", full.display(), root.display())
+    };
+    if let Some(fixed) = correct_path(&full, false) {
+        msg.push_str(&format!("\nDid you mean {}?", fixed.display()));
+        return msg;
+    }
+    let inside = !absolute || lexical(&full).starts_with(&lexical(root));
+    let search_root = if inside { Some(root.to_path_buf()) } else { project_root_of(&full) };
+    if let Some(base) = &search_root {
+        let hits = name_matches(base, path);
+        if !hits.is_empty() {
+            let place = if inside { "the workspace".to_string() } else { base.display().to_string() };
+            msg.push_str(&format!("\nDid you mean one of these (relative to {place})?"));
+            for h in hits {
+                msg.push_str("\n  ");
+                msg.push_str(&h);
+            }
+            return msg;
+        }
+    }
+    if let Some(parent) = deepest_existing(&full) {
+        msg.push_str(&format!("\nNothing with that name nearby. {} contains: {}", parent.display(), dir_summary(&parent)));
+    } else if inside {
+        msg.push_str("\nNothing with that name exists under the workspace. Use find_files or list_dir to look around instead of guessing.");
+    }
+    msg
+}
+
+/// Paths under `base` whose file name is the one asked for (or contains
+/// its stem), relative to `base`.
+fn name_matches(base: &Path, path: &str) -> Vec<String> {
     let name = Path::new(&normalize_path(path))
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     if name.is_empty() {
-        return msg;
+        return Vec::new();
     }
-    let files = workspace_files(root);
-    let base = |f: &String| f.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_lowercase();
-    let mut hits: Vec<&String> = files.iter().filter(|f| base(f) == name).take(8).collect();
+    let files = workspace_files(base);
+    let file_name = |f: &String| f.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_lowercase();
+    let mut hits: Vec<String> = files.iter().filter(|f| file_name(f) == name).take(8).cloned().collect();
     if hits.is_empty() {
         let stem = name.split('.').next().unwrap_or(&name).to_string();
         if stem.len() >= 3 {
-            hits = files.iter().filter(|f| base(f).contains(&stem)).take(8).collect();
+            hits = files.iter().filter(|f| file_name(f).contains(&stem)).take(8).cloned().collect();
         }
     }
-    if hits.is_empty() {
-        msg.push_str("\nNothing with that name exists under the workspace. Use find_files or list_dir to look around instead of guessing.");
-    } else {
-        msg.push_str("\nDid you mean one of these (relative to the workspace)?");
-        for h in hits {
-            msg.push_str("\n  ");
-            msg.push_str(h);
+    hits
+}
+
+/// The project a path lies in: the nearest existing ancestor with a git /
+/// package marker — never a home folder or a drive root.
+fn project_root_of(p: &Path) -> Option<PathBuf> {
+    const MARKERS: &[&str] = &[".git", "package.json", "Cargo.toml", "pyproject.toml", "go.mod", "pom.xml", "composer.json"];
+    let home = home_dir();
+    p.ancestors()
+        .skip(1)
+        .filter(|a| a.is_dir())
+        .take_while(|a| a.parent().is_some() && home.as_deref() != Some(*a))
+        .find(|a| MARKERS.iter().any(|m| a.join(m).exists()))
+        .map(Path::to_path_buf)
+}
+
+/// Entries of a folder on one line (folders marked with /), at most 40.
+fn dir_summary(dir: &Path) -> String {
+    let Ok(rd) = std::fs::read_dir(dir) else { return "(unreadable)".into() };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) { format!("{n}/") } else { n }
+        })
+        .filter(|n| !INDEX_SKIP.contains(&n.trim_end_matches('/')))
+        .collect();
+    names.sort();
+    let total = names.len();
+    if total == 0 {
+        return "(empty)".into();
+    }
+    let mut out = names.into_iter().take(40).collect::<Vec<_>>().join(", ");
+    if total > 40 {
+        out.push_str(&format!(", … ({} more)", total - 40));
+    }
+    out
+}
+
+/// Read-only tools follow an obvious misspelling instead of failing: a
+/// folder name off by a typo or case, or a file name off by case only
+/// (two files `test1.ts` / `test2.ts` are too close to guess between).
+/// Returns the corrected path and the note shown with the result.
+fn autocorrect(root: &Path, path: &str, tool: &str) -> Option<(String, String)> {
+    let file = tool == "read_file";
+    if path.trim().is_empty() {
+        return None;
+    }
+    let full = resolve(root, path).ok()?;
+    if full.exists() {
+        return None;
+    }
+    // `src/styles` when only `src/styles.css` is there: the extension was
+    // left off. read_file reads that file; list_dir lists its folder.
+    if let Some(sibling) = only_extension_missing(&full) {
+        let (target, what) = match tool {
+            "read_file" => (sibling.clone(), format!("showing the file {}", sibling.display())),
+            "list_dir" => (sibling.parent()?.to_path_buf(), format!("{} is a file — listing its folder", sibling.display())),
+            _ => (sibling.clone(), format!("using the file {}", sibling.display())),
+        };
+        let note = format!("[{} does not exist — {what}]\n", full.display());
+        return Some((target.to_string_lossy().into_owned(), note));
+    }
+    let fixed = correct_path(&full, true)?;
+    if file {
+        let (a, b) = (full.file_name()?.to_string_lossy(), fixed.file_name()?.to_string_lossy());
+        if !a.eq_ignore_ascii_case(&b) {
+            return None;
         }
     }
-    msg
+    let note = format!("[{} does not exist — showing {} instead]\n", full.display(), fixed.display());
+    Some((fixed.to_string_lossy().into_owned(), note))
+}
+
+/// The ONE file next to `p` named `p` + an extension (`styles` →
+/// `styles.css`), when its folder exists.
+fn only_extension_missing(p: &Path) -> Option<PathBuf> {
+    let name = p.file_name()?.to_string_lossy().to_lowercase();
+    let mut hits = std::fs::read_dir(p.parent()?).ok()?.flatten().filter(|e| {
+        let n = e.file_name().to_string_lossy().to_lowercase();
+        e.file_type().is_ok_and(|t| t.is_file())
+            && n.strip_prefix(&name).is_some_and(|rest| rest.starts_with('.') && !rest[1..].contains('.'))
+    });
+    let first = hits.next()?;
+    hits.next().is_none().then(|| first.path())
+}
+
+/// Lower-cased (on Windows), `/`-separated, `.`/`..`-folded form of a path,
+/// for comparing paths that may not exist.
+fn lexical(p: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            other => parts.push(other.as_os_str().to_string_lossy().trim_end_matches(['/', '\\']).to_string()),
+        }
+    }
+    let s = parts.join("/");
+    if cfg!(windows) { s.to_lowercase() } else { s }
+}
+
+/// The deepest ancestor of `p` that exists.
+fn deepest_existing(p: &Path) -> Option<PathBuf> {
+    p.ancestors().skip(1).find(|a| !a.as_os_str().is_empty() && a.is_dir()).map(Path::to_path_buf)
+}
+
+/// difflib's SequenceMatcher.ratio, approximated by the longest common
+/// subsequence: 2·LCS / (len a + len b), case-insensitive.
+fn name_similarity(a: &str, b: &str) -> f64 {
+    let a: Vec<char> = a.to_lowercase().chars().collect();
+    let b: Vec<char> = b.to_lowercase().chars().collect();
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let mut prev = vec![0usize; b.len() + 1];
+    for ca in &a {
+        let mut cur = vec![0usize; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur[j + 1] = if ca == cb { prev[j] + 1 } else { prev[j + 1].max(cur[j]) };
+        }
+        prev = cur;
+    }
+    2.0 * prev[b.len()] as f64 / (a.len() + b.len()) as f64
+}
+
+/// Same cutoff as Aider's get_close_matches.
+const CLOSE_MATCH: f64 = 0.8;
+
+/// `p` with each missing component replaced by the closest real entry of
+/// its folder (case or a typo), when every component can be fixed and the
+/// result exists. None when nothing close enough exists — or, with
+/// `unique`, when two entries are equally close.
+fn correct_path(p: &Path, unique: bool) -> Option<PathBuf> {
+    let mut cur = PathBuf::new();
+    let mut changed = false;
+    for c in p.components() {
+        let next = cur.join(c.as_os_str());
+        let std::path::Component::Normal(name) = c else {
+            cur = next;
+            continue;
+        };
+        if next.exists() {
+            cur = next;
+            continue;
+        }
+        let name = name.to_string_lossy();
+        let mut close: Vec<(f64, String)> = std::fs::read_dir(&cur)
+            .ok()?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .map(|n| (name_similarity(&name, &n), n))
+            .filter(|(score, _)| *score >= CLOSE_MATCH)
+            .collect();
+        close.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let best = close.first()?.clone();
+        if unique && close.get(1).is_some_and(|second| second.0 >= best.0) {
+            return None;
+        }
+        cur = cur.join(best.1);
+        changed = true;
+    }
+    (changed && cur.exists()).then_some(cur)
 }
 
 fn is_missing(e: &std::io::Error) -> bool {
@@ -318,10 +522,7 @@ pub fn read_file(root: &Path, path: &str, start_line: Option<usize>, end_line: O
     };
 
     let lines: Vec<&str> = text.lines().collect();
-    let from = start_line.unwrap_or(1).max(1);
-    let to = end_line
-        .unwrap_or_else(|| from.saturating_add(READ_DEFAULT_LINES - 1))
-        .min(lines.len());
+    let (from, to, preview) = read_window(lines.len(), text.len(), start_line, end_line);
 
     if from > lines.len() {
         return ToolResult::err(format!(
@@ -342,7 +543,17 @@ pub fn read_file(root: &Path, path: &str, start_line: Option<usize>, end_line: O
             None => out.push_str(&format!("{:>5}  {}\n", from + i, line)),
         }
     }
-    if end_line.is_none() && to < lines.len() {
+    if preview {
+        let outline = crate::syntax::outline(&full, &text);
+        out.push_str(&format!("\n[Large file: only lines {from}-{to} of {} are shown. ", lines.len()));
+        if outline.is_empty() {
+            out.push_str("grep for what you need, then read just that range with start_line/end_line.]\n");
+        } else {
+            out.push_str("Its outline (line ranges) — read just the part you need with start_line/end_line, or grep:\n");
+            out.push_str(&outline.join("\n"));
+            out.push_str("]\n");
+        }
+    } else if end_line.is_none() && to < lines.len() {
         out.push_str(&format!(
             "… {} more lines. Read on with start_line={} (or grep for what you need).\n",
             lines.len() - to,
@@ -350,6 +561,19 @@ pub fn read_file(root: &Path, path: &str, start_line: Option<usize>, end_line: O
         ));
     }
     ToolResult::ok(out)
+}
+
+/// The lines a read_file call returns: (from, to, preview). `preview` = a
+/// big file read without a range (first lines + outline). The agent loop
+/// uses the same window to spot a re-read of lines it already has.
+pub fn read_window(lines: usize, bytes: usize, start_line: Option<usize>, end_line: Option<usize>) -> (usize, usize, bool) {
+    let from = start_line.unwrap_or(1).max(1);
+    match (start_line, end_line) {
+        (_, Some(end)) => (from, end.min(lines).min(from.saturating_add(READ_DEFAULT_LINES - 1)), false),
+        (Some(_), None) => (from, from.saturating_add(READ_ON_LINES - 1).min(lines), false),
+        (None, None) if lines <= READ_WHOLE_LINES && bytes <= READ_WHOLE_BYTES => (1, lines, false),
+        (None, None) => (1, READ_PREVIEW_LINES.min(lines), true),
+    }
 }
 
 /// Writes (or creates) a file, making parent directories as needed.
@@ -496,6 +720,12 @@ pub fn workspace_files(root: &Path) -> Vec<String> {
 }
 
 /// Recursive text search across the workspace.
+/// grep output limits: whole lines of 200 files used to come back with
+/// absolute paths — thousands of tokens re-sent on every later step.
+const GREP_MAX_MATCHES: usize = 100;
+const GREP_PER_FILE: usize = 12;
+const GREP_LINE_CHARS: usize = 200;
+
 pub fn grep(root: &Path, pattern: &str, subdir: Option<&str>) -> ToolResult {
     let base = match subdir {
         Some(s) if !s.is_empty() => match resolve(root, s) {
@@ -504,55 +734,95 @@ pub fn grep(root: &Path, pattern: &str, subdir: Option<&str>) -> ToolResult {
         },
         _ => root.to_path_buf(),
     };
+    if !base.exists() {
+        return ToolResult::err(not_found(root, subdir.unwrap_or("")));
+    }
 
     // A literal substring search keeps this dependency-free and predictable.
-    let needle = pattern.to_string();
-    let mut hits: Vec<String> = Vec::new();
-    let mut scanned = 0usize;
-
-    fn walk(dir: &Path, needle: &str, hits: &mut Vec<String>, scanned: &mut usize) {
-        if hits.len() >= 200 || *scanned > 5000 {
+    struct Hits {
+        files: Vec<(PathBuf, Vec<(usize, String)>, usize)>,
+        total: usize,
+        scanned: usize,
+    }
+    fn search_file(path: &Path, needle: &str, hits: &mut Hits) {
+        let Ok(meta) = std::fs::metadata(path) else { return };
+        if meta.len() > 400_000 {
             return;
         }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".git" || name == "node_modules" || name == "target" || name == "dist" {
-                continue;
-            }
-            if path.is_dir() {
-                walk(&path, needle, hits, scanned);
-                continue;
-            }
-            // Only look at text-ish files, and skip anything large.
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.len() > 400_000 {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            *scanned += 1;
-            for (i, line) in text.lines().enumerate() {
-                if line.contains(needle) {
-                    hits.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
-                    if hits.len() >= 200 {
-                        return;
-                    }
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        hits.scanned += 1;
+        let mut lines = Vec::new();
+        let mut count = 0usize;
+        for (i, line) in text.lines().enumerate() {
+            if line.contains(needle) {
+                count += 1;
+                if lines.len() < GREP_PER_FILE {
+                    let t = line.trim();
+                    let t = match t.char_indices().nth(GREP_LINE_CHARS) {
+                        Some((cut, _)) => format!("{}…", &t[..cut]),
+                        None => t.to_string(),
+                    };
+                    lines.push((i + 1, t));
                 }
             }
         }
+        if count > 0 {
+            hits.total += count;
+            hits.files.push((path.to_path_buf(), lines, count));
+        }
+    }
+    fn walk(dir: &Path, needle: &str, hits: &mut Hits) {
+        if hits.scanned > 5000 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if INDEX_SKIP.contains(&name.as_str()) || name == "dist" {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, needle, hits);
+            } else {
+                search_file(&path, needle, hits);
+            }
+        }
     }
 
-    walk(&base, &needle, &mut hits, &mut scanned);
-
-    if hits.is_empty() {
+    let mut hits = Hits { files: Vec::new(), total: 0, scanned: 0 };
+    if base.is_file() {
+        search_file(&base, pattern, &mut hits);
+    } else {
+        walk(&base, pattern, &mut hits);
+    }
+    if hits.files.is_empty() {
         return ToolResult::ok(format!("no matches for {pattern:?}"));
     }
-    ToolResult::ok(hits.join("\n"))
+    let rel = |p: &Path| p.strip_prefix(root).map(|r| r.display().to_string().replace('\\', "/")).unwrap_or_else(|_| p.display().to_string());
+    let mut out = format!("{} matches in {} files", hits.total, hits.files.len());
+    let mut shown = 0usize;
+    let mut skipped_files = 0usize;
+    for (path, lines, count) in &hits.files {
+        if shown >= GREP_MAX_MATCHES {
+            skipped_files += 1;
+            continue;
+        }
+        out.push_str(&format!("\n{}:", rel(path)));
+        for (n, l) in lines {
+            out.push_str(&format!("\n{n:>6}: {l}"));
+            shown += 1;
+        }
+        if *count > lines.len() {
+            out.push_str(&format!("\n        … {} more in this file", count - lines.len()));
+        }
+    }
+    if skipped_files > 0 {
+        out.push_str(&format!("\n… {skipped_files} more files with matches — narrow the pattern or the path."));
+    }
+    ToolResult::ok(out)
 }
 
 /* ---------- Patch application (diff-only edits) ---------- */
@@ -822,7 +1092,7 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
         if !create || !create_only {
             return ToolResult::err(format!(
                 "{}\nThis file does not exist, so there is nothing to edit — find the real path first. \
-                 Only if you really mean to create a NEW file: set create:true and send ONE hunk with an empty SEARCH side.",
+                 Only if you really mean to create a NEW file: write it whole with write_file.",
                 not_found(root, path)
             ));
         }
@@ -865,12 +1135,19 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
     let mut applied = 0usize;
     let mut errors: Vec<String> = Vec::new();
     let mut fuzzy: Vec<String> = Vec::new();
+    let mut already = 0usize;
     for (i, (search, replace)) in hunks.iter().enumerate() {
         let (needle, replace) = (match_endings(&current, search), match_endings(&current, replace));
         match locate(&current, &needle, &replace) {
             Ok((start, end, replace)) => {
                 current = format!("{}{}{}", &current[..start], replace, &current[end..]);
                 applied += 1;
+            }
+            // SEARCH is gone but REPLACE is there: this change was already
+            // made (an earlier call, a resent diff) — Aider's check.
+            // (A one-liner like "}" is everywhere — that proves nothing.)
+            Err(0) if replace.trim().len() >= 30 && !matches!(locate(&current, &replace, &replace), Err(0)) => {
+                already += 1;
             }
             Err(0) => match closest_region(&current, &needle) {
                 // Nearly identical and clearly the only candidate: the model
@@ -894,11 +1171,17 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
                 }
                 Some((at, len, score, _)) if score >= 0.5 => {
                     let lines: Vec<&str> = current.lines().collect();
-                    let from = at.saturating_sub(2);
-                    let to = (at + len + 2).min(lines.len());
+                    // A small file is shown whole: SEARCH this far off usually
+                    // came from an outdated or misremembered version of it.
+                    let (from, to) = if lines.len() <= 150 {
+                        (0, lines.len())
+                    } else {
+                        (at.saturating_sub(5), (at + len + 5).min(lines.len()))
+                    };
                     let snippet: String = (from..to).map(|n| format!("{:>5}  {}\n", n + 1, lines[n])).collect();
+                    let shown = if from == 0 && to == lines.len() { "The whole file as it is NOW" } else { "Around them" };
                     errors.push(format!(
-                        "hunk {i}: SEARCH text not found in {path}. The closest part of the file ({:.0}% similar) is lines {}-{} — copy SEARCH from it EXACTLY (without the line numbers):\n{snippet}",
+                        "hunk {i}: SEARCH text not found in {path}. The closest part of the file ({:.0}% similar) is lines {}-{} — your SEARCH does not match what is there; copy SEARCH EXACTLY from the current text (without the line numbers). {shown}:\n{snippet}",
                         score * 100.0,
                         at + 1,
                         at + len
@@ -936,6 +1219,11 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
             crate::syntax::report(path, &current, &broken)
         ));
     }
+    if applied == 0 && errors.is_empty() {
+        return ToolResult::ok(format!(
+            "{path} already contains these changes (the REPLACE text is there, SEARCH is gone) — nothing to do. Do not send this diff again."
+        ));
+    }
     if applied == 0 {
         return ToolResult::err(format!(
             "{}\nNothing was changed. Do not resend the same diff: fix SEARCH from the lines above, \
@@ -946,6 +1234,9 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
     match std::fs::write(&full, &current) {
         Ok(()) => {
             let mut out = format!("patched {path}: {applied}/{} hunks applied", hunks.len());
+            if already > 0 {
+                out.push_str(&format!(", {already} already in the file"));
+            }
             if !fuzzy.is_empty() {
                 out.push('\n');
                 out.push_str(&fuzzy.join("\n"));
@@ -1310,6 +1601,123 @@ fn failure_hint(shell: Shell, command: &str, code: i32, text: &str) -> Option<St
 
 /// Truncates from the middle so both the start and the end stay visible.
 /// Slices on CHAR boundaries — byte slicing panicked on Cyrillic output.
+/// Command output the model gets in full, lines / characters.
+const OUT_HEAD_LINES: usize = 60;
+const OUT_TAIL_LINES: usize = 100;
+const OUT_MAX_CHARS: usize = 10_000;
+
+/// Compiler / linter diagnostic: `src/a.ts(12,5): error TS2322: …`,
+/// `src/a.rs:12:5: warning: …`, `error[E0308]: … --> src/a.rs:12:5`.
+static DIAGNOSTIC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|-->\s*)([\w./\\@~-]+\.[a-z]{1,6})[(:](\d+)[,:]?(?:\d+)?\)?:?.*?\b(error|warning)\b(?:\s+(\w*\d+))?").unwrap()
+});
+
+/// Command output made cheap to read, the way Roo Code / Goose / Claude
+/// Code keep a 2000-line `tsc` from flooding the context: progress-bar
+/// redraws dropped, repeated lines folded, and a long output cut to its head
+/// and tail with a diagnostics summary on top. The full output goes to a log
+/// file the model can grep / read_file when it really needs the middle.
+fn condense_output(raw: String) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut repeats = 0usize;
+    for line in raw.lines() {
+        // A progress bar redraws itself with \r: the terminal shows the last.
+        let line = line.rsplit('\r').next().unwrap_or(line).trim_end();
+        if lines.last().is_some_and(|l| l == line) {
+            repeats += 1;
+            continue;
+        }
+        if repeats > 0 {
+            if let Some(last) = lines.last_mut() {
+                last.push_str(&format!("  (×{})", repeats + 1));
+            }
+            repeats = 0;
+        }
+        lines.push(line.to_string());
+    }
+    if repeats > 0 {
+        if let Some(last) = lines.last_mut() {
+            last.push_str(&format!("  (×{})", repeats + 1));
+        }
+    }
+    let total_chars: usize = lines.iter().map(|l| l.len() + 1).sum();
+    if lines.len() <= OUT_HEAD_LINES + OUT_TAIL_LINES && total_chars <= OUT_MAX_CHARS {
+        return lines.join("\n");
+    }
+
+    let log = save_full_output(&raw);
+    let mut out = String::new();
+    if let Some(summary) = diagnostics_summary(&lines) {
+        out.push_str(&summary);
+        out.push_str("\n\n");
+    }
+    let head = OUT_HEAD_LINES.min(lines.len());
+    let tail_from = lines.len().saturating_sub(OUT_TAIL_LINES).max(head);
+    out.push_str(&lines[..head].join("\n"));
+    if tail_from > head {
+        out.push_str(&format!("\n\n… {} lines omitted", tail_from - head));
+        match &log {
+            Some(p) => out.push_str(&format!(" — the full output is in {} (grep it / read_file a range; do not re-run the command just to see it)", p.display())),
+            None => out.push_str(" — narrow the command (grep, head, a single file) to see them"),
+        }
+        out.push_str(" …\n\n");
+        out.push_str(&lines[tail_from..].join("\n"));
+    }
+    clip_middle(out, OUT_MAX_CHARS)
+}
+
+/// "214 errors, 3 warnings in 23 files: src/a.ts (40), … · most common: TS2322 (80), …"
+fn diagnostics_summary(lines: &[String]) -> Option<String> {
+    let (mut errors, mut warnings) = (0usize, 0usize);
+    let mut files: Vec<(String, usize)> = Vec::new();
+    let mut codes: Vec<(String, usize)> = Vec::new();
+    let bump = |v: &mut Vec<(String, usize)>, k: &str| match v.iter_mut().find(|(n, _)| n == k) {
+        Some(e) => e.1 += 1,
+        None => v.push((k.to_string(), 1)),
+    };
+    for l in lines {
+        let Some(c) = DIAGNOSTIC.captures(l) else { continue };
+        if c[3].eq_ignore_ascii_case("error") {
+            errors += 1;
+        } else {
+            warnings += 1;
+        }
+        bump(&mut files, &c[1].replace('\\', "/"));
+        if let Some(code) = c.get(4).map(|m| m.as_str()).filter(|s| !s.is_empty()) {
+            bump(&mut codes, code);
+        }
+    }
+    if errors + warnings < 5 {
+        return None;
+    }
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    codes.sort_by(|a, b| b.1.cmp(&a.1));
+    let list = |v: &[(String, usize)], n: usize| {
+        let mut s = v.iter().take(n).map(|(k, c)| format!("{k} ({c})")).collect::<Vec<_>>().join(", ");
+        if v.len() > n {
+            s.push_str(&format!(", +{} more", v.len() - n));
+        }
+        s
+    };
+    let mut out = format!("Diagnostics: {errors} errors, {warnings} warnings in {} files: {}", files.len(), list(&files, 12));
+    if !codes.is_empty() {
+        out.push_str(&format!("\nMost common: {}", list(&codes, 8)));
+    }
+    out.push_str("\nFix them file by file; re-run the check for ONE file or grep the log instead of dumping everything again.");
+    Some(out)
+}
+
+/// The whole output of a long command, for the model to grep later.
+fn save_full_output(raw: &str) -> Option<PathBuf> {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join("singularity-output");
+    std::fs::create_dir_all(&dir).ok()?;
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("out-{}-{n}.log", std::process::id()));
+    std::fs::write(&path, raw).ok()?;
+    Some(path)
+}
+
 fn clip_middle(text: String, max: usize) -> String {
     if text.len() <= max {
         return text;
@@ -1662,7 +2070,7 @@ pub fn run_command(
         text.push_str("stderr:\n");
         text.push_str(&stderr);
     }
-    let mut text = clip_middle(text, MAX_OUTPUT_BYTES);
+    let mut text = condense_output(text);
     if text.trim().is_empty() {
         text = "(no output)".into();
     }
@@ -1860,12 +2268,12 @@ pub fn find_files(root: &Path, pattern: &str, path: Option<&str>) -> ToolResult 
     let hits: Vec<String> = workspace_files(&base)
         .into_iter()
         .filter(|f| re.is_match(f.trim_end_matches('/')))
-        .take(300)
+        .take(100)
         .collect();
     if hits.is_empty() {
         return ToolResult::ok(format!("no files match {pattern:?} under {}", base.display()));
     }
-    let more = if hits.len() == 300 { "\n… (first 300 shown — narrow the pattern)" } else { "" };
+    let more = if hits.len() == 100 { "\n… (first 100 shown — narrow the pattern)" } else { "" };
     ToolResult::ok(format!("{} (paths relative to it):\n{}{more}", base.display(), hits.join("\n")))
 }
 
@@ -1881,6 +2289,32 @@ fn copy_recursive(from: &Path, to: &Path) -> std::io::Result<u64> {
     } else {
         if let Some(parent) = to.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(from, to).map(|_| 1)
+    }
+}
+
+/// `cp -r`: copies `from` to `to`, merging into existing folders and
+/// overwriting existing files (collected in `overwritten`). Returns the
+/// number of files copied.
+fn copy_merge(from: &Path, to: &Path, overwritten: &mut Vec<PathBuf>) -> std::io::Result<u64> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        let mut n = 0;
+        for e in std::fs::read_dir(from)? {
+            let e = e?;
+            n += copy_merge(&e.path(), &to.join(e.file_name()), overwritten)?;
+        }
+        Ok(n)
+    } else {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if to.is_dir() {
+            return Err(std::io::Error::other(format!("{} is a folder, cannot overwrite it with a file", to.display())));
+        }
+        if to.exists() {
+            overwritten.push(to.to_path_buf());
         }
         std::fs::copy(from, to).map(|_| 1)
     }
@@ -1924,15 +2358,55 @@ pub fn file_op(root: &Path, op: &str, path: &str, to: &str) -> ToolResult {
                     target = target.join(name);
                 }
             }
+            let (from, into) = (lexical(&src), lexical(&target));
+            if from == into {
+                return ToolResult::err(format!("{op}: source and destination are the same ({shown})"));
+            }
+            if src.is_dir() && into.starts_with(&format!("{from}/")) {
+                return ToolResult::err(format!("cannot {op} {shown} into itself ({})", target.display()));
+            }
+            if op == "copy" {
+                // `cp -r` semantics (what Goose / Roo Code agents get from
+                // the shell): copying onto an existing folder merges into it
+                // and same-named files are overwritten; the result names them.
+                if src.is_dir() && target.is_file() {
+                    return ToolResult::err(format!("cannot copy folder {shown} onto file {}", target.display()));
+                }
+                let merged = target.is_dir();
+                let mut overwritten = Vec::new();
+                return match copy_merge(&src, &target, &mut overwritten) {
+                    Ok(n) => {
+                        let mut msg = format!("copied {shown} → {} ({n} files", target.display());
+                        if merged {
+                            msg.push_str(", merged into the existing folder");
+                        }
+                        if overwritten.is_empty() {
+                            msg.push(')');
+                        } else {
+                            msg.push_str(&format!(", {} overwritten):", overwritten.len()));
+                            for p in overwritten.iter().take(20) {
+                                msg.push_str(&format!("\n  {}", p.display()));
+                            }
+                            if overwritten.len() > 20 {
+                                msg.push_str(&format!("\n  … and {} more", overwritten.len() - 20));
+                            }
+                        }
+                        ToolResult::ok(msg)
+                    }
+                    Err(e) => ToolResult::err(format!("copy failed: {e}")),
+                };
+            }
             if target.exists() {
-                return ToolResult::err(format!("{} already exists — delete it first or pick another name", target.display()));
+                // Like `mv` onto a non-empty folder: never merge on a move.
+                return ToolResult::err(format!(
+                    "{} already exists — move does not overwrite; delete it first, pick another name, or copy instead (copy merges)",
+                    target.display()
+                ));
             }
             if let Some(parent) = target.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let res = if op == "copy" {
-                copy_recursive(&src, &target).map(|n| format!("copied {shown} → {} ({n} files)", target.display()))
-            } else {
+            let res = {
                 std::fs::rename(&src, &target)
                     .or_else(|_| copy_recursive(&src, &target).and_then(|_| remove_any(&src)))
                     .map(|_| format!("moved {shown} → {}", target.display()))
@@ -1972,6 +2446,9 @@ pub fn git(root: &Path, subcommand: &str, args: &[String], cwd: Option<&str>) ->
     if sub.is_empty() || sub.contains(char::is_whitespace) {
         return ToolResult::err("`subcommand` is ONE git subcommand (status, diff, commit…); put the rest in `args`");
     }
+    // Models often repeat the subcommand (or "git") at the head of `args`.
+    let skip = args.iter().take(2).take_while(|a| a.as_str() == "git" || a.as_str() == sub).count();
+    let args = &args[skip..];
     let workdir = match cwd.map(str::trim) {
         Some(c) if !c.is_empty() => match resolve(root, c) {
             Ok(p) => p,
@@ -2004,7 +2481,7 @@ pub fn git(root: &Path, subcommand: &str, args: &[String], cwd: Option<&str>) ->
         }
         text.push_str(&err);
     }
-    let text = clip_middle(text, MAX_OUTPUT_BYTES);
+    let text = condense_output(text);
     let body = format!(
         "git {sub} {} [in {}] → exit {}\n{}",
         args.join(" "),
@@ -2053,6 +2530,16 @@ pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult
     let _write = matches!(name, "write_file" | "edit_file" | "apply_patch" | "file_op")
         .then(|| WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
 
+    if matches!(name, "read_file" | "list_dir" | "grep" | "find_files") {
+        if let Some((fixed, note)) = autocorrect(root, s("path"), name) {
+            let mut args = args.clone();
+            args["path"] = serde_json::Value::String(fixed);
+            let mut res = dispatch(root, name, &args);
+            res.output = format!("{note}{}", res.output);
+            return res;
+        }
+    }
+
     match name {
         "read_file" => read_file(
             root,
@@ -2060,14 +2547,25 @@ pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult
             args.get("start_line").and_then(|v| v.as_u64()).map(|v| v as usize),
             args.get("end_line").and_then(|v| v.as_u64()).map(|v| v as usize),
         ),
-        // The model rewrites EXISTING files only; new files go through
-        // apply_patch create:true with its wrong-path guard.
+        // Writes or creates a file (like Claude Code's Write / Goose's
+        // text_editor write). The one refusal: a new file in a folder that
+        // does not exist while a same-named file is elsewhere — that is a
+        // wrong guess at an existing file's path, not a new file.
         "write_file" => match resolve(root, s("path")) {
-            Ok(full) if full.is_file() => write_file(root, s("path"), s("content")),
-            Ok(_) => ToolResult::err(format!(
-                "{}\nwrite_file only rewrites an existing file. For a NEW file use apply_patch with create:true.",
-                not_found(root, s("path"))
-            )),
+            Ok(full) if full.is_dir() => ToolResult::err(format!("{} is a directory", s("path"))),
+            Ok(full) if !full.exists() && full.parent().is_some_and(|p| !p.exists()) => {
+                let hint = not_found(root, s("path"));
+                if hint.contains("Did you mean") {
+                    ToolResult::err(format!(
+                        "refusing to create {}: its folder does not exist and a file with the same name is already in the workspace.\n{hint}\n\
+                         Write to the existing file instead, or create the folder first with file_op mkdir if a new file is really intended.",
+                        s("path")
+                    ))
+                } else {
+                    write_file(root, s("path"), s("content"))
+                }
+            }
+            Ok(_) => write_file(root, s("path"), s("content")),
             Err(e) => ToolResult::err(e),
         },
         "background" => crate::bg::tool(args),
@@ -2108,6 +2606,131 @@ pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh temp folder, removed on drop.
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("sing-tools-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Tmp(p)
+        }
+        fn write(&self, rel: &str, text: &str) {
+            let f = self.0.join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, text).unwrap();
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn name_similarity_matches_difflib_cutoff() {
+        assert!(name_similarity("compoents", "components") >= CLOSE_MATCH);
+        assert!(name_similarity("Components", "components") == 1.0);
+        assert!(name_similarity("src", "components") < CLOSE_MATCH);
+    }
+
+    #[test]
+    fn misspelled_absolute_path_is_corrected_not_blamed_on_the_workspace() {
+        let other = Tmp::new("nf-other");
+        other.write("src/components/ui/button.tsx", "x");
+        let ws = Tmp::new("nf-ws");
+        let typo = other.0.join("src").join("compoents");
+        let msg = not_found(&ws.0, &typo.to_string_lossy());
+        assert!(!msg.contains("relative paths start at"), "{msg}");
+        assert!(msg.contains("Did you mean") && msg.contains("components"), "{msg}");
+        // Several wrong components down the path are fixed too (case, typo).
+        let deep = other.0.join("SRC").join("componets").join("ui");
+        assert!(not_found(&ws.0, &deep.to_string_lossy()).contains("Did you mean"));
+        // Nothing close: shows what the folder holds instead of the workspace list.
+        let far = other.0.join("src").join("zzzzzz");
+        let msg = not_found(&ws.0, &far.to_string_lossy());
+        assert!(!msg.contains("Did you mean") && msg.contains("contains: components/"), "{msg}");
+    }
+
+    #[test]
+    fn missing_file_outside_the_workspace_is_searched_in_its_project() {
+        let other = Tmp::new("nf-proj");
+        other.write("package.json", "{}");
+        other.write("src/styles.css", "body{}");
+        other.write("src/theme/global.css", "x");
+        let ws = Tmp::new("nf-proj-ws");
+        let guess = other.0.join("src").join("styles").join("global.css");
+        let msg = not_found(&ws.0, &guess.to_string_lossy());
+        assert!(msg.contains("src/theme/global.css"), "{msg}");
+    }
+
+    #[test]
+    fn read_only_tools_follow_an_obvious_typo() {
+        let ws = Tmp::new("auto");
+        ws.write("src/components/Button.tsx", "export const Button = 1;");
+        let typo = ws.0.join("src").join("compoents");
+        let res = dispatch(&ws.0, "list_dir", &serde_json::json!({ "path": typo.to_string_lossy() }));
+        assert!(res.ok && res.output.contains("showing") && res.output.contains("Button.tsx"), "{}", res.output);
+        let res = dispatch(&ws.0, "read_file", &serde_json::json!({ "path": "src/compoents/button.tsx" }));
+        assert!(res.ok && res.output.contains("export const Button"), "{}", res.output);
+        // A different file name is never guessed for a read.
+        let res = dispatch(&ws.0, "read_file", &serde_json::json!({ "path": "src/components/Buton.tsx" }));
+        assert!(!res.ok && res.output.contains("Did you mean"), "{}", res.output);
+    }
+
+    #[test]
+    fn ambiguous_typos_are_not_followed() {
+        let ws = Tmp::new("auto-amb");
+        ws.write("test1/a.txt", "1");
+        ws.write("test2/a.txt", "2");
+        let res = dispatch(&ws.0, "list_dir", &serde_json::json!({ "path": "test3" }));
+        assert!(!res.ok, "{}", res.output);
+    }
+
+    #[test]
+    fn git_drops_a_repeated_subcommand() {
+        let ws = Tmp::new("git-dup");
+        let res = git(&ws.0, "status", &["status".into()], None);
+        assert!(res.output.starts_with("git status  [in"), "{}", res.output);
+    }
+
+    #[test]
+    fn relative_path_keeps_the_workspace_hint() {
+        let ws = Tmp::new("nf-rel");
+        ws.write("src/components/a.ts", "x");
+        let msg = not_found(&ws.0, "src/compnents/a.ts");
+        assert!(msg.contains("relative paths start at") && msg.contains("Did you mean"), "{msg}");
+    }
+
+    #[test]
+    fn copy_into_existing_folder_merges_like_cp_r() {
+        let src = Tmp::new("cp-src");
+        src.write("ui/button.tsx", "new button");
+        src.write("ui/input.tsx", "input");
+        let ws = Tmp::new("cp-ws");
+        ws.write("src/components/ui/button.tsx", "old button");
+        ws.write("src/components/ui/keep.tsx", "keep");
+        let res = file_op(&ws.0, "copy", &src.0.join("ui").to_string_lossy(), "src/components");
+        assert!(res.ok, "{}", res.output);
+        assert!(res.output.contains("merged") && res.output.contains("1 overwritten"), "{}", res.output);
+        let ui = ws.0.join("src/components/ui");
+        assert_eq!(std::fs::read_to_string(ui.join("button.tsx")).unwrap(), "new button");
+        assert_eq!(std::fs::read_to_string(ui.join("input.tsx")).unwrap(), "input");
+        assert_eq!(std::fs::read_to_string(ui.join("keep.tsx")).unwrap(), "keep");
+    }
+
+    #[test]
+    fn copy_and_move_refuse_nonsense() {
+        let ws = Tmp::new("cp-guard");
+        ws.write("a/f.txt", "x");
+        ws.write("b/a/f.txt", "y");
+        assert!(!file_op(&ws.0, "copy", "a", "a/sub").ok, "into itself");
+        assert!(!file_op(&ws.0, "copy", "a/f.txt", "a/f.txt").ok, "onto itself");
+        let mv = file_op(&ws.0, "move", "a", "b");
+        assert!(!mv.ok && mv.output.contains("move does not overwrite"), "{}", mv.output);
+        assert_eq!(std::fs::read_to_string(ws.0.join("b/a/f.txt")).unwrap(), "y");
+    }
 
     #[test]
     fn parses_single_hunk() {
@@ -2307,6 +2930,10 @@ tail".to_string())]);
         let now = std::fs::read_to_string(dir.join("Hero.tsx")).unwrap();
         assert!(now.contains("\"Hi\"") && now.starts_with("export function Hero()") && now.ends_with("}
 "), "{now}");
+        // The same diff again: REPLACE is already there — done, not an error.
+        let res = apply_patch(&dir, "Hero.tsx", near, false);
+        assert!(res.ok && res.output.contains("already contains"), "{}", res.output);
+        assert_eq!(std::fs::read_to_string(dir.join("Hero.tsx")).unwrap(), now);
         // Too different to apply: the error quotes the real lines.
         let far = "<<<<<<< SEARCH
 export function Hero(props) {
@@ -2316,6 +2943,77 @@ x
 >>>>>>> REPLACE";
         let res = apply_patch(&dir, "Hero.tsx", far, false);
         assert!(!res.ok && res.output.contains("closest part") && res.output.contains("    1  export function Hero()"), "{}", res.output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn big_files_read_as_preview_with_outline_and_paths_without_extension_resolve() {
+        let dir = std::env::temp_dir().join(format!("sg_big_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let mut ts = String::new();
+        for i in 0..60 {
+            ts.push_str(&format!("export function handler{i}(x: number) {{\n"));
+            for j in 0..10 {
+                ts.push_str(&format!("  const v{j} = x + {j};\n"));
+            }
+            ts.push_str("  return x;\n}\n\n");
+        }
+        std::fs::write(dir.join("src/big.ts"), &ts).unwrap();
+        let res = dispatch(&dir, "read_file", &serde_json::json!({ "path": "src/big.ts" }));
+        assert!(res.ok, "{}", res.output);
+        assert!(res.output.starts_with("src/big.ts (lines 1-150 of 840)"), "{}", &res.output[..80]);
+        assert!(res.output.contains("Large file") && res.output.contains("export function handler59(x: number) {"), "outline missing");
+        assert!(res.output.contains("827-839"), "outline has line ranges");
+        // An explicit range reads just that.
+        let res = dispatch(&dir, "read_file", &serde_json::json!({ "path": "src/big.ts", "start_line": 827, "end_line": 830 }));
+        assert!(res.output.contains("(lines 827-830 of 840)") && !res.output.contains("Large file"));
+        // The extension left off: the one `big.*` file is meant.
+        let res = dispatch(&dir, "read_file", &serde_json::json!({ "path": "src/big", "start_line": 1, "end_line": 1 }));
+        assert!(res.ok && res.output.contains("does not exist — showing the file"), "{}", res.output);
+        let res = dispatch(&dir, "list_dir", &serde_json::json!({ "path": "src/big" }));
+        assert!(res.ok && res.output.contains("listing its folder"), "{}", res.output);
+        // grep: grouped, relative, works on one file.
+        let res = dispatch(&dir, "grep", &serde_json::json!({ "pattern": "return x", "path": "src/big.ts" }));
+        assert!(res.output.starts_with("60 matches in 1 files\nsrc/big.ts:"), "{}", res.output);
+        assert!(res.output.contains("… 48 more in this file"), "{}", res.output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn long_command_output_is_condensed_with_a_diagnostics_summary() {
+        // A tsc dump: 400 errors over 4 files, plus a progress bar and spam.
+        let mut raw = String::from("Progress 1%\rProgress 50%\rProgress 100%\n");
+        for i in 0..400 {
+            raw.push_str(&format!("src/f{}.tsx({},5): error TS{}: Type 'x' is not assignable to type 'y'.\n", i % 4, i + 1, if i % 3 == 0 { 2322 } else { 2339 }));
+        }
+        raw.push_str(&"warning: same line\n".repeat(50));
+        let out = condense_output(raw.clone());
+        assert!(out.len() <= OUT_MAX_CHARS + 100, "{} chars", out.len());
+        assert!(out.starts_with("Diagnostics: 400 errors"), "{out}");
+        assert!(out.contains("src/f0.tsx (100)") && out.contains("TS2339 (266)"), "{out}");
+        assert!(out.contains("Progress 100%") && !out.contains("Progress 50%"));
+        assert!(out.contains("warning: same line  (×50)"), "{out}");
+        // The middle is not lost: it is in the log the message points to.
+        let log = out.split("the full output is in ").nth(1).unwrap().split(" (grep").next().unwrap();
+        assert_eq!(std::fs::read_to_string(log).unwrap(), raw);
+        let _ = std::fs::remove_file(log);
+        // Short output passes untouched.
+        assert_eq!(condense_output("ok\ndone".into()), "ok\ndone");
+    }
+
+    #[test]
+    fn write_file_creates_new_files_but_not_wrong_paths() {
+        let dir = std::env::temp_dir().join(format!("sg_write_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src/layout")).unwrap();
+        std::fs::write(dir.join("src/layout/Nav.tsx"), "x").unwrap();
+        let w = |p: &str| dispatch(&dir, "write_file", &serde_json::json!({ "path": p, "content": "new\n" }));
+        // A new file next to existing ones, and one in a brand-new folder.
+        assert!(w("src/layout/AppLayout.tsx").ok);
+        assert!(w("src/pages/Home.tsx").ok);
+        assert_eq!(std::fs::read_to_string(dir.join("src/pages/Home.tsx")).unwrap(), "new\n");
+        // A missing folder + the same name elsewhere = a mistyped path.
+        let res = w("src/layuot/Nav.tsx");
+        assert!(!res.ok && res.output.contains("refusing"), "{}", res.output);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

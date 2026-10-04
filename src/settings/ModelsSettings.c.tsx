@@ -83,6 +83,21 @@ function explainGoogleError(raw: string): string {
   return raw;
 }
 
+/** The same for any other provider: say what a status code means, keep the details. */
+function explainProviderError(raw: string): string {
+  const text = raw.toLowerCase();
+  if (/\b401\b/.test(text) || text.includes("unauthorized") || text.includes("invalid_api_key") || text.includes("invalid api key")) {
+    return `The provider rejected the API key — check the key and that it belongs to this Base URL.\n${raw}`;
+  }
+  if (/\b403\b/.test(text) || text.includes("forbidden")) {
+    return `The key has no access to the model list on this endpoint.\n${raw}`;
+  }
+  if (/\b404\b/.test(text)) {
+    return `Nothing at this address — check the Base URL (it usually ends with /v1).\n${raw}`;
+  }
+  return raw;
+}
+
 /* ---------- Google OAuth block ---------- */
 
 function GoogleAuth({
@@ -766,6 +781,11 @@ function ProviderCard({
    *  persisted (and pushed to the Rust limiter) on blur. */
   const [rpmDraft, setRpmDraft] = useState(String(provider.rate_limit_rpm ?? 0));
   const [concDraft, setConcDraft] = useState(String(provider.concurrency ?? 0));
+  /** Max agents of this provider's runs (a model may set its own). */
+  const [agentsDraft, setAgentsDraft] = useState("1");
+  useEffect(() => {
+    void db.loadProviderAgents(provider.id).then((n) => setAgentsDraft(String(n)));
+  }, [provider.id]);
   const noLimits = (provider.rate_limit_rpm ?? 0) === 0 && (provider.concurrency ?? 0) === 0;
   /** "" / garbage → 0 (unlimited); anything else clamps to a sane ceiling. */
   const clampLimit = (v: string) => {
@@ -839,7 +859,8 @@ function ProviderCard({
     );
     if (result.error || result.models.length === 0) {
       await persist({ status: "error" });
-      setMessage({ kind: "err", text: explainGoogleError(result.error ?? "No models returned") });
+      const raw = result.error ?? "No models returned";
+      setMessage({ kind: "err", text: isGoogle ? explainGoogleError(raw) : explainProviderError(raw) });
       showFlash({ ok: false, text: "Failed" });
     } else {
       await db.replaceModels(provider.id, result.models);
@@ -944,7 +965,7 @@ function ProviderCard({
             exit={{ opacity: 0, y: -4 }}
           >
             <AlertTriangle size={13} className="mt-0.5 shrink-0" />
-            <span>{message.text}</span>
+            <span className="whitespace-pre-line break-words">{message.text}</span>
           </motion.div>
         )}
       </AnimatePresence>
@@ -1008,6 +1029,25 @@ function ProviderCard({
                 <>
                   <SettingRow title="Show in the model picker" hint="Off hides its models without deleting them">
                     <Switch on={provider.enabled} onChange={(next) => persist({ enabled: next })} ariaLabel="toggle provider" />
+                  </SettingRow>
+
+                  <SettingRow
+                    title="Max agents"
+                    hint="How many agents a run may use at once. 1 = the agent works alone (cheapest); above 1 it may hand parts of the work to helpers working side by side, each one a separate conversation with the model that costs as much again. A model can override it (its sliders)."
+                  >
+                    <Input
+                      className="w-[110px]"
+                      type="number"
+                      min={1}
+                      max={52}
+                      value={agentsDraft}
+                      onChange={(e) => setAgentsDraft(e.target.value)}
+                      onBlur={() => {
+                        const n = Math.min(52, Math.max(1, Math.floor(Number(agentsDraft)) || 1));
+                        setAgentsDraft(String(n));
+                        void db.saveProviderAgents(provider.id, n);
+                      }}
+                    />
                   </SettingRow>
 
                   <Sep />
@@ -1113,13 +1153,14 @@ function ProviderCard({
                       <div className="group flex h-8 items-center gap-2 rounded-lg px-2 text-[12px] text-[var(--text-main)] hover:bg-[var(--hover-bg)]">
                         <span className="min-w-0 flex-1 truncate font-mono" title={m.model_id}>{m.name}</span>
                         <ModelCaps kind={provider.kind} baseUrl={provider.base_url} modelId={m.model_id} rowId={m.id} />
-                        {/* API models: context, answer length and abilities are set by hand. */}
-                        {isApi && (
+                        {/* API models: context, answer length and abilities by hand; every
+                            non-CLI model: how many agents it may use. */}
+                        {!isCli && (
                           <IconButton
                             size="xs"
                             reveal={capsOpen !== m.id}
                             className={capsOpen === m.id ? "text-[var(--accent)]" : ""}
-                            label="Context, images, files, tools…"
+                            label={isApi ? "Context, images, files, tools, agents…" : "Agents at once"}
                             onClick={() => setCapsOpen(capsOpen === m.id ? null : m.id)}
                           >
                             <SlidersHorizontal size={12} />
@@ -1129,8 +1170,8 @@ function ProviderCard({
                           <Trash2 size={12} />
                         </IconButton>
                       </div>
-                      {isApi && capsOpen === m.id && (
-                        <ModelCapsEditor kind={provider.kind} baseUrl={provider.base_url} modelId={m.model_id} rowId={m.id} />
+                      {!isCli && capsOpen === m.id && (
+                        <ModelCapsEditor kind={provider.kind} baseUrl={provider.base_url} modelId={m.model_id} rowId={m.id} providerId={provider.id} />
                       )}
                     </div>
                   ))}

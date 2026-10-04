@@ -88,11 +88,16 @@ function TabBody({ tab, msgs }: { tab: PanelTabSpec; msgs: Msg[] }) {
   }
 
   if (tab.type === "file") {
-    // Latest change of the file wins - the tab shows the net result.
+    // The net result: before the file's first change → after its last one.
     let step: db.AgentStepEvent | undefined;
+    let before: string | undefined;
     for (const s of steps) {
-      if (s.path === tab.path && s.done && s.ok && s.new_text !== undefined) step = s;
+      if (s.path === tab.path && s.done && s.new_text !== undefined) {
+        if (!step) before = s.old_text ?? undefined;
+        step = s;
+      }
     }
+    if (step) step = { ...step, old_text: before };
     if (!step) {
       return (
         <div className="flex min-h-0 flex-1 items-center justify-center p-4 text-[12px] text-[var(--text-dim)]">

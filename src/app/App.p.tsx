@@ -120,7 +120,7 @@ export default function App() {
     () => (localStorage.getItem("gen_animation") as GenAnimation | null) ?? "pixels"
   );
   /** Last picked model, restored on launch so the chat remembers its choice. */
-  const [pickedModel, setPickedModel] = useState<{ gatewayId: string; modelId: string } | null>(
+  const [pickedModel, setPickedModel] = useState<{ gatewayId: string; modelId: string; effort?: Effort } | null>(
     null
   );
   const chatRef = useRef<HTMLDivElement>(null);
@@ -164,14 +164,12 @@ export default function App() {
    */
   const [sshPanel, setSshPanel] = useState<SshPanelTarget | null>(null);
 
-  /** Helper agents (Settings → Agent) and how many may work at once. */
+  /** Helper agents (Settings → Agent); how many may work at once is per model. */
   const [subagents, setSubagents] = useState<db.Subagent[]>([]);
-  const [maxAgents, setMaxAgents] = useState(2);
   /** Retries of a failed model request before a run gives up. */
   const [maxRetries, setMaxRetries] = useState(5);
   useEffect(() => {
     void db.loadSubagents().then(setSubagents);
-    void db.loadMaxAgents().then(setMaxAgents);
     void db.loadMaxRetries().then(setMaxRetries);
   }, []);
 
@@ -186,7 +184,6 @@ export default function App() {
     globalAutoRun,
     sshServers,
     subagents,
-    maxAgents,
     maxRetries,
     pickedModel,
     newChatProject,
@@ -219,7 +216,7 @@ export default function App() {
       {
         gatewayId: t.provider_id,
         modelId: t.model_id,
-        effort: (localStorage.getItem("effort") as Effort) || "medium",
+        effort: (localStorage.getItem("effort") as Effort) || "low",
       },
       [],
       { project: t.project, background: true }
@@ -232,6 +229,13 @@ export default function App() {
     : convMsgs[DRAFT_ID] ?? [];
   /** True while THIS conversation has a generation running. */
   const streaming = !!activeConv && !!activeRuns[activeConv.id];
+  /** The running agent's latest request size, tokens (the gauge's live reading). */
+  const liveContext = (() => {
+    if (!streaming) return undefined;
+    const last = draftMsgs[draftMsgs.length - 1];
+    const seg = last?.segments?.find((s) => s.kind === "usage");
+    return seg?.kind === "usage" ? seg.usage.last_input || undefined : undefined;
+  })();
   /**
    * Aurora palette for the prompt box, derived from the on-screen chat's run:
    * red after a failed turn, indigo while it thinks, amber once text streams,
@@ -750,11 +754,37 @@ export default function App() {
   /** Providers grouped with their models — feeds the model picker. */
   const gateways = useMemo(() => toGateways(providers, models), [providers, models]);
 
-  /** Remembers the model the user picked, so the next launch restores it. */
-  const pickModel = useCallback((next: { gatewayId: string; modelId: string }) => {
-    setPickedModel(next);
-    void db.setSetting("picked_model", JSON.stringify(next));
-  }, []);
+  /** Remembers the model the user picked, so the next launch restores it —
+   *  and, inside a chat, makes it that chat's model from now on. */
+  const pickModel = useCallback(
+    (next: { gatewayId: string; modelId: string }) => {
+      setPickedModel(next);
+      void db.setSetting("picked_model", JSON.stringify(next));
+      if (activeConv) {
+        const effort = (localStorage.getItem("effort") as Effort) || "low";
+        void db.saveConvModel(activeConv.id, { ...next, effort });
+      }
+    },
+    [activeConv],
+  );
+
+  /** Opening a chat brings back the provider + model it runs on. */
+  useEffect(() => {
+    const id = activeConv?.id;
+    if (!id) return;
+    let alive = true;
+    void db.loadConvModel(id).then((m) => {
+      if (!alive || !m) return;
+      // Only a model that still exists (and is enabled) — else keep the current pick.
+      const ok = models.some((x) => x.provider_id === m.gatewayId && x.model_id === m.modelId && x.enabled !== false);
+      if (ok) setPickedModel({ gatewayId: m.gatewayId, modelId: m.modelId, effort: m.effort });
+    });
+    return () => {
+      alive = false;
+    };
+    // Re-run only when another chat is opened (not on every models refresh).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConv?.id]);
 
   /** Opens the New Conversation screen in Agent mode, optionally inside a project. */
   const startNewChat = (project: string = NO_PROJECT) => {
@@ -1419,11 +1449,12 @@ export default function App() {
                       load={() =>
                         chat.contextFor(activeConv?.id ?? null, activeConv?.project ?? NO_PROJECT, {
                           ...pickedModel,
-                          effort: (localStorage.getItem("effort") as Effort) || "medium",
+                          effort: (localStorage.getItem("effort") as Effort) || "low",
                         })
                       }
-                      refreshKey={`${activeConv?.id ?? ""}|${draftMsgs.length}|${pickedModel.gatewayId}|${pickedModel.modelId}|${maxAgents}`}
+                      refreshKey={`${activeConv?.id ?? ""}|${draftMsgs.length}|${pickedModel.gatewayId}|${pickedModel.modelId}`}
                       busy={streaming}
+                      live={liveContext}
                     />
                   )
                 }
@@ -1513,11 +1544,6 @@ export default function App() {
               onMaxRetries={(n) => {
                 setMaxRetries(n);
                 void db.setSetting("max_retries", String(n));
-              }}
-              maxAgents={maxAgents}
-              onMaxAgents={(n) => {
-                setMaxAgents(n);
-                void db.setSetting("max_agents", String(n));
               }}
               initialProject={settingsProject}
               initialSection={settingsSection}

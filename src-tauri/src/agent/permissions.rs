@@ -59,15 +59,13 @@ pub(in crate::agent) fn permission_gate(tool: &str, args: &Value, workspace: &st
         })
     };
     match tool {
-        "run_command" | "ssh_exec" => {
+        "run_command" => {
             let cmd = get("command");
             let risky = crate::safety::risky_command(cmd);
             if auto_run && risky.is_none() {
                 return None;
             }
-            let place = if tool == "ssh_exec" {
-                format!("server {}", get("server"))
-            } else if get("cwd").is_empty() {
+            let place = if get("cwd").is_empty() {
                 cwd.to_string()
             } else {
                 full_path(cwd, get("cwd")).display().to_string()

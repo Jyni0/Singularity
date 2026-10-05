@@ -29,6 +29,8 @@ export interface Msg {
   images?: db.StoredImage[];
   /** Why the turn failed — shown under whatever it produced. Live only. */
   error?: string;
+  /** Agent turns: the model that wrote it, "<provider kind>:<model id>". */
+  by?: string;
 }
 
 /**

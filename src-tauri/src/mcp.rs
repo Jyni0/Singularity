@@ -23,7 +23,7 @@ use tauri::AppHandle;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
-use crate::ssh::{sql, unique_id};
+use crate::db::{sql, unique_id};
 use crate::vault;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";

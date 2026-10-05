@@ -22,5 +22,4 @@ export { SettingRow, SettingsCard, Sep, SectionHeading } from "./layout/Settings
 export { NavItem, RowActions } from "./layout/Nav.c";
 
 export { FileIcon, baseName, dirName } from "./icons/FileIcon.c";
-export { OsLogo } from "./icons/OsLogo.c";
 export { ProviderLogo, GoogleMark, OpenAIMark, AnthropicMark } from "./icons/ProviderLogo.c";

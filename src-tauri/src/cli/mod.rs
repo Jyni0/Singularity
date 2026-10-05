@@ -16,7 +16,7 @@ mod model;
 mod protocol;
 mod usage;
 
-pub use model::{end_chat, keeps_session, CliModel};
+pub use model::{chat_sessions, end_chat, keeps_session, ChatSessionInfo, CliModel};
 
 use serde::Serialize;
 use std::ffi::OsString;
@@ -41,6 +41,15 @@ impl Cli {
             "anthropic-cli" => Some(Cli::Claude),
             "google-cli" => Some(Cli::Antigravity),
             _ => None,
+        }
+    }
+
+    /// The provider kind of this CLI (the inverse of `from_kind`).
+    pub fn kind(self) -> &'static str {
+        match self {
+            Cli::Codex => "openai-cli",
+            Cli::Claude => "anthropic-cli",
+            Cli::Antigravity => "google-cli",
         }
     }
 
@@ -797,6 +806,13 @@ pub async fn cli_login(kind: String) -> Result<CliStatus, String> {
 #[tauri::command]
 pub fn cli_end_chat(chat_id: String) {
     end_chat(&chat_id);
+}
+
+/// The live CLI sessions of a chat (one per provider) and how far into the
+/// chat each has read — the chat marks messages a session has not seen.
+#[tauri::command]
+pub fn cli_chat_sessions(chat_id: String) -> Vec<ChatSessionInfo> {
+    chat_sessions(&chat_id)
 }
 
 /// The subscription's plan and how much of each limit window is used.

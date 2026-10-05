@@ -19,13 +19,18 @@
 //! (Stop) kills the process.
 //!
 //! Chats: a run's model takes its session from the chat's slot
-//! ([`CliModel::for_chat`]), so ONE CLI session serves the whole chat — the
-//! next message of the chat is written into the session that is already
-//! running (it holds the earlier runs, tool results included) instead of
-//! starting a new CLI with the whole conversation again.
+//! ([`CliModel::for_chat`]): ONE session per provider per chat — the next
+//! message is written into the session that is already running (it holds
+//! the earlier runs, tool results included) instead of starting a new CLI
+//! with the whole conversation again. Switching the chat to another
+//! provider's model leaves this session alone; another model of the SAME
+//! provider replaces it (its prompt cache is per model anyway). A session
+//! remembers how far into the chat it has read ([`ChatMark`]); on its return
+//! it gets what the other models said and changed meanwhile, then the prompt.
 
 use super::protocol::{self, Piece, Rendered, ToolTagFilter};
 use super::{agy_model_args, ensure, jobs, tail, Cli};
+use crate::chat::ChatTurn;
 use rig_agent::core::completion::message::{AssistantContent, Message, Text};
 use rig_agent::core::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
@@ -60,36 +65,72 @@ pub struct CliModel {
     /// No call made yet: the first call of a run may resume the chat's
     /// session with just the new user message.
     fresh: Arc<AtomicBool>,
+    /// The chat this model serves ("" = a session of one run).
+    chat: String,
+    /// The chat as the app sent it for this run (untrimmed).
+    turns: Option<Arc<Vec<ChatTurn>>>,
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Session>>>;
 
-/// The chats' CLI sessions, most recently used last.
+/// The chats' CLI sessions ("chat|cli"), most recently used last.
 static CHAT_SESSIONS: LazyLock<std::sync::Mutex<Vec<(String, Slot)>>> = LazyLock::new(Default::default);
-/// Idle chat sessions kept alive (each one is a CLI process for agy/Claude).
-const KEEP_CHATS: usize = 4;
+/// Idle sessions kept alive over all chats (agy/Claude: a CLI process each).
+const KEEP_SESSIONS: usize = 6;
 
-/// The session slot of `chat` for this CLI + model + effort. Another model
-/// or effort in the same chat ends the chat's previous session.
-fn chat_slot(chat: &str, key: &str) -> Slot {
+/// The session slot of `chat` for one CLI. The other providers' sessions of
+/// the chat stay; a session of another model of this CLI is replaced when
+/// the run opens it (see `open`).
+fn chat_slot(chat: &str, cli: Cli) -> Slot {
+    let key = format!("{chat}|{cli:?}");
     let mut all = CHAT_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-    let prefix = format!("{chat}|");
-    all.retain(|(k, _)| !k.starts_with(&prefix) || k == key);
-    if let Some(i) = all.iter().position(|(k, _)| k == key) {
+    if let Some(i) = all.iter().position(|(k, _)| *k == key) {
         let entry = all.remove(i);
         let slot = entry.1.clone();
         all.push(entry);
         return slot;
     }
     let slot = Slot::default();
-    all.push((key.to_string(), slot.clone()));
-    while all.len() > KEEP_CHATS {
+    all.push((key, slot.clone()));
+    while all.len() > KEEP_SESSIONS {
         all.remove(0); // its process is killed with it
     }
     slot
 }
 
-/// Ends the CLI session of `chat` (the chat was deleted).
+/// One live session of a chat, for the chat's "not read yet" marks.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChatSessionInfo {
+    /// Provider kind ("anthropic-cli", …).
+    pub kind: &'static str,
+    pub model: String,
+    pub effort: String,
+    /// Chat messages (as the app sends them) the session has read.
+    pub read: usize,
+}
+
+/// The live sessions of `chat`. One busy with a run is left out — the app
+/// asks again when the run is over.
+pub fn chat_sessions(chat: &str) -> Vec<ChatSessionInfo> {
+    let prefix = format!("{chat}|");
+    let slots: Vec<Slot> = CHAT_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .map(|(_, s)| s.clone())
+        .collect();
+    slots
+        .iter()
+        .filter_map(|slot| {
+            let g = slot.try_lock().ok()?;
+            let s = g.as_ref()?;
+            Some(ChatSessionInfo { kind: s.cli.kind(), model: s.model.clone(), effort: s.effort.clone(), read: s.read.len })
+        })
+        .collect()
+}
+
+/// Ends the CLI sessions of `chat` (the chat was deleted).
 pub fn end_chat(chat: &str) {
     let prefix = format!("{chat}|");
     CHAT_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, _)| !k.starts_with(&prefix));
@@ -116,6 +157,10 @@ struct Proc {
 /// A live session between two calls: the process (or, for Codex, the
 /// recorded thread to resume) plus what it has seen.
 struct Session {
+    cli: Cli,
+    /// The model and effort it runs with.
+    model: String,
+    effort: String,
     proc: Option<Proc>,
     /// Codex: the thread id `exec resume` continues.
     thread: Option<String>,
@@ -126,21 +171,31 @@ struct Session {
     tool_defs: u64,
     /// Fingerprints of the request messages it has seen (system included).
     seen: Vec<u64>,
-    /// The user's own messages in the chat so far — a new run continues
-    /// the session only when it brings exactly one more.
-    turns: usize,
+    /// How far into the chat it has read.
+    read: ChatMark,
     /// Codex: the thread's usage totals so far (a resumed thread reports
     /// totals, not the call's own numbers).
     totals: Usage,
 }
 
-/// The user's typed messages in a request (tool results do not count).
-fn user_turns(req: &CompletionRequest) -> usize {
-    use rig_agent::core::completion::message::UserContent;
-    req.chat_history
-        .iter()
-        .filter(|m| matches!(m, Message::User { content } if content.iter().any(|c| matches!(c, UserContent::Text(_)))))
-        .count()
+/// How far into the chat a session has read: the chat's messages at its
+/// latest run (as the app sends them — whole, not trimmed) and fingerprints
+/// of the user's among them. An edited or deleted earlier message makes the
+/// chat another conversation.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ChatMark {
+    len: usize,
+    users: Vec<u64>,
+}
+
+impl ChatMark {
+    fn of(turns: &[ChatTurn]) -> Self {
+        Self { len: turns.len(), users: turns.iter().filter(|t| !is_agent(&t.role)).map(|t| fingerprint(&t.text)).collect() }
+    }
+}
+
+fn is_agent(role: &str) -> bool {
+    role == "agent" || role == "assistant"
 }
 
 fn fingerprint<T: serde::Serialize>(v: &T) -> u64 {
@@ -171,17 +226,22 @@ impl Session {
     }
 
     /// The text to write when `req` starts a NEW run of the chat this
-    /// session serves: its last user message. The session already holds the
-    /// earlier runs (in more detail than the saved chat). None when the
-    /// tools changed or the message carries images.
-    fn resume(&self, req: &CompletionRequest) -> Option<String> {
-        // Same tools, and the chat grew by exactly this message (an edited
-        // and resent earlier prompt is another conversation).
-        if fingerprint(&req.tools) != self.tool_defs || user_turns(req) != self.turns + 1 {
+    /// session serves: what the chat gained since the session last read it
+    /// (other models' turns), then the new prompt. The session already holds
+    /// its own earlier runs, in more detail than the saved chat. None when
+    /// the tools changed, an earlier message was edited or deleted, or the
+    /// prompt carries images.
+    fn resume(&self, req: &CompletionRequest, chat: &[ChatTurn]) -> Option<String> {
+        let m = &self.read;
+        if fingerprint(&req.tools) != self.tool_defs || m.len == 0 || chat.len() <= m.len || ChatMark::of(&chat[..m.len]) != *m {
+            return None;
+        }
+        if chat.last().is_some_and(|t| is_agent(&t.role)) {
             return None;
         }
         let last = req.chat_history.last().filter(|m| matches!(m, Message::User { .. }))?;
-        protocol::render_followup(std::slice::from_ref(last), !req.tools.is_empty())
+        let prompt = protocol::render_followup(std::slice::from_ref(last), !req.tools.is_empty())?;
+        Some(format!("{}{prompt}", protocol::render_catchup(&chat[m.len..chat.len() - 1], self.cli.kind())))
     }
 }
 
@@ -208,15 +268,20 @@ impl CliModel {
             effort: effort.to_string(),
             session: Arc::default(),
             fresh: Arc::new(AtomicBool::new(true)),
+            chat: String::new(),
+            turns: None,
         }
     }
 
-    /// A model whose session is the chat's one (see the module docs). An
-    /// empty `chat` = a session of this run only.
-    pub fn for_chat(cli: Cli, model: &str, effort: &str, chat: &str) -> Self {
+    /// A model whose session is the chat's one for this CLI (see the module
+    /// docs); `turns` = the chat as the app sent it. An empty `chat` = a
+    /// session of this run only.
+    pub fn for_chat(cli: Cli, model: &str, effort: &str, chat: &str, turns: Option<Arc<Vec<ChatTurn>>>) -> Self {
         let mut m = Self::new(cli, model, effort);
         if !chat.is_empty() {
-            m.session = chat_slot(chat, &format!("{chat}|{cli:?}|{}|{effort}", m.model));
+            m.session = chat_slot(chat, cli);
+            m.chat = chat.to_string();
+            m.turns = turns;
         }
         m
     }
@@ -291,22 +356,29 @@ impl CliModel {
         let fps = request_fingerprints(&req);
         let fresh = self.fresh.swap(false, Ordering::SeqCst);
         let mut slot = if sessioned { Some(self.session.clone().lock_owned().await) } else { None };
+        let chat: &[ChatTurn] = self.turns.as_deref().map(Vec::as_slice).unwrap_or(&[]);
         // A session that does not continue is dropped here (its process
-        // killed) and a fresh one starts. The first call of a run may resume
-        // the chat's session with just the new message.
-        let live = slot.as_mut().and_then(|g| g.take()).and_then(|s| {
-            if let Some(text) = s.followup(&req, &fps) {
-                return Some((s, text, true));
-            }
-            let text = if fresh { s.resume(&req) } else { None }?;
-            Some((s, text, false))
-        });
-        // The chat's user messages at the start of this run (notes added
-        // inside a run are not part of the saved chat).
-        let turns = match &live {
-            Some((s, _, true)) => s.turns,
-            _ => user_turns(&req),
+        // killed) and a fresh one starts: another model of this CLI, or
+        // another effort where it is fixed at launch (Codex takes it per
+        // call). The first call of a run may resume the chat's session with
+        // just what it missed plus the new message.
+        let live = slot
+            .as_mut()
+            .and_then(|g| g.take())
+            .filter(|s| s.model == self.model && (s.effort == self.effort || cli == Cli::Codex))
+            .and_then(|s| {
+                if let Some(text) = s.followup(&req, &fps) {
+                    return Some((s, text, true));
+                }
+                let text = if fresh { s.resume(&req, chat) } else { None }?;
+                Some((s, text, false))
+            });
+        // How far into the chat the session has read once this call is in.
+        let read = match &live {
+            Some((s, _, true)) => s.read.clone(),
+            _ => ChatMark::of(chat),
         };
+        let (model, effort) = (self.model.clone(), self.effort.clone());
         let mut thread: Option<String> = None;
         let (mut proc, first) = match live {
             Some((Session { proc: Some(proc), .. }, text, _)) => {
@@ -386,7 +458,18 @@ impl CliModel {
                                 }
                                 if tx.send(Ok(RawStreamingChoice::FinalResponse(StreamFinal::new(provider, usage)))).await.is_ok() {
                                     if let Some(g) = slot.as_mut() {
-                                        **g = Some(Session { proc: Some(proc), thread: None, tools: fps.0, tool_defs, seen: fps.1, turns, totals: Usage::new() });
+                                        **g = Some(Session {
+                                            cli,
+                                            model: model.clone(),
+                                            effort: effort.clone(),
+                                            proc: Some(proc),
+                                            thread: None,
+                                            tools: fps.0,
+                                            tool_defs,
+                                            seen: fps.1.clone(),
+                                            read: read.clone(),
+                                            totals: Usage::new(),
+                                        });
                                     }
                                 }
                                 return;
@@ -442,7 +525,18 @@ impl CliModel {
             // Codex: the conversation is recorded; the next call resumes it.
             if let (true, Cli::Codex, Some(t)) = (sent && sessioned, cli, state.thread.take().or(thread)) {
                 if let Some(g) = slot.as_mut() {
-                    **g = Some(Session { proc: None, thread: Some(t), tools: fps.0, tool_defs, seen: fps.1, turns, totals: proc.totals });
+                    **g = Some(Session {
+                        cli,
+                        model,
+                        effort,
+                        proc: None,
+                        thread: Some(t),
+                        tools: fps.0,
+                        tool_defs,
+                        seen: fps.1,
+                        read,
+                        totals: proc.totals,
+                    });
                 }
             }
         });
@@ -527,7 +621,14 @@ impl Job {
     /// `persist` / `resume`: Codex only — record the conversation, or
     /// continue a recorded thread with `r.prompt`.
     fn prepare(m: &CliModel, r: &Rendered, agy_args: &[String], persist: bool, resume: Option<&str>) -> Result<Self, String> {
-        let dir = jobs().join(format!("run-{}", uid()));
+        // agy puts its working folder (and the rules in it) into its own
+        // prompt: one folder per chat keeps that prefix the same for every
+        // session of the chat, so its prompt cache can hit.
+        let dir = if m.cli == Cli::Antigravity && persist && !m.chat.is_empty() {
+            jobs().join(format!("run-agy-{:016x}", fingerprint(&m.chat)))
+        } else {
+            jobs().join(format!("run-{}", uid()))
+        };
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let mut job = Job { args: vec![], stdin: String::new(), files: vec![dir.clone()], cwd: None };
         // Levels each CLI accepts (the UI offers only these; anything else
@@ -671,7 +772,9 @@ fn write_agy_rules(dir: &std::path::Path, system: &str) -> std::io::Result<Strin
     let mut rest = system;
     for name in ["GEMINI.md", "AGENTS.md"] {
         if rest.trim().is_empty() {
-            break;
+            // A reused folder: no rules left over from a longer prompt.
+            let _ = std::fs::remove_file(dir.join(name));
+            continue;
         }
         let cut = if rest.len() <= AGY_RULE_BYTES {
             rest.len()
@@ -1045,30 +1148,82 @@ mod tests {
         }
     }
 
-    /// A new run of the same chat sends only its new message; an edited
-    /// earlier prompt (the chat did not grow by one) does not resume.
+    fn turn(role: &str, text: &str, by: &str) -> ChatTurn {
+        ChatTurn { role: role.into(), text: text.into(), by: by.into(), ..Default::default() }
+    }
+
+    fn session(chat: &[ChatTurn], first: &CompletionRequest) -> Session {
+        let (tools, seen) = request_fingerprints(first);
+        Session {
+            cli: Cli::Claude,
+            model: "opus".into(),
+            effort: "low".into(),
+            proc: None,
+            thread: Some("t".into()),
+            tools,
+            tool_defs: fingerprint(&first.tools),
+            seen,
+            read: ChatMark::of(chat),
+            totals: Usage::new(),
+        }
+    }
+
+    /// A new run of the same chat sends only its new message — also long
+    /// after the trimmed history stopped growing (the 7th+ message).
     #[test]
     fn chat_session_resumes_with_only_the_new_message() {
-        let first = req(vec![Message::user("build it")]);
-        let (tools, seen) = request_fingerprints(&first);
-        let s = Session { proc: None, thread: Some("t".into()), tools, tool_defs: fingerprint(&first.tools), seen, turns: 1, totals: Usage::new() };
-        // Next run: saved turns + the new prompt, with fresh instructions.
-        let mut next = req(vec![Message::user("build it"), Message::assistant("done"), Message::user("now test it")]);
+        let mut chat: Vec<ChatTurn> = Vec::new();
+        for i in 0..10 {
+            chat.push(turn("user", &format!("q{i}"), ""));
+            chat.push(turn("agent", &format!("a{i}"), "anthropic-cli:opus"));
+        }
+        chat.push(turn("user", "q10", ""));
+        let first = req(vec![Message::user("q10")]);
+        let s = session(&chat, &first);
+        chat.push(turn("agent", "a10", "anthropic-cli:opus"));
+        chat.push(turn("user", "now test it", ""));
+        let mut next = req(vec![Message::user("q10"), Message::assistant("a10"), Message::user("now test it")]);
         next.preamble = Some("instructions, repo map changed".into());
-        assert_eq!(s.resume(&next).as_deref(), Some("now test it"));
-        let edited = req(vec![Message::user("build it differently")]);
-        assert!(s.resume(&edited).is_none());
+        // Its own answer is not repeated to it.
+        assert_eq!(s.resume(&next, &chat).as_deref(), Some("now test it"));
+        // An edited earlier prompt is another conversation.
+        let mut edited = chat.clone();
+        edited[2].text = "q1 differently".into();
+        assert!(s.resume(&next, &edited).is_none());
+    }
+
+    /// Back from another provider: the session hears what that model said
+    /// and which files it changed, then the prompt.
+    #[test]
+    fn returning_session_gets_what_other_models_did() {
+        let mut chat = vec![turn("user", "build it", "")];
+        let first = req(vec![Message::user("build it")]);
+        let s = session(&chat, &first);
+        chat.push(turn("agent", "built", "anthropic-cli:opus"));
+        chat.push(turn("user", "fix the header", ""));
+        let mut codex = turn("agent", "header fixed", "openai-cli:gpt-5");
+        codex.work_log = "- apply_patch src/h.tsx → changed (+3 −1)".into();
+        codex.changed = vec!["src/h.tsx".into()];
+        chat.push(codex);
+        chat.push(turn("user", "now the footer", ""));
+        let next = req(vec![Message::user("now the footer")]);
+        let text = s.resume(&next, &chat).unwrap();
+        assert!(!text.contains("built"), "{text}");
+        assert!(text.contains("<user>\nfix the header\n</user>") && text.contains("model=\"gpt-5\"") && text.contains("header fixed"));
+        assert!(text.contains("read them again before editing: src/h.tsx"));
+        assert!(text.ends_with("now the footer"), "{text}");
     }
 
     #[test]
-    fn a_chat_has_one_session_slot_per_model() {
-        let a = chat_slot("chat-x", "chat-x|Claude|opus|high");
-        let b = chat_slot("chat-x", "chat-x|Claude|opus|high");
+    fn a_chat_has_one_session_slot_per_provider() {
+        let a = chat_slot("chat-x", Cli::Claude);
+        let b = chat_slot("chat-x", Cli::Claude);
         assert!(Arc::ptr_eq(&a, &b));
-        // Another model in the chat replaces it.
-        let c = chat_slot("chat-x", "chat-x|Claude|sonnet|high");
+        // Another provider in the chat gets its own slot; the first stays.
+        let c = chat_slot("chat-x", Cli::Codex);
         assert!(!Arc::ptr_eq(&a, &c));
-        assert_eq!(CHAT_SESSIONS.lock().unwrap().iter().filter(|(k, _)| k.starts_with("chat-x|")).count(), 1);
+        assert!(Arc::ptr_eq(&a, &chat_slot("chat-x", Cli::Claude)));
+        assert_eq!(CHAT_SESSIONS.lock().unwrap().iter().filter(|(k, _)| k.starts_with("chat-x|")).count(), 2);
         end_chat("chat-x");
         assert!(!CHAT_SESSIONS.lock().unwrap().iter().any(|(k, _)| k.starts_with("chat-x|")));
     }

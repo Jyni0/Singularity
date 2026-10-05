@@ -101,19 +101,6 @@ fn cache_master(key: [u8; 32]) {
     }
 }
 
-/// True when the master key is safely persisted (keyring or file).
-pub fn vault_backed() -> bool {
-    if keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
-        .and_then(|e| e.get_password())
-        .is_ok()
-    {
-        return true;
-    }
-    fallback_path()
-        .map(|d| d.join("vault.key").exists())
-        .unwrap_or(false)
-}
-
 /// Encrypts a secret: `enc:v1:<base64(nonce || ciphertext || tag)>`.
 /// Empty input stays empty (nothing to protect).
 pub fn encrypt(plain: &str) -> String {
@@ -160,6 +147,19 @@ pub fn decrypt(stored: &str) -> String {
             String::new()
         }
     }
+}
+
+/// Encrypts secrets the frontend stores itself (provider API keys).
+#[tauri::command]
+pub fn vault_seal(values: Vec<String>) -> Vec<String> {
+    values.iter().map(|v| if v.starts_with(MARKER) { v.clone() } else { encrypt(v) }).collect()
+}
+
+/// Decrypts them for use and display; plaintext passes through, a value
+/// this machine's key cannot open comes back empty (enter it again).
+#[tauri::command]
+pub fn vault_open(values: Vec<String>) -> Vec<String> {
+    values.iter().map(|v| decrypt(v)).collect()
 }
 
 // Note: legacy plaintext rows need no explicit migration — decrypt()

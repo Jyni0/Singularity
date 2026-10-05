@@ -21,6 +21,12 @@ pub struct ChatTurn {
     /// Agent turns: the read / search / command outputs themselves.
     #[serde(default)]
     pub work_detail: String,
+    /// Agent turns: who wrote it, "<provider kind>:<model id>" ("" = unknown).
+    #[serde(default)]
+    pub by: String,
+    /// Agent turns: files it created or changed.
+    #[serde(default)]
+    pub changed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

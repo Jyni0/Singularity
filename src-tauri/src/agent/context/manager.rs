@@ -449,6 +449,7 @@ mod tests {
             text: text.into(),
             work_log: log.into(),
             work_detail: detail.into(),
+            ..Default::default()
         };
         let user = |text: &str| crate::chat::ChatTurn { role: "user".into(), text: text.into(), ..Default::default() };
         let turns = vec![

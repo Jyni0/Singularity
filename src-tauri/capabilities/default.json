@@ -17,8 +17,6 @@
     "core:window:allow-is-maximized",
     "core:window:allow-is-fullscreen",
     "core:window:allow-set-fullscreen",
-    "clipboard-manager:allow-write-text",
-    "clipboard-manager:allow-read-text",
     "dialog:default",
     "dialog:allow-open",
     "sql:default",

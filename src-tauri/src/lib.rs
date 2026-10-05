@@ -9,7 +9,6 @@ mod mcp;
 mod db;
 mod discovery;
 mod oauth;
-mod proxy;
 mod bg;
 mod syntax;
 mod pricing;
@@ -17,7 +16,6 @@ mod plugins;
 mod runs;
 mod safety;
 mod skills;
-mod ssh;
 mod stt;
 mod vault;
 mod tools;
@@ -237,23 +235,6 @@ async fn transcribe_audio(
     stt::transcribe(app, audio, language).await
 }
 
-/* ---------- SSH Client mode ---------- */
-
-/// Connects (or reuses a pooled session) to a saved server. The frontend
-/// never sends credentials here — Rust reads them from the database, so the
-/// audit log and the agent tool see the exact same stored units.
-#[tauri::command]
-async fn ssh_connect(app: tauri::AppHandle, server_id: String) -> Result<(), String> {
-    ssh::connect(&app, "user", &server_id).await
-}
-
-/// Server ids with a live connection — the Units grid paints status from it.
-#[tauri::command]
-fn ssh_connected(app: tauri::AppHandle) -> Vec<String> {
-    let _ = app;
-    ssh::connected_ids()
-}
-
 /// Logs to stderr. Filter with RUST_LOG (default: this crate at info), e.g.
 /// `RUST_LOG=singularity_lib::agent=debug` for per-step agent detail.
 fn init_tracing() {
@@ -277,7 +258,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         // Folder picker for choosing the agent workspace.
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(
             tauri_plugin_sql::Builder::default()
                 .add_migrations(db::DB_URL, migrations)
@@ -337,6 +317,7 @@ pub fn run() {
             cli::cli_logout,
             cli::cli_usage,
             cli::cli_end_chat,
+            cli::cli_chat_sessions,
             agent_run,
             agent_confirm,
             agent_snapshot,
@@ -346,9 +327,6 @@ pub fn run() {
             transcribe_audio,
             tray::tray_state,
             updater::update_check,
-            proxy::ssh_list_proxies,
-            proxy::ssh_save_proxy,
-            proxy::ssh_delete_proxy,
             updater::update_install,
             skills::skills_list,
             skills::skills_get,
@@ -364,43 +342,12 @@ pub fn run() {
             workspace_files,
             tray::tray_action,
             tray::tray_resize,
-            ssh_connect,
-            ssh_connected,
             bg::bg_list,
             bg::bg_output,
             bg::bg_stop,
             bg::bg_remove,
-            ssh::ssh_list_servers,
-            ssh::ssh_save_server,
-            ssh::ssh_reorder_units,
-            ssh::ssh_reveal_password,
-            ssh::ssh_delete_server,
-            ssh::ssh_list_keys,
-            ssh::ssh_save_key,
-            ssh::ssh_delete_key,
-            ssh::ssh_get_key,
-            ssh::ssh_derive_public,
-            ssh::ssh_generate_key,
-            ssh::ssh_list_scripts,
-            ssh::ssh_save_script,
-            ssh::ssh_delete_script,
-            ssh::ssh_shell_open,
-            ssh::ssh_shell_input,
-            ssh::ssh_shell_resize,
-            ssh::ssh_shell_snapshot,
-            ssh::ssh_shell_close,
-            ssh::ssh_shell_list,
-            ssh::ssh_sftp_list,
-            ssh::ssh_sftp_home,
-            ssh::ssh_sftp_download,
-            ssh::ssh_sftp_upload,
-            ssh::ssh_sftp_read_text,
-            ssh::ssh_sftp_write_text,
-            ssh::ssh_sftp_write_chunk,
-            ssh::ssh_sftp_rename,
-            ssh::ssh_sftp_remove,
-            ssh::ssh_sftp_mkdir,
-            ssh::ssh_vault_status,
+            vault::vault_seal,
+            vault::vault_open,
             chat_stream
         ])
         .build(tauri::generate_context!())

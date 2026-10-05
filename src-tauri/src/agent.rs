@@ -32,7 +32,7 @@ pub use plain::stream as stream_plain;
 pub use runtime::ContextPart;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -222,10 +222,6 @@ pub struct AgentRequest {
     /// Images attached to the last user turn.
     #[serde(default)]
     pub images: Vec<crate::chat::ImageAttachment>,
-    /// Saved SSH units the project may use (name + host only — credentials
-    /// stay in the database; the ssh_exec tool resolves them server-side).
-    #[serde(default)]
-    pub ssh_units: Vec<SshUnitRef>,
     /// Built-in tools switched off in Settings → Plugins (by tool name).
     #[serde(default)]
     pub disabled_tools: Vec<String>,
@@ -247,6 +243,10 @@ pub struct AgentRequest {
     /// The conversation: a subscription CLI keeps ONE session per chat.
     #[serde(default)]
     pub chat_id: String,
+    /// The chat as the app sent it, before trimming: a CLI session finds in
+    /// it what it has not read yet (set by the backend, never sent).
+    #[serde(skip)]
+    pub chat_turns: Option<std::sync::Arc<Vec<crate::chat::ChatTurn>>>,
     /// Retries of a failed model request (any API/stream error) before the
     /// run gives up. Settings → Agent; default 5.
     #[serde(default = "default_retries")]
@@ -286,18 +286,6 @@ pub struct SubagentDef {
     /// The subagent's own system prompt.
     #[serde(default)]
     pub prompt: String,
-}
-
-/// What the model needs to see about an SSH unit: a name to pick and the
-/// host for context. No credentials ever cross into the prompt.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SshUnitRef {
-    pub name: String,
-    #[serde(default)]
-    pub host: String,
-    /// Server row id — ssh_exec maps name → id with this.
-    #[serde(default)]
-    pub id: String,
 }
 
 fn default_auth() -> String {
@@ -347,6 +335,8 @@ pub async fn run_agent(
     // A stale stop request must never kill a fresh run that reuses the id.
     crate::cancel::clear(&run_id);
 
+    let mut req = req;
+    req.chat_turns = Some(std::sync::Arc::new(turns.clone()));
     // Only the recent conversation goes on the wire, with old answers
     // clipped — the whole chat history used to ride along on every round.
     let turns = context::trim_history(turns);
@@ -461,28 +451,6 @@ fn emit_step(app: &AppHandle, run_id: &str, index: usize, name: &str, input: Str
             image: res.image.clone(),
         },
     );
-}
-
-/// Runs the model's ssh_exec call through the shared SSH pool. The unit name
-/// from the model maps to a saved server id; credentials never leave Rust.
-/// Every attempt is audit-logged with actor "agent" (the Logs page shows it).
-async fn run_ssh_tool(app: &AppHandle, req: &AgentRequest, args: &Value) -> crate::tools::ToolResult {
-    let server_name = args.get("server").and_then(|v| v.as_str()).unwrap_or("");
-    let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-    if server_name.is_empty() || command.is_empty() {
-        return crate::tools::ToolResult::err("ssh_exec needs both server and command");
-    }
-    let unit = req.ssh_units.iter().find(|u| u.name == server_name);
-    let Some(unit) = unit else {
-        let known: Vec<&str> = req.ssh_units.iter().map(|u| u.name.as_str()).collect();
-        return crate::tools::ToolResult::err(format!(
-            "unknown server {server_name:?}; available: {known:?}"
-        ));
-    };
-    match crate::ssh::exec(app, "agent", &unit.id, command).await {
-        Ok(out) => crate::tools::ToolResult::ok(out),
-        Err(e) => crate::tools::ToolResult::err(e),
-    }
 }
 
 /// Aggregated usage of one run — what the Debug HUD displays.

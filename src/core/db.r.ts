@@ -16,12 +16,6 @@ import type {
   ProviderKind,
   ProviderStatus,
   ScheduledTask,
-  SftpEntry,
-  SshKey,
-  SshProxy,
-  SshLog,
-  SshScript,
-  SshServer,
   StoredImage,
   StoredMessage,
 } from "./types.i";
@@ -36,11 +30,6 @@ interface MemoryStore {
   models: Model[];
   messages: StoredMessage[];
   settings: Record<string, string>;
-  sshServers: SshServer[];
-  sshKeys: SshKey[];
-  sshScripts: SshScript[];
-  sshProxies: SshProxy[];
-  sshLogs: SshLog[];
 }
 
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -53,11 +42,6 @@ const memory: MemoryStore = {
   models: [],
   messages: [],
   settings: {},
-  sshServers: [],
-  sshKeys: [],
-  sshScripts: [],
-  sshProxies: [],
-  sshLogs: [],
 };
 
 const memId = () => `mem-${Math.random().toString(36).slice(2, 10)}`;
@@ -316,6 +300,22 @@ export async function updateConversationPinned(id: string, pinned: boolean): Pro
   ]);
 }
 
+/** A subscription CLI's live session in a chat (one per provider). */
+export interface CliChatSession {
+  /** Provider kind ("anthropic-cli", "openai-cli", "google-cli"). */
+  kind: string;
+  model: string;
+  effort: string;
+  /** How many of the chat's messages (as modelTurns sends them) it has read. */
+  read: number;
+}
+
+/** The live CLI sessions of a chat — what each has read so far. */
+export async function cliChatSessions(chatId: string): Promise<CliChatSession[]> {
+  if (!inTauri) return [];
+  return invoke<CliChatSession[]>("cli_chat_sessions", { chatId }).catch(() => []);
+}
+
 export async function removeConversation(id: string): Promise<void> {
   // A subscription CLI may still hold this chat's session open.
   void invoke("cli_end_chat", { chatId: id }).catch(() => {});
@@ -338,8 +338,19 @@ export async function loadMessages(conversationId: string): Promise<StoredMessag
   if (!db) {
     return memory.messages.filter((m) => m.conversation_id === conversationId);
   }
-  // duration_ms/images arrived in migration 7, segments in 9; fall back
-  // stepwise on older schemas instead of failing the chat.
+  // duration_ms/images arrived in migration 7, segments in 9, model in 20;
+  // fall back stepwise on older schemas instead of failing the chat.
+  try {
+    return await db.select<StoredMessage[]>(
+      `SELECT conversation_id, role, text, created_at, duration_ms, images, segments, model
+         FROM messages
+        WHERE conversation_id = $1
+        ORDER BY created_at, rowid`,
+      [conversationId]
+    );
+  } catch {
+    /* before migration 20 */
+  }
   try {
     return await db.select<StoredMessage[]>(
       `SELECT conversation_id, role, text, created_at, duration_ms, images, segments
@@ -381,6 +392,8 @@ export interface MessageMeta {
    * after a restart, panel tabs included.
    */
   segmentsJson?: string;
+  /** Agent turns: the model that wrote it, "<provider kind>:<model id>". */
+  by?: string;
 }
 
 /**
@@ -434,6 +447,7 @@ export async function appendMessage(
     duration_ms: meta.durationMs ?? 0,
     images: imagesJson,
     segments: segmentsJson,
+    model: meta.by,
   };
   if (!db) {
     memory.messages.push(row);
@@ -442,6 +456,25 @@ export async function appendMessage(
       if (c) c.updatedAt = now;
     }
     return;
+  }
+  try {
+    await db.execute(
+      `INSERT INTO messages (id, conversation_id, role, text, duration_ms, images, segments, model)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        memId(),
+        conversationId,
+        role,
+        text,
+        meta.durationMs ?? 0,
+        imagesJson,
+        segmentsJson,
+        meta.by ?? "",
+      ]
+    );
+    return;
+  } catch {
+    /* before migration 20 */
   }
   try {
     await db.execute(
@@ -511,6 +544,24 @@ interface ModelRow {
   enabled: number;
 }
 
+/**
+ * Provider API keys are kept vault-encrypted in the database (vault.rs,
+ * "enc:v1:…"); the app works with them in the clear. Plaintext rows from
+ * before are read as is and encrypted on their next save.
+ */
+const VAULT_MARK = "enc:v1:";
+
+async function openSecrets(values: string[]): Promise<string[]> {
+  if (!inTauri || !values.some((v) => v.startsWith(VAULT_MARK))) return values;
+  return invoke<string[]>("vault_open", { values });
+}
+
+async function sealSecret(value: string): Promise<string> {
+  if (!inTauri || !value || value.startsWith(VAULT_MARK)) return value;
+  const [sealed] = await invoke<string[]>("vault_seal", { values: [value] });
+  return sealed ?? value;
+}
+
 export async function loadProviders(): Promise<Provider[]> {
   const db = await getDb();
   if (!db) return memory.providers;
@@ -519,12 +570,13 @@ export async function loadProviders(): Promise<Provider[]> {
             rate_limit_rpm, concurrency
        FROM providers ORDER BY name`
   );
-  return rows.map((r) => ({
+  const keys = await openSecrets(rows.map((r) => r.api_key ?? ""));
+  return rows.map((r, i) => ({
     id: r.id,
     name: r.name,
     kind: r.kind as ProviderKind,
     base_url: r.base_url,
-    api_key: r.api_key,
+    api_key: keys[i] ?? "",
     enabled: r.enabled === 1,
     status: r.status as ProviderStatus,
     last_sync: r.last_sync,
@@ -577,7 +629,7 @@ export async function upsertProvider(p: Provider): Promise<void> {
       p.name,
       p.kind,
       p.base_url,
-      p.api_key,
+      await sealSecret(p.api_key),
       p.enabled ? 1 : 0,
       p.status,
       p.auth,
@@ -1038,6 +1090,10 @@ export interface ChatTurn {
   /** Agent turns: the read / search / command outputs themselves. The
    *  backend keeps them for the latest turn only (see trim_history). */
   work_detail?: string;
+  /** Agent turns: who wrote it, "<provider kind>:<model id>". */
+  by?: string;
+  /** Agent turns: files it created or changed. */
+  changed?: string[];
 }
 
 /** An image attachment, carried as a data URL and converted per protocol. */
@@ -1187,11 +1243,6 @@ export interface AgentRequest {
   auto_run?: boolean;
   /** Images attached to the final user turn. */
   images?: ImageAttachment[];
-  /**
-   * Saved SSH units the agent may use through the ssh_exec tool. Name + host
-   * only — credentials stay in the database and are resolved server-side.
-   */
-  ssh_units?: { id: string; name: string; host: string }[];
   /** Built-in tools switched off in Settings → Plugins. */
   disabled_tools?: string[];
   /** Where generate_image draws; absent = no picture generation this run. */
@@ -1667,390 +1718,6 @@ export async function setWorkspace(path: string): Promise<string> {
   return await invoke<string>("set_agent_workspace", { path });
 }
 
-/* ---------- SSH Client mode ----------
-   Servers / keys / scripts are managed through Rust commands (ssh.rs):
-   secrets are AES-256-GCM encrypted at rest (vault.rs, master key in the
-   OS credential store) and listings come back with secrets blanked — the
-   webview never sees stored credentials after a save. Only the audit log
-   (no secrets) is read directly through the SQL plugin. */
-
-/* Rust serde payloads are camelCase; map to/from the TS snake_case shape. */
-interface RustServer {
-  id: string;
-  name: string;
-  host: string;
-  port: number;
-  username: string;
-  auth: string;
-  password?: string;
-  privateKey?: string;
-  keyId?: string;
-  hostKey?: string;
-  hasPassword?: boolean;
-  os?: string;
-  proxyId?: string;
-}
-
-function toServer(r: RustServer): SshServer {
-  return {
-    id: r.id,
-    name: r.name,
-    host: r.host,
-    port: r.port || 22,
-    username: r.username || "root",
-    auth: r.auth === "key" || r.auth === "cred" ? r.auth : "password",
-    password: r.password ?? "",
-    private_key: r.privateKey ?? "",
-    key_id: r.keyId ?? "",
-    host_key: r.hostKey ?? "",
-    has_password: !!r.hasPassword,
-    os: r.os ?? "",
-    proxy_id: r.proxyId ?? "",
-  };
-}
-
-function toRustServer(s: SshServer): RustServer {
-  return {
-    id: s.id ?? "",
-    name: s.name,
-    host: s.host,
-    port: s.port || 22,
-    username: s.username || "root",
-    auth: s.auth,
-    password: s.password ?? "",
-    privateKey: s.private_key ?? "",
-    keyId: s.key_id ?? "",
-    hostKey: s.host_key ?? "",
-    proxyId: s.proxy_id ?? "",
-  };
-}
-
-interface RustKey {
-  id: string;
-  name: string;
-  privateKey?: string;
-  passphrase?: string;
-  hasKey?: boolean;
-  fingerprint?: string;
-  comment?: string;
-  publicKey?: string;
-}
-
-function toKey(r: RustKey): SshKey {
-  return {
-    id: r.id,
-    name: r.name,
-    private_key: r.privateKey ?? "",
-    passphrase: r.passphrase ?? "",
-    has_key: !!r.hasKey,
-    fingerprint: r.fingerprint ?? "",
-    comment: r.comment ?? "",
-    public_key: r.publicKey ?? "",
-  };
-}
-
-function toRustKey(k: SshKey): RustKey {
-  return {
-    id: k.id ?? "",
-    name: k.name,
-    privateKey: k.private_key ?? "",
-    passphrase: k.passphrase ?? "",
-    hasKey: k.has_key,
-    fingerprint: k.fingerprint ?? "",
-  };
-}
-
-async function sshInvoke<T>(cmd: string, args: Record<string, unknown> = {}): Promise<T> {
-  if (!inTauri) throw new Error("SSH needs the desktop shell (npm run tauri:dev)");
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<T>(cmd, args);
-}
-
-/* ---------- Units ---------- */
-
-/** All saved SSH units, newest first (secrets blanked). */
-export async function loadSshServers(): Promise<SshServer[]> {
-  if (!inTauri) return [...memory.sshServers];
-  const rows = await sshInvoke<RustServer[]>("ssh_list_servers");
-  return rows.map(toServer);
-}
-
-/** Inserts or updates a unit. Blank password/key keeps the stored secret. */
-export async function saveSshServer(server: SshServer): Promise<string> {
-  if (!inTauri) {
-    const id = server.id || memId() + "-srv";
-    memory.sshServers = [{ ...server, id }, ...memory.sshServers.filter((s) => s.id !== id)];
-    return id;
-  }
-  return sshInvoke<string>("ssh_save_server", { server: toRustServer(server) });
-}
-
-/** Decrypts a server's stored password (the edit form's "show"); every reveal is audit-logged. */
-export async function sshRevealPassword(serverId: string): Promise<string> {
-  if (!inTauri) return memory.sshServers.find((s) => s.id === serverId)?.password ?? "";
-  return sshInvoke<string>("ssh_reveal_password", { serverId });
-}
-
-/** Persists the dragged order of a units list (ids top to bottom). */
-export async function reorderSshUnits(kind: "server" | "key" | "script" | "proxy", ids: string[]): Promise<void> {
-  if (!inTauri) {
-    const sortBy = <T extends { id: string }>(list: T[]): T[] => {
-      const byId = new Map(list.map((x) => [x.id, x]));
-      return ids.map((id) => byId.get(id)).filter((x): x is T => !!x);
-    };
-    if (kind === "server") memory.sshServers = sortBy(memory.sshServers);
-    else if (kind === "key") memory.sshKeys = sortBy(memory.sshKeys);
-    else if (kind === "proxy") memory.sshProxies = sortBy(memory.sshProxies);
-    else memory.sshScripts = sortBy(memory.sshScripts);
-    return;
-  }
-  await sshInvoke("ssh_reorder_units", { kind, ids });
-}
-
-/** Deletes a unit (disconnects it first; its logs stay). */
-export async function deleteSshServer(id: string): Promise<void> {
-  if (!inTauri) {
-    memory.sshServers = memory.sshServers.filter((s) => s.id !== id);
-    return;
-  }
-  await sshInvoke("ssh_delete_server", { serverId: id });
-}
-
-/* ---------- Key credentials ---------- */
-
-export async function loadSshKeys(): Promise<SshKey[]> {
-  if (!inTauri) return [...memory.sshKeys];
-  const rows = await sshInvoke<RustKey[]>("ssh_list_keys");
-  return rows.map(toKey);
-}
-
-export async function saveSshKey(key: SshKey): Promise<string> {
-  if (!inTauri) {
-    const id = key.id || memId() + "-key";
-    memory.sshKeys = [{ ...key, id }, ...memory.sshKeys.filter((k) => k.id !== id)];
-    return id;
-  }
-  return sshInvoke<string>("ssh_save_key", { key: toRustKey(key) });
-}
-
-/**
- * FULL view of one credential — private key and passphrase decrypted.
- * Called ONLY when the credential's edit form opens; listings stay blank.
- */
-export async function getSshKey(id: string): Promise<SshKey> {
-  if (!inTauri) {
-    return memory.sshKeys.find((k) => k.id === id) ?? {
-      id,
-      name: "",
-      private_key: "",
-      passphrase: "",
-      has_key: false,
-      fingerprint: "",
-      comment: "",
-      public_key: "",
-    };
-  }
-  const r = await sshInvoke<RustKey>("ssh_get_key", { keyId: id });
-  return toKey(r);
-}
-
-/**
- * Derives (publicKey, fingerprint) from a pasted private key body without
- * saving anything — the import form previews the public half live.
- */
-export async function deriveSshPublicKey(
-  privateKey: string,
-  passphrase: string
-): Promise<{ publicKey: string; fingerprint: string }> {
-  if (!inTauri) return { publicKey: "", fingerprint: "" };
-  const [publicKey, fingerprint] = await sshInvoke<[string, string]>("ssh_derive_public", {
-    privateKey,
-    passphrase,
-  });
-  return { publicKey, fingerprint };
-}
-
-export async function deleteSshKey(id: string): Promise<void> {
-  if (!inTauri) {
-    memory.sshKeys = memory.sshKeys.filter((k) => k.id !== id);
-    return;
-  }
-  await sshInvoke("ssh_delete_key", { keyId: id });
-}
-
-/**
- * Generates a new keypair credential in Rust and stores it vault-encrypted.
- * The returned row carries only public data (fingerprint, public key,
- * comment "Generated By Singularity"). Outside Tauri there is no crypto, so
- * a placeholder row is produced to keep the UI flow testable.
- */
-export async function generateSshKey(
-  name: string,
-  algorithm: string,
-  passphrase: string
-): Promise<SshKey> {
-  if (!inTauri) {
-    const id = memId() + "-key";
-    const row: SshKey = {
-      id,
-      name: name || algorithm.toUpperCase(),
-      private_key: "",
-      passphrase: "",
-      has_key: true,
-      fingerprint: "SHA256:placeholder",
-      comment: "Generated By Singularity",
-      public_key: "",
-    };
-    memory.sshKeys = [row, ...memory.sshKeys];
-    return row;
-  }
-  const r = await sshInvoke<RustKey>("ssh_generate_key", { name, algorithm, passphrase });
-  return toKey(r);
-}
-
-/* ---------- Proxies ---------- */
-
-interface RustProxy {
-  id: string;
-  name: string;
-  kind: string;
-  host: string;
-  port: number;
-  username: string;
-  password?: string;
-  hasPassword?: boolean;
-}
-
-/** Saved proxies, in the user's order (passwords never included). */
-export async function loadSshProxies(): Promise<SshProxy[]> {
-  if (!inTauri) return [...memory.sshProxies];
-  const rows = await sshInvoke<RustProxy[]>("ssh_list_proxies");
-  return rows.map((r) => ({
-    id: r.id,
-    name: r.name,
-    kind: r.kind === "socks5" ? "socks5" : "http",
-    host: r.host,
-    port: r.port,
-    username: r.username ?? "",
-    password: "",
-    has_password: !!r.hasPassword,
-  }));
-}
-
-/** Inserts or updates a proxy. Blank password keeps the stored one; "-" clears it. */
-export async function saveSshProxy(proxy: SshProxy): Promise<string> {
-  if (!inTauri) {
-    const id = proxy.id || memId() + "-prx";
-    const row = { ...proxy, id, has_password: proxy.password ? proxy.password !== "-" : proxy.has_password, password: "" };
-    memory.sshProxies = [row, ...memory.sshProxies.filter((p) => p.id !== id)];
-    return id;
-  }
-  return sshInvoke<string>("ssh_save_proxy", {
-    proxy: {
-      id: proxy.id,
-      name: proxy.name,
-      kind: proxy.kind,
-      host: proxy.host,
-      port: proxy.port,
-      username: proxy.username,
-      password: proxy.password,
-    },
-  });
-}
-
-/** Deletes a proxy; servers that used it connect directly again. */
-export async function deleteSshProxy(id: string): Promise<void> {
-  if (!inTauri) {
-    memory.sshProxies = memory.sshProxies.filter((p) => p.id !== id);
-    memory.sshServers = memory.sshServers.map((s) => (s.proxy_id === id ? { ...s, proxy_id: "" } : s));
-    return;
-  }
-  await sshInvoke("ssh_delete_proxy", { proxyId: id });
-}
-
-/* ---------- Scripts ---------- */
-
-export async function loadSshScripts(): Promise<SshScript[]> {
-  if (!inTauri) return [...memory.sshScripts];
-  return sshInvoke<SshScript[]>("ssh_list_scripts");
-}
-
-export async function saveSshScript(script: SshScript): Promise<string> {
-  if (!inTauri) {
-    const id = script.id || memId() + "-scr";
-    memory.sshScripts = [{ ...script, id }, ...memory.sshScripts.filter((s) => s.id !== id)];
-    return id;
-  }
-  return sshInvoke<string>("ssh_save_script", { script });
-}
-
-export async function deleteSshScript(id: string): Promise<void> {
-  if (!inTauri) {
-    memory.sshScripts = memory.sshScripts.filter((s) => s.id !== id);
-    return;
-  }
-  await sshInvoke("ssh_delete_script", { scriptId: id });
-}
-
-/** Runs a saved script on a server; returns combined output. */
-
-/* ---------- Audit log (no secrets — read via SQL plugin) ---------- */
-
-interface SshLogRow {
-  id: string;
-  actor: string;
-  server_id: string;
-  server_name: string;
-  host: string;
-  action: string;
-  ok: number;
-  detail: string;
-  created_at: number;
-}
-
-/** The audit trail, newest first, capped for the Logs page. */
-export async function loadSshLogs(limit = 300): Promise<SshLog[]> {
-  const db = await getDb();
-  if (!db) return [...memory.sshLogs];
-  const rows = await db.select<SshLogRow[]>(
-    "SELECT id, actor, server_id, server_name, host, action, ok, detail, created_at FROM ssh_logs ORDER BY created_at DESC, id DESC LIMIT $1",
-    [limit],
-  );
-  return rows.map((r) => ({ ...r, ok: !!r.ok }));
-}
-
-/** Window event fired after the audit log was cleared (Logs page reloads). */
-export const SSH_LOGS_CLEARED = "ssh-logs-cleared";
-
-/** Deletes the whole SSH audit trail (Settings → Logs, SSH Client mode). */
-export async function clearSshLogs(): Promise<void> {
-  const db = await getDb();
-  if (!db) memory.sshLogs = [];
-  else await db.execute("DELETE FROM ssh_logs");
-  window.dispatchEvent(new Event(SSH_LOGS_CLEARED));
-}
-
-/** Number of rows in the audit trail. */
-export async function countSshLogs(): Promise<number> {
-  const db = await getDb();
-  if (!db) return memory.sshLogs.length;
-  const rows = await db.select<{ n: number }[]>("SELECT COUNT(*) AS n FROM ssh_logs");
-  return rows[0]?.n ?? 0;
-}
-
-/* ---------- Live connections (Rust owns the pool) ---------- */
-
-/** Connects to a saved unit (idempotent — a live session is reused). */
-export async function sshConnect(serverId: string): Promise<void> {
-  await sshInvoke("ssh_connect", { serverId });
-}
-
-/** Server ids with a live connection right now. */
-export async function sshConnected(): Promise<string[]> {
-  if (!inTauri) return [];
-  return sshInvoke<string[]>("ssh_connected");
-}
-
 /* ---------- Context gauge + prices ---------- */
 
 /** One category of what the next agent request carries (estimated tokens). */
@@ -2145,206 +1812,6 @@ export async function bgStop(id: number): Promise<void> {
 /** Forgets a finished task (and deletes its log). */
 export async function bgRemove(id: number): Promise<void> {
   await bgInvoke("bg_remove", { id });
-}
-
-/* ---------- Interactive terminal (PTY) ---------- */
-
-/**
- * Opens an interactive PTY shell sized cols×rows. Measure the terminal box
- * FIRST — that size is negotiated with the remote sshd, so a small value
- * here means a small remote console (wrong line wrapping).
- * Returns the session id; output arrives on `ssh://shell-data`.
- */
-export async function sshShellOpen(
-  serverId: string,
-  cols: number,
-  rows: number,
-  term?: string,
-): Promise<string> {
-  return sshInvoke<string>("ssh_shell_open", { serverId, cols, rows, term: term ?? null });
-}
-
-/** Feeds typed bytes to the PTY. Accepts a string or raw bytes. */
-export async function sshShellInput(sessionId: string, data: string | Uint8Array): Promise<void> {
-  const b64 =
-    typeof data === "string"
-      ? base64FromBytes(new TextEncoder().encode(data))
-      : base64FromBytes(data);
-  await sshInvoke("ssh_shell_input", { sessionId, data: b64 });
-}
-
-/** Tells the remote PTY the terminal box changed size. */
-export async function sshShellResize(sessionId: string, cols: number, rows: number): Promise<void> {
-  await sshInvoke("ssh_shell_resize", { sessionId, cols, rows });
-}
-
-/** Base64 of recent output (ring buffer) — restores a reopened terminal. */
-export async function sshShellSnapshot(sessionId: string): Promise<Uint8Array> {
-  const b64 = await sshInvoke<string>("ssh_shell_snapshot", { sessionId });
-  return bytesFromBase64(b64);
-}
-
-/** Closes a shell session (idempotent). */
-export async function sshShellClose(sessionId: string): Promise<void> {
-  await sshInvoke("ssh_shell_close", { sessionId });
-}
-
-/** Live shells as [sessionId, serverId] pairs — attach instead of reopening. */
-export async function sshShellList(): Promise<[string, string][]> {
-  if (!inTauri) return [];
-  return sshInvoke<[string, string][]>("ssh_shell_list");
-}
-
-/* ---------- base64 helpers (binary-safe IPC) ---------- */
-
-function base64FromBytes(bytes: Uint8Array): string {
-  let s = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    s += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(s);
-}
-
-function bytesFromBase64(b64: string): Uint8Array {
-  const s = atob(b64);
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-  return out;
-}
-
-/** Decodes a base64 event payload to bytes (shell output is binary-safe). */
-export function decodeB64(b64: string): Uint8Array {
-  return bytesFromBase64(b64);
-}
-
-/* ---------- SFTP file transfer ---------- */
-
-/** Lists a remote directory (dirs first, then name). Empty path = cwd. */
-export async function sftpList(serverId: string, path: string): Promise<SftpEntry[]> {
-  return sshInvoke<SftpEntry[]>("ssh_sftp_list", { serverId, path });
-}
-
-/** Resolves the remote home directory (where the session starts). */
-export async function sftpHome(serverId: string): Promise<string> {
-  return sshInvoke<string>("ssh_sftp_home", { serverId });
-}
-
-/** Downloads a remote file to a local path; returns bytes written. */
-export async function sftpDownload(
-  serverId: string,
-  remote: string,
-  local: string,
-): Promise<number> {
-  return sshInvoke<number>("ssh_sftp_download", { serverId, remote, local });
-}
-
-/** Uploads a local file to a remote path; returns bytes written. */
-export async function sftpUpload(
-  serverId: string,
-  local: string,
-  remote: string,
-): Promise<number> {
-  return sshInvoke<number>("ssh_sftp_upload", { serverId, local, remote });
-}
-
-/** Reads a small text file for the preview pane (capped at 2 MB). */
-export async function sftpReadText(serverId: string, remote: string): Promise<string> {
-  return sshInvoke<string>("ssh_sftp_read_text", { serverId, remote });
-}
-
-/** Saves text edited in the SFTP editor back to the server. */
-export async function sftpWriteText(serverId: string, remote: string, content: string): Promise<void> {
-  await sshInvoke("ssh_sftp_write_text", { serverId, remote, content });
-}
-
-/** Chunk size of drag-and-drop uploads (bytes go over IPC as a raw body). */
-const UPLOAD_CHUNK = 4 * 1024 * 1024;
-
-/**
- * Uploads an in-memory file (e.g. dropped onto the SFTP page — the webview
- * sees its bytes, not a local path) in chunks; progress arrives as
- * ssh://transfer events like any other upload.
- */
-export async function sftpUploadBlob(serverId: string, remote: string, blob: Blob): Promise<void> {
-  if (!inTauri) throw new Error("SSH needs the desktop shell (npm run tauri:dev)");
-  const { invoke } = await import("@tauri-apps/api/core");
-  const total = blob.size;
-  let offset = 0;
-  do {
-    const part = new Uint8Array(await blob.slice(offset, offset + UPLOAD_CHUNK).arrayBuffer());
-    await invoke("ssh_sftp_write_chunk", part, {
-      headers: {
-        "x-server-id": serverId,
-        "x-remote": encodeURIComponent(remote),
-        "x-offset": String(offset),
-        "x-total": String(total),
-      },
-    });
-    offset += part.length;
-  } while (offset < total);
-}
-
-export async function sftpRename(serverId: string, oldPath: string, newPath: string): Promise<void> {
-  await sshInvoke("ssh_sftp_rename", { serverId, old: oldPath, new: newPath });
-}
-
-export async function sftpRemove(serverId: string, path: string, isDir: boolean): Promise<void> {
-  await sshInvoke("ssh_sftp_remove", { serverId, path, isDir });
-}
-
-export async function sftpMkdir(serverId: string, path: string): Promise<void> {
-  await sshInvoke("ssh_sftp_mkdir", { serverId, path });
-}
-
-/** True when the vault master key is persisted (OS keyring or app-data file). */
-export async function sshVaultBacked(): Promise<boolean> {
-  if (!inTauri) return false;
-  return sshInvoke<boolean>("ssh_vault_status");
-}
-
-/** Transfer progress: {serverId, file, done, total, finished}. */
-export interface SshTransferProgress {
-  serverId: string;
-  file: string;
-  done: number;
-  total: number;
-  finished: boolean;
-}
-
-/**
- * Subscribes to live SSH events. Returns a disposer.
- *
- * * onStatus   — connected-server ids changed (`ssh://status`);
- * * onLogged   — a new audit row was written (`ssh://logged`);
- * * onShellData— PTY output, base64 (`ssh://shell-data`);
- * * onShellExit— a shell ended (`ssh://shell-exit`);
- * * onTransfer — SFTP progress (`ssh://transfer`);
- * * onOs       — a server's OS was detected (`ssh://os`), [serverId, token].
- */
-export async function onSshEvent(handlers: {
-  onStatus?: (connectedIds: string[]) => void;
-  onLogged?: () => void;
-  onShellData?: (payload: { sessionId: string; data: string }) => void;
-  onShellExit?: (payload: { sessionId: string; code: number | null }) => void;
-  onTransfer?: (progress: SshTransferProgress) => void;
-  onOs?: (payload: [string, string]) => void;
-}): Promise<() => void> {
-  if (!inTauri) return () => {};
-  const { listen } = await import("@tauri-apps/api/event");
-  const offs = await Promise.all([
-    listen<string[]>("ssh://status", (e) => handlers.onStatus?.(e.payload)),
-    listen("ssh://logged", () => handlers.onLogged?.()),
-    listen<{ sessionId: string; data: string }>("ssh://shell-data", (e) =>
-      handlers.onShellData?.(e.payload),
-    ),
-    listen<{ sessionId: string; code: number | null }>("ssh://shell-exit", (e) =>
-      handlers.onShellExit?.(e.payload),
-    ),
-    listen<SshTransferProgress>("ssh://transfer", (e) => handlers.onTransfer?.(e.payload)),
-    listen<[string, string]>("ssh://os", (e) => handlers.onOs?.(e.payload)),
-  ]);
-  return () => offs.forEach((off) => off());
 }
 
 /* ---------- Self-update (GitHub Releases) ---------- */

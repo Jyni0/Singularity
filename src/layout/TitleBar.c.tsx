@@ -6,13 +6,10 @@ import { inTauri } from "../utils/env.u";
 import { shortcutKey } from "../utils/keys.u";
 import { UpdateButton, requestUpdateCheck } from "./UpdateButton.c";
 
-type AppMode = "agent" | "ssh";
-
 interface MenuItem {
   label: string;
   /** Shown on the right; the same combo is bound globally below. */
   shortcut?: string;
-  checked?: boolean;
   run: () => void;
 }
 type MenuEntry = MenuItem | "separator";
@@ -23,8 +20,6 @@ const RELEASES_URL = "https://github.com/Jyni0/Singularity/releases";
 const inTerminal = (t: EventTarget | null) => t instanceof Element && !!t.closest(".xterm");
 
 export function TitleBar({
-  mode,
-  onSetMode,
   onNewConversation,
   onNewProject,
   onOpenFolder,
@@ -32,9 +27,6 @@ export function TitleBar({
   onToggleSidebar,
   sidebarHidden,
 }: {
-  /** Current app mode — the Mode menu marks the active entry with a check. */
-  mode: AppMode;
-  onSetMode: (mode: AppMode) => void;
   onNewConversation: () => void;
   onNewProject: () => void;
   /** Pick a folder and start a chat in the project for it. */
@@ -111,10 +103,6 @@ export function TitleBar({
       "separator",
       { label: "Close Window", run: close },
       { label: "Quit Singularity", shortcut: "Ctrl+Q", run: () => void quit() },
-    ],
-    Mode: [
-      { label: "Agent", shortcut: "Ctrl+1", checked: mode === "agent", run: () => onSetMode("agent") },
-      { label: "SSH Client", shortcut: "Ctrl+2", checked: mode === "ssh", run: () => onSetMode("ssh") },
     ],
     View: [
       { label: sidebarHidden ? "Show Sidebar" : "Hide Sidebar", shortcut: "Ctrl+B", run: onToggleSidebar },
@@ -208,14 +196,6 @@ export function TitleBar({
                         className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-[var(--text-main)] transition-colors hover:bg-[var(--hover-bg)]"
                         onClick={() => runItem(item)}
                       >
-                        {m === "Mode" && (
-                          <span
-                            className="w-3 shrink-0 text-center text-[var(--accent)]"
-                            style={{ opacity: item.checked ? 1 : 0 }}
-                          >
-                            ✓
-                          </span>
-                        )}
                         <span className="flex-1">{item.label}</span>
                         {item.shortcut && (
                           <span className="pl-4 text-[11px] text-[var(--text-dim)]">{item.shortcut}</span>

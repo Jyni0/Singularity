@@ -317,6 +317,64 @@ fn only_extension_missing(p: &Path) -> Option<PathBuf> {
     hits.next().is_none().then(|| first.path())
 }
 
+/// For a NEW file under a folder that does not exist: the existing file the
+/// path most likely meant — the same path with the missing folder's name
+/// corrected to an almost identical sibling (`src/layuot/Nav.tsx` →
+/// `src/layout/Nav.tsx`). None when the folder is simply new: a same-named
+/// file somewhere else (`index.html`) says nothing.
+fn mistyped_folder(full: &Path) -> Option<PathBuf> {
+    let mut missing = full.parent()?;
+    if missing.exists() {
+        return None;
+    }
+    while !missing.parent()?.exists() {
+        missing = missing.parent()?;
+    }
+    let rest = full.strip_prefix(missing).ok()?;
+    let name = missing.file_name()?.to_string_lossy().to_lowercase();
+    std::fs::read_dir(missing.parent()?)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| typo_of(&e.file_name().to_string_lossy().to_lowercase(), &name))
+        .map(|e| e.path().join(rest))
+        .find(|p| p.is_file())
+}
+
+/// `p` relative to the workspace (`/`-separated) when it is inside it.
+fn rel_to(root: &Path, p: &Path) -> String {
+    p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/")
+}
+
+/// `a` and `b` differ by a typo: 1 edit (2 for names of 6+ chars), a swap
+/// of neighbours counting as one.
+fn typo_of(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let max = if a.len().min(b.len()) >= 6 { 2 } else { 1 };
+    if a == b || a.len().abs_diff(b.len()) > max {
+        return false;
+    }
+    // Optimal string alignment distance.
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for j in 0..=b.len() {
+        d[0][j] = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                v = v.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = v;
+        }
+    }
+    d[a.len()][b.len()] <= max
+}
+
 /// Lower-cased (on Windows), `/`-separated, `.`/`..`-folded form of a path,
 /// for comparing paths that may not exist.
 fn lexical(p: &Path) -> String {
@@ -1096,14 +1154,13 @@ pub fn apply_patch(root: &Path, path: &str, diff: &str, create: bool) -> ToolRes
                 not_found(root, path)
             ));
         }
-        // A same-named file elsewhere + a folder that does not exist yet is
-        // almost always a wrong guess at an existing file's path.
-        let parent_missing = full.parent().is_some_and(|p| !p.exists());
-        let hint = not_found(root, path);
-        if parent_missing && hint.contains("Did you mean") {
+        // A folder name one typo away from a folder that has this file is a
+        // wrong guess at the existing file's path.
+        if let Some(meant) = mistyped_folder(&full) {
             return ToolResult::err(format!(
-                "refusing to create {path}: its folder does not exist and a file with the same name is already in the workspace.\n{hint}\n\
-                 Edit the existing file instead, or create the folder first with file_op mkdir if a new file is really intended."
+                "refusing to create {path}: its folder does not exist, but {} does — a typo in the folder name? \
+                 Edit that file instead, or create the folder first with file_op mkdir if a new file is really intended.",
+                rel_to(root, &meant)
             ));
         }
         if let Some(parent) = full.parent() {
@@ -2547,24 +2604,23 @@ pub fn dispatch(root: &Path, name: &str, args: &serde_json::Value) -> ToolResult
             args.get("start_line").and_then(|v| v.as_u64()).map(|v| v as usize),
             args.get("end_line").and_then(|v| v.as_u64()).map(|v| v as usize),
         ),
-        // Writes or creates a file (like Claude Code's Write / Goose's
-        // text_editor write). The one refusal: a new file in a folder that
-        // does not exist while a same-named file is elsewhere — that is a
-        // wrong guess at an existing file's path, not a new file.
+        // Writes or creates a file, its folders included (like Claude Code's
+        // Write / Goose's text_editor write). The one refusal: a folder
+        // name one typo away from a folder that has this very file — a
+        // wrong guess at an existing file's path, not a new file. (A
+        // same-named file ELSEWHERE — index.html — says nothing: refusing
+        // then threw away a whole file the model had just written.)
         "write_file" => match resolve(root, s("path")) {
             Ok(full) if full.is_dir() => ToolResult::err(format!("{} is a directory", s("path"))),
-            Ok(full) if !full.exists() && full.parent().is_some_and(|p| !p.exists()) => {
-                let hint = not_found(root, s("path"));
-                if hint.contains("Did you mean") {
-                    ToolResult::err(format!(
-                        "refusing to create {}: its folder does not exist and a file with the same name is already in the workspace.\n{hint}\n\
-                         Write to the existing file instead, or create the folder first with file_op mkdir if a new file is really intended.",
-                        s("path")
-                    ))
-                } else {
-                    write_file(root, s("path"), s("content"))
-                }
-            }
+            Ok(full) if !full.exists() => match mistyped_folder(&full) {
+                Some(meant) => ToolResult::err(format!(
+                    "refusing to create {}: its folder does not exist, but {} does — a typo in the folder name? \
+                     Write to that file instead, or create the folder first with file_op mkdir if a new file is really intended.",
+                    s("path"),
+                    rel_to(root, &meant)
+                )),
+                None => write_file(root, s("path"), s("content")),
+            },
             Ok(_) => write_file(root, s("path"), s("content")),
             Err(e) => ToolResult::err(e),
         },
@@ -3011,9 +3067,14 @@ x
         assert!(w("src/layout/AppLayout.tsx").ok);
         assert!(w("src/pages/Home.tsx").ok);
         assert_eq!(std::fs::read_to_string(dir.join("src/pages/Home.tsx")).unwrap(), "new\n");
-        // A missing folder + the same name elsewhere = a mistyped path.
+        // A folder one typo away from the folder that has this file = a mistyped path.
         let res = w("src/layuot/Nav.tsx");
-        assert!(!res.ok && res.output.contains("refusing"), "{}", res.output);
+        assert!(!res.ok && res.output.contains("refusing") && res.output.contains("src/layout/Nav.tsx"), "{}", res.output);
+        // A brand-new folder for a common name that exists elsewhere is just new.
+        std::fs::write(dir.join("index.html"), "old").unwrap();
+        assert!(w("bmw-service/index.html").ok);
+        assert_eq!(std::fs::read_to_string(dir.join("bmw-service/index.html")).unwrap(), "new\n");
+        assert!(typo_of("layout", "layuot") && typo_of("src", "scr") && !typo_of("bmw-service", "src") && !typo_of("public", "pages"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3179,10 +3240,14 @@ x
         assert!(!res3.ok);
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\nTWO\nthree");
 
-        // A guessed path in a missing folder, same name as an existing file.
-        let guess = apply_patch(&dir, "nope/a.txt", create, true);
+        // A typo in a folder that has this file: refused.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/a.txt"), "x").unwrap();
+        let guess = apply_patch(&dir, "sbu/a.txt", create, true);
         assert!(!guess.ok && guess.output.contains("refusing"), "{}", guess.output);
-        assert!(!dir.join("nope").exists());
+        assert!(!dir.join("sbu").exists());
+        // A new folder is just new.
+        assert!(apply_patch(&dir, "fresh/a.txt", create, true).ok);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

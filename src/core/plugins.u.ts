@@ -2,7 +2,7 @@
  * Plugins: what the agent can do, in one place.
  *
  *  * Built-in plugins are groups of the agent's own tools (terminal, git,
- *    web, SSH) that can be switched off — the tools then leave the request
+ *    web, images) that can be switched off — the tools then leave the request
  *    (and stop costing context).
  *  * Add-ons (ready-made MCP servers) live in addons.u.ts.
  */
@@ -42,12 +42,6 @@ export const BUILTIN_PLUGINS: BuiltinPlugin[] = [
     title: "Web",
     description: "Search the internet and read pages as clean text — docs, changelogs, error messages.",
     tools: ["web_search", "web_fetch"],
-  },
-  {
-    id: "ssh",
-    title: "SSH servers",
-    description: "Run commands on the servers saved in the SSH client — deploys, logs, restarts.",
-    tools: ["ssh_exec"],
   },
   {
     id: "images",

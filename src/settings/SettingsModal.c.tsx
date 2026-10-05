@@ -10,12 +10,10 @@ import {
   Palette,
   Plug,
   Puzzle,
-  ScrollText,
   Settings as SettingsIcon,
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
-  SquareTerminal,
   Trash2,
   X,
   type LucideIcon,
@@ -25,9 +23,7 @@ import { APP_VERSION, NO_PROJECT, THEME_LIST } from "../core/types.i";
 import { ModelsSettings } from "./ModelsSettings.c";
 import { AgentsSettings } from "./AgentsSettings.c";
 import type * as db from "../core/db.r";
-import { TerminalSettings } from "./TerminalSettings.c";
 import { ProjectSelect, ProjectSettingsPanel } from "./ProjectSettings.c";
-import { LogsSettings } from "./LogsSettings.c";
 import { SkillsSettings } from "./SkillsSettings.c";
 import { GEN_ANIMATIONS, type GenAnimation } from "../components/effects/GenerationGlow.c";
 import { McpSettings } from "./McpSettings.c";
@@ -45,8 +41,6 @@ export type SettingsSection =
   | "skills"
   | "plugins"
   | "mcp"
-  | "terminal"
-  | "logs"
   | "about";
 
 export function SettingsModal({
@@ -75,7 +69,6 @@ export function SettingsModal({
   onMaxRetries,
   initialProject,
   initialSection,
-  mode = "agent",
   workspace = "",
   onClose,
 }: {
@@ -113,20 +106,10 @@ export function SettingsModal({
   initialProject?: string | null;
   /** Tab to land on — "Project Settings" opens it directly. */
   initialSection?: SettingsSection;
-  /**
-   * Which app mode opened the modal. The SAME modal serves both modes:
-   * General and About are always available; the agent sections (Models,
-   * Execution, Behavior, Projects…) show in agent mode, and SSH Client gets
-   * the Terminal section instead.
-   */
-  mode?: "agent" | "ssh";
   onClose: () => void;
 }) {
   const [section, setSection] = useState<SettingsSection>(initialSection ?? "general");
-  // A section that this mode does not offer (deep link / stale state) lands
-  // on General — General and About exist in EVERY mode.
-  const sshSections: SettingsSection[] = ["general", "appearance", "terminal", "logs", "about"];
-  const effectiveSection = mode === "ssh" && !sshSections.includes(section) ? "general" : section;
+  const effectiveSection = section;
   const [settingsProject, setSettingsProject] = useState<string | null>(initialProject ?? null);
   const [name, setName] = useState("");
   /** Inline delete confirmation in the Manage Projects list. */
@@ -145,9 +128,7 @@ export function SettingsModal({
     setName("");
   };
 
-  // Both modes share this modal. General, Appearance and About exist in
-  // every mode; the agent sections show in agent mode only, the SSH
-  // Terminal and Logs in SSH Client mode only. Grouped by what they touch.
+  // Sections grouped by what they touch; About is pinned to the bottom.
   type NavItem = { id: SettingsSection; label: string; icon: LucideIcon };
   type NavGroup = { group?: string; items: NavItem[] };
   const basics: NavGroup = {
@@ -156,9 +137,7 @@ export function SettingsModal({
       { id: "appearance", label: "Appearance", icon: Palette },
     ],
   };
-  const navItems: NavGroup[] =
-    mode === "agent"
-      ? [
+  const navItems: NavGroup[] = [
           basics,
           {
             group: "Agent",
@@ -181,16 +160,6 @@ export function SettingsModal({
             items: [
               { id: "projects", label: "Projects", icon: Folders },
               { id: "project-settings", label: "Project Settings", icon: FolderCog },
-            ],
-          },
-        ]
-      : [
-          basics,
-          {
-            group: "SSH",
-            items: [
-              { id: "terminal", label: "Terminal", icon: SquareTerminal },
-              { id: "logs", label: "Logs", icon: ScrollText },
             ],
           },
         ];
@@ -222,8 +191,6 @@ export function SettingsModal({
     permissions: ["Permissions", "What the agent may do without asking"],
     projects: ["Projects", "Create and organize project folders"],
     "project-settings": ["Project Settings", "Rename, permissions and delete for one project"],
-    terminal: ["Terminal", "Theme and behaviour of the SSH console"],
-    logs: ["Logs", "The SSH audit trail of connections and commands"],
     about: ["About", "Application information"],
   };
 
@@ -298,21 +265,17 @@ export function SettingsModal({
                   />
                 </div>
               </SettingRow>
-              {mode === "agent" && (
-                <>
-                  <Sep />
-                  <SettingRow title="Generation Animation" hint="What plays behind the chat while the model works">
-                    <Segmented
-                      options={GEN_ANIMATIONS.map((a) => a.label)}
-                      value={GEN_ANIMATIONS.find((a) => a.id === genAnimation)?.label ?? "Pixels"}
-                      onChange={(label) => {
-                        const next = GEN_ANIMATIONS.find((a) => a.label === label);
-                        if (next) onGenAnimation?.(next.id);
-                      }}
-                    />
-                  </SettingRow>
-                </>
-              )}
+              <Sep />
+              <SettingRow title="Generation Animation" hint="What plays behind the chat while the model works">
+                <Segmented
+                  options={GEN_ANIMATIONS.map((a) => a.label)}
+                  value={GEN_ANIMATIONS.find((a) => a.id === genAnimation)?.label ?? "Pixels"}
+                  onChange={(label) => {
+                    const next = GEN_ANIMATIONS.find((a) => a.label === label);
+                    if (next) onGenAnimation?.(next.id);
+                  }}
+                />
+              </SettingRow>
             </SettingsCard>
           )}
 
@@ -322,22 +285,17 @@ export function SettingsModal({
                 title="Background"
                 hint="Closing the window keeps the app in the system tray; agents finish their runs there"
               />
-              {/* Debug Mode is an agent-chat setting — agent mode only. */}
-              {mode === "agent" && (
-                <>
-                  <Sep />
-                  <SettingRow
-                    title="Debug Mode"
-                    hint="Live stats in chat: tokens/sec, token spend, cache rate, time"
-                  >
-                    <Switch
-                      on={debugMode}
-                      onChange={onDebugMode}
-                      ariaLabel="toggle debug mode"
-                    />
-                  </SettingRow>
-                </>
-              )}
+              <Sep />
+              <SettingRow
+                title="Debug Mode"
+                hint="Live stats in chat: tokens/sec, token spend, cache rate, time"
+              >
+                <Switch
+                  on={debugMode}
+                  onChange={onDebugMode}
+                  ariaLabel="toggle debug mode"
+                />
+              </SettingRow>
             </SettingsCard>
           )}
 
@@ -365,10 +323,6 @@ export function SettingsModal({
           {effectiveSection === "mcp" && <McpSettings />}
 
           {effectiveSection === "plugins" && <PluginsSettings />}
-
-          {effectiveSection === "terminal" && <TerminalSettings />}
-
-          {effectiveSection === "logs" && <LogsSettings />}
 
           {effectiveSection === "permissions" && (
             <SettingsCard>

@@ -18,7 +18,7 @@ pub(in crate::agent) struct BuiltinTool {
 }
 
 /// Every built-in tool this run offers (Settings → Plugins may switch some
-/// off; ssh_exec / generate_image only exist when configured).
+/// off; generate_image only exists when configured).
 pub(in crate::agent) fn builtin_tools(ctx: &RunCtx) -> Vec<BuiltinTool> {
     tool_specs(&ctx.req)
         .as_array()
@@ -48,10 +48,6 @@ impl AgentTool for BuiltinTool {
             let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
             let no_app = || ToolResult::err(format!("{name} is not available here"));
             match name.as_str() {
-                "ssh_exec" => match &c.app {
-                    Some(app) => crate::agent::run_ssh_tool(app, &c.req, &args).await,
-                    None => no_app(),
-                },
                 "web_search" => {
                     let max = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
                     crate::web::search(&get("query"), max).await

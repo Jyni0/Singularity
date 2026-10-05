@@ -9,8 +9,6 @@ use serde_json::{json, Value};
 /* ---------- Tool schema exposed to the model ---------- */
 
 /// Tool definitions in a neutral shape, converted per protocol when sent.
-/// The ssh_exec tool is appended only when the project has saved SSH units,
-/// so the model never sees a tool it cannot use.
 pub(in crate::agent) fn tool_specs(req: &AgentRequest) -> Value {
     let shell_names: Vec<&str> = if cfg!(windows) { vec!["bash", "powershell", "cmd"] } else { vec!["bash"] };
     let mut specs = json!([
@@ -184,35 +182,6 @@ pub(in crate::agent) fn tool_specs(req: &AgentRequest) -> Value {
             }
         }
     ]);
-    if !req.ssh_units.is_empty() {
-        let names: Vec<String> = req.ssh_units.iter().map(|u| u.name.clone()).collect();
-        let hint = req
-            .ssh_units
-            .iter()
-            .map(|u| format!("{} = {}", u.name, u.host))
-            .collect::<Vec<_>>()
-            .join(", ");
-        specs.as_array_mut().unwrap().push(json!({
-            "name": "ssh_exec",
-            "description": format!(
-                "Run a command on a remote server over SSH and return its output. \
-                 Available units (server → host): {hint}. Connections are pooled \
-                 and authenticated automatically from saved credentials."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "server": {
-                        "type": "string",
-                        "enum": names,
-                        "description": "Which saved SSH unit to run on."
-                    },
-                    "command": { "type": "string", "description": "Command line to execute on the remote server." }
-                },
-                "required": ["server", "command"]
-            }
-        }));
-    }
     if req.image_gen.is_some() {
         specs.as_array_mut().unwrap().push(json!({
             "name": "generate_image",
@@ -272,10 +241,6 @@ pub(in crate::agent) fn summarize(name: &str, args: &Value) -> String {
             let hunks = tools::parse_patch(get("diff")).len();
             format!("{} ({} hunks)", get("path"), hunks)
         }
-        // ssh_exec MUST be specific: with the path-only fallback every call
-        // looked identical ("ssh_exec()"), so two DIFFERENT remote commands
-        // tripped the repeat guard as "the same action".
-        "ssh_exec" => format!("{}: {}", get("server"), one_line(get("command"), 80)),
         "list_dir" | "change_dir" => get("path").to_string(),
         "find_files" => {
             if get("path").is_empty() {
@@ -328,7 +293,7 @@ pub(in crate::agent) fn live_summary(name: &str, args: &str) -> String {
         return summarize(name, &v);
     }
     let key = match name {
-        "run_command" | "ssh_exec" => "command",
+        "run_command" => "command",
         "grep" | "find_files" => "pattern",
         "web_search" => "query",
         "web_fetch" => "url",

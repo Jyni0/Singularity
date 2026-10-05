@@ -120,7 +120,23 @@ pub fn migrations() -> Vec<Migration> {
         proxy_migration(),
         scheduled_tasks_migration(),
         mcp_migration(),
+        message_model_migration(),
     ]
+}
+
+/// Version 20 — which model wrote an agent turn ("<provider kind>:<model id>").
+///
+/// A chat can switch models; each subscription CLI keeps its own session,
+/// and on its return it is told only what the OTHER models said meanwhile.
+fn message_model_migration() -> Migration {
+    Migration {
+        version: 20,
+        description: "message author model",
+        sql: "
+            ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT '';
+        ",
+        kind: MigrationKind::Up,
+    }
 }
 
 /// Version 19 — MCP servers the agent can use as extra tools.
@@ -562,4 +578,34 @@ pub fn db_path(app: &tauri::AppHandle) -> Result<String, String> {
         .map_err(|e| format!("no app data dir: {e}"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {dir:?}: {e}"))?;
     Ok(dir.join("singularity.db").to_string_lossy().to_string())
+}
+/// Cached sqlx pool on the same database file (cheap Arc clone) — for Rust
+/// code that needs rows without a frontend round-trip (MCP server secrets).
+/// A tokio Mutex instead of OnceCell so a failed connect is RETRIED on the
+/// next call rather than cached forever.
+static SQL: tokio::sync::Mutex<Option<sqlx::SqlitePool>> = tokio::sync::Mutex::const_new(None);
+
+pub(crate) async fn sql(app: &tauri::AppHandle) -> Option<sqlx::SqlitePool> {
+    let mut guard = SQL.lock().await;
+    if let Some(pool) = guard.as_ref() {
+        return Some(pool.clone());
+    }
+    let path = db_path(app).ok()?;
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(std::path::Path::new(&path))
+        .create_if_missing(false);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect_with(opts)
+        .await
+        .ok()?;
+    *guard = Some(pool.clone());
+    Some(pool)
+}
+
+/// Cheap unique id (prefix + nanos + jitter) — no uuid crate for one column.
+pub fn unique_id(prefix: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    format!("{prefix}-{:x}-{:x}", d.as_nanos(), d.subsec_nanos().wrapping_mul(2654435761))
 }

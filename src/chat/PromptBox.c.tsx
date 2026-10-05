@@ -71,6 +71,7 @@ export function PromptBox({
   onStop,
   pickedModel,
   onPickModel,
+  onPickEffort,
   workspace = "",
   onCommand,
   queued = [],
@@ -92,6 +93,9 @@ export function PromptBox({
   pickedModel?: { gatewayId: string; modelId: string; effort?: Effort } | null;
   /** Reports the model the user picked, so it can be persisted. */
   onPickModel?: (next: { gatewayId: string; modelId: string }) => void;
+  /** Reports the effort the user picked (with the model it is for) — the
+   *  open chat keeps it. */
+  onPickEffort?: (next: { gatewayId: string; modelId: string; effort: Effort }) => void;
   /** Folder the prompt's run works in — the @ menu lists its files. */
   workspace?: string;
   /** `/new`, `/skills`, `/mcp`, `/compact [focus]` — handled by the app;
@@ -459,6 +463,7 @@ export function PromptBox({
   const pickEffort = (next: Effort) => {
     setEffort(next);
     localStorage.setItem("effort", next);
+    if (gatewayId && modelId) onPickEffort?.({ gatewayId, modelId, effort: next });
   };
 
   const send = () => {

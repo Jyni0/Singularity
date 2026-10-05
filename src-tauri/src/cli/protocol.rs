@@ -182,6 +182,74 @@ pub fn render_followup(messages: &[Message], tools: bool) -> Option<String> {
     Some(if tools { format!("{text}\n\n{}", reminder()) } else { text })
 }
 
+/// One answer of another model in a catch-up, chars (its tail: the summary).
+const CATCHUP_ANSWER_CHARS: usize = 3_000;
+/// Its work log, chars.
+const CATCHUP_LOG_CHARS: usize = 3_000;
+
+/// What a session missed while the chat ran on other models: the chat
+/// messages after the ones it has read (its own answers left out), plus the
+/// files those models changed — its memory of them is stale. Empty when it
+/// missed nothing. Goes in front of the new prompt.
+pub fn render_catchup(missed: &[crate::chat::ChatTurn], own_kind: &str) -> String {
+    let own = format!("{own_kind}:");
+    let mut parts = Vec::new();
+    let mut changed: Vec<&str> = Vec::new();
+    for t in missed {
+        let agent = t.role == "agent" || t.role == "assistant";
+        if !agent {
+            parts.push(format!("<user>\n{}\n</user>", t.text.trim()));
+            continue;
+        }
+        if t.by.starts_with(&own) {
+            continue;
+        }
+        for f in &t.changed {
+            if !changed.contains(&f.as_str()) {
+                changed.push(f);
+            }
+        }
+        let who = t.by.split_once(':').map(|(_, m)| m).filter(|m| !m.is_empty()).unwrap_or("another model");
+        let mut body = clip_head(t.text.trim(), CATCHUP_ANSWER_CHARS);
+        if !t.work_log.trim().is_empty() {
+            body.push_str(&format!("\n[What it did]\n{}", clip_tail(t.work_log.trim(), CATCHUP_LOG_CHARS)));
+        }
+        parts.push(format!("<assistant model=\"{who}\">\n{body}\n</assistant>"));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "[Earlier in this chat, while you were not in it, I worked with another model. What was said and done since your last reply:]\n\n{}",
+        parts.join("\n\n")
+    );
+    if !changed.is_empty() {
+        out.push_str(&format!(
+            "\n\n[Files changed since you last saw them — what you remember of them is stale; read them again before editing: {}]",
+            changed.join(", ")
+        ));
+    }
+    out.push_str("\n\n---\n\n");
+    out
+}
+
+/// The last `n` chars of `s`, marked when cut.
+fn clip_head(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    if count <= n {
+        return s.to_string();
+    }
+    format!("[…] {}", s.chars().skip(count - n).collect::<String>())
+}
+
+/// The first `n` chars of `s`, marked when cut.
+fn clip_tail(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => format!("{}\n[…]", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
 /// The app's tools, described for a model that can only answer in text.
 fn tool_protocol(req: &CompletionRequest) -> String {
     // Worded as the user's own app, not as "tools": the CLIs' models are told
@@ -312,6 +380,14 @@ mod tests {
         // An assistant message cannot be "new" in a live session.
         assert!(render_followup(&[Message::assistant("x")], true).is_none());
         assert!(render_followup(&[], true).is_none());
+    }
+
+    #[test]
+    fn catchup_skips_own_turns_and_is_empty_when_nothing_missed() {
+        let t = |role: &str, text: &str, by: &str| crate::chat::ChatTurn { role: role.into(), text: text.into(), by: by.into(), ..Default::default() };
+        assert_eq!(render_catchup(&[t("agent", "mine", "google-cli:gemini")], "google-cli"), "");
+        let out = render_catchup(&[t("user", "q", ""), t("agent", "theirs", "anthropic-cli:opus")], "google-cli");
+        assert!(out.contains("<user>\nq\n</user>") && out.contains("model=\"opus\"") && out.ends_with("---\n\n"), "{out}");
     }
 
     #[test]

@@ -58,6 +58,7 @@ export function storedToMsg(m: db.StoredMessage): Msg {
     durationMs: m.duration_ms ?? undefined,
     images,
     segments,
+    by: m.model || undefined,
   };
 }
 

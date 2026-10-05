@@ -17,7 +17,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import type { Dispatch, SetStateAction } from "react";
 import * as db from "../core/db.r";
-import type { Attachment, Conversation, Effort, Model, Project, Provider, SshServer } from "../core/types.i";
+import type { Attachment, Conversation, Effort, Model, Project, Provider } from "../core/types.i";
 import { isCliKind } from "../core/types.i";
 import { composePrompt } from "../utils/attachments.u";
 import type { Msg, Segment } from "../chat/message.i";
@@ -34,17 +34,29 @@ export const COMPACT_MARKER = "[Summary of the earlier conversation — older me
  * message that follows (roles keep alternating for every provider).
  */
 export function modelTurns(history: Msg[]): db.ChatTurn[] {
+  return modelTurnsOf(history).turns;
+}
+
+/**
+ * modelTurns plus, per turn, the index of the message it came from — a CLI
+ * session reports how many turns it has read, the chat marks the rest.
+ */
+export function modelTurnsOf(history: Msg[]): { turns: db.ChatTurn[]; source: number[] } {
   const at = history.map((m) => m.role).lastIndexOf("compact");
-  const plain = (list: Msg[]): db.ChatTurn[] =>
-    list.filter((m) => m.role !== "compact").map((m) => ({ role: m.role, text: m.text, ...workOf(m) }));
-  if (at < 0) return plain(history);
+  const turns: db.ChatTurn[] = [];
+  const source: number[] = [];
+  history.forEach((m, i) => {
+    if (i <= at || m.role === "compact") return;
+    turns.push({ role: m.role, text: m.text, ...workOf(m), ...(m.by ? { by: m.by } : {}) });
+    source.push(i);
+  });
+  if (at < 0) return { turns, source };
   const summary = `${COMPACT_MARKER}\n${history[at].text.trim()}`;
-  const rest = plain(history.slice(at + 1));
-  const first = rest.findIndex((t) => t.role === "user");
-  if (first < 0) return [{ role: "user", text: summary }];
-  const out = rest.slice(first);
+  const first = turns.findIndex((t) => t.role === "user");
+  if (first < 0) return { turns: [{ role: "user", text: summary }], source: [at] };
+  const out = turns.slice(first);
   out[0] = { role: "user", text: `${summary}\n\n---\n\n${out[0].text}` };
-  return out;
+  return { turns: out, source: source.slice(first) };
 }
 
 /** Outputs of these tools are worth carrying into the next message. */
@@ -59,7 +71,7 @@ const DETAIL_ONE = 6_000;
  * outputs of its reads / searches / commands. A file the turn changed later
  * is not carried as it was read — its line says how it changed instead.
  */
-function workOf(m: Msg): Pick<db.ChatTurn, "work_log" | "work_detail"> {
+function workOf(m: Msg): Pick<db.ChatTurn, "work_log" | "work_detail" | "changed"> {
   if (m.role !== "agent") return {};
   const steps = (m.segments ?? []).flatMap((s) => (s.kind === "step" && s.step.done ? [s.step] : []));
   if (steps.length === 0) return {};
@@ -80,7 +92,9 @@ function workOf(m: Msg): Pick<db.ChatTurn, "work_log" | "work_detail"> {
     const body = s.result.length > DETAIL_ONE ? `[…]\n${s.result.slice(-DETAIL_ONE)}` : s.result;
     detail.push(`### ${s.name} ${s.input.slice(0, 200)}\n${body}`);
   }
-  return { work_log: log.join("\n"), work_detail: detail.join("\n\n") };
+  // As written by the tools (first spelling of each file).
+  const files = [...new Map(steps.filter((s) => s.path && s.new_text !== undefined).map((s) => [s.path!.replace(/\\/g, "/").toLowerCase(), s.path!])).values()];
+  return { work_log: log.join("\n"), work_detail: detail.join("\n\n"), ...(files.length ? { changed: files } : {}) };
 }
 
 /** Everything the context gauge shows for one conversation. */
@@ -91,8 +105,9 @@ export interface ContextReport {
   providerKind: string;
   /** Token totals of every run of this conversation (usage segments). */
   spent: { prompt: number; completion: number; cached: number; runs: number };
-  /** Real / estimated tokens of the last run's first request (the parts
-   *  are already scaled by it); null = nothing to calibrate against yet. */
+  /** Tokenizer correction of the estimate (the parts are already scaled by
+   *  it): real / estimated size of the last run's first request, kept
+   *  within what tokenizers differ by; null = nothing to calibrate against. */
   calibration: number | null;
   /** The real size of the last run's final request (tool results and
    *  in-run compaction included) — the estimate only sees the saved turns. */
@@ -153,7 +168,6 @@ export interface UseChatOptions {
   appWorkspace: string;
   agentMode: boolean;
   globalAutoRun: boolean;
-  sshServers: SshServer[];
   subagents: db.Subagent[];
   /** Retries of a failed model request (Settings → Agent). */
   maxRetries: number;
@@ -435,7 +449,6 @@ export function useChat(options: UseChatOptions) {
       max_agents: agents,
       chat_id: chatId,
       max_retries: o.maxRetries,
-      ssh_units: o.sshServers.map((s) => ({ id: s.id, name: s.name, host: s.host })),
       disabled_tools: loadDisabledTools(),
     };
   };
@@ -524,6 +537,8 @@ export function useChat(options: UseChatOptions) {
     ]);
     const spent = { prompt: 0, completion: 0, cached: 0, runs: 0 };
     let calibration: number | null = null;
+    /** What the provider adds that we never see (a gateway's own prompt). */
+    let hidden = 0;
     let lastRequest: number | null = null;
     for (const m of history) {
       for (const seg of m.segments ?? []) {
@@ -533,13 +548,18 @@ export function useChat(options: UseChatOptions) {
         spent.completion += seg.usage.completion_tokens;
         spent.cached += seg.usage.cached_tokens;
         spent.runs += 1;
-        // The provider's own count of a request we also estimated: the
-        // ratio corrects the chars→tokens guess for this model's tokenizer
-        // (and hidden overhead like tool-use framing). The latest run wins.
+        // The provider's own count of a request we also estimated. Up to a
+        // tokenizer's difference it scales the estimate; the rest is a
+        // prompt the provider adds itself (gateways that run the model
+        // behind their own agent add tens of thousands of tokens) and is
+        // ADDED, not spread over the parts. The latest run wins.
         const { first_input: real, first_est: est } = seg.usage;
         // (Not for a CLI: its own hidden prompt is in `real`, the gauge
         // uses the session's measured size instead.)
-        if (real && est && est > 200 && !isCliKind(provider.kind)) calibration = Math.min(3, Math.max(0.4, real / est));
+        if (real && est && est > 200 && !isCliKind(provider.kind)) {
+          calibration = Math.min(1.35, Math.max(0.8, real / est));
+          hidden = Math.max(0, Math.round(real - est * calibration));
+        }
       }
     }
     const scaled = calibration === null
@@ -549,6 +569,9 @@ export function useChat(options: UseChatOptions) {
           tokens: Math.round(p.tokens * calibration!),
           items: p.items.map((it) => ({ ...it, tokens: Math.round(it.tokens * calibration!) })),
         }));
+    if (hidden > 500) {
+      scaled.push({ label: "Provider's own prompt", group: "system", tokens: hidden, items: [] });
+    }
     return { parts: scaled, info, spent, calibration, lastRequest, modelName: modelRow.name || modelRow.model_id, providerKind: provider.kind };
   };
 
@@ -698,7 +721,10 @@ export function useChat(options: UseChatOptions) {
     if (!background) localStorage.setItem("dsh:last-conv", convId);
     // Reload re-attach: remember which conversation this run streams into.
     localStorage.setItem("dsh:live-run", JSON.stringify({ runId, convId }));
-    updateConvMsgs(convId, (prev) => [...prev, { role: "agent", text: "", segments: [] }]);
+    // Who writes this turn: a CLI session of another provider is later told
+    // what this model said; its own answers it already has.
+    const by = `${provider.kind}:${modelRow.model_id}`;
+    updateConvMsgs(convId, (prev) => [...prev, { role: "agent", text: "", segments: [], by }]);
     setActiveRuns((prev) => ({ ...prev, [convId]: runId }));
     setRunPhase((prev) => ({ ...prev, [convId]: "thinking" }));
     setErroredConv((prev) => (prev === convId ? null : prev));
@@ -771,6 +797,7 @@ export function useChat(options: UseChatOptions) {
         await db.appendMessage(convId, "agent", answer, {
           durationMs: elapsed,
           segmentsJson: persisted && persisted.length ? JSON.stringify(persisted) : undefined,
+          by,
         });
         opts.current.onActivity(convId);
       }
@@ -806,6 +833,7 @@ export function useChat(options: UseChatOptions) {
           await db.appendMessage(convId, "agent", live.text, {
             durationMs: elapsed,
             segmentsJson: persisted && persisted.length ? JSON.stringify(persisted) : undefined,
+            by,
           });
           opts.current.onActivity(convId);
         }

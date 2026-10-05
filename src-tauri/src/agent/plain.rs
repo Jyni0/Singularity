@@ -14,7 +14,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter};
 
 pub async fn stream(app: &AppHandle, request_id: &str, p: &ProviderConfig, turns: &[ChatTurn]) -> Result<(), String> {
-    let req: AgentRequest = serde_json::from_value(json!({
+    let mut req: AgentRequest = serde_json::from_value(json!({
         "kind": p.kind,
         "base_url": p.base_url,
         "api_key": p.api_key,
@@ -25,6 +25,7 @@ pub async fn stream(app: &AppHandle, request_id: &str, p: &ProviderConfig, turns
         "chat_id": p.chat_id,
     }))
     .map_err(|e| e.to_string())?;
+    req.chat_turns = Some(std::sync::Arc::new(turns.to_vec()));
     let setup = model::build(&req)?;
     let mut b = AgentBuilder::from_model_handle(setup.handle).preamble(&p.system).default_max_turns(1);
     if let Some(t) = setup.temperature {

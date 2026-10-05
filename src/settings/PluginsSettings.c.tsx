@@ -15,7 +15,6 @@ import {
   RefreshCw,
   Search,
   Sparkles,
-  Server,
   SquareTerminal,
   Trash2,
 } from "lucide-react";
@@ -29,7 +28,6 @@ const ICONS: Record<string, React.ReactNode> = {
   terminal: <SquareTerminal size={15} />,
   git: <GitBranch size={15} />,
   web: <Globe size={15} />,
-  ssh: <Server size={15} />,
   images: <ImageIcon size={15} />,
 };
 
